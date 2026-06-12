@@ -9,6 +9,9 @@ from core.resolver import resolve
 from core.classifier import classify
 from core.token import fetch_token_data
 from analysis.slither_runner import run_slither
+from analysis.vyper_runner import analyze as vyper_analyze
+from analysis.yul_handler import analyze as yul_analyze
+from core.language import detect_language, extract_vyper_version
 from analysis.pattern_engine import enrich_findings, summarize
 from exploits.generator import generate_poc
 from exploits.verifier import verify_exploit
@@ -57,14 +60,27 @@ def print_result(result):
 
     analysis = result.get("analysis") or {}
     if analysis:
-        sev = analysis.get("severity_counts", {})
-        lines.append("" )
-        lines.append("  --- Analysis Results ---")
-        lines.append("  High       : " + str(sev.get("HIGH", 0)))
-        lines.append("  Medium     : " + str(sev.get("MEDIUM", 0)))
-        lines.append("  Low        : " + str(sev.get("LOW", 0)))
-        lines.append("  Info       : " + str(sev.get("INFORMATIONAL", 0)))
-        hv = analysis.get("high_value_findings", [])
+        # Recount from all findings (handles mixed Slither+Yul+Vyper)
+        all_findings = analysis.get("findings", [])
+        critical = sum(1 for f in all_findings if f.get("severity") == "CRITICAL")
+        high = sum(1 for f in all_findings if f.get("severity") == "HIGH")
+        medium = sum(1 for f in all_findings if f.get("severity") == "MEDIUM")
+        low = sum(1 for f in all_findings if f.get("severity") == "LOW")
+        info = sum(1 for f in all_findings if f.get("severity") == "INFORMATIONAL")
+        lang = analysis.get("language", "unknown")
+        lines.append("")
+        lines.append("  --- Analysis Results (" + lang + ") ---")
+        if critical:
+            lines.append("  Critical   : " + str(critical))
+        lines.append("  High       : " + str(high))
+        lines.append("  Medium     : " + str(medium))
+        lines.append("  Low        : " + str(low))
+        if info:
+            lines.append("  Info       : " + str(info))
+        hv = analysis.get("high_value_findings") or [
+            f for f in analysis.get("findings", [])
+            if f.get("severity") in ("CRITICAL", "HIGH")
+        ]
         if hv:
             lines.append("  --- High Value Findings ---")
             for f in hv[:3]:
@@ -113,12 +129,40 @@ def analyze(address, chain_name, output_json=False):
         if category == "token":
             token_data = fetch_token_data(address, chain)
 
-        slither_result = run_slither(resolved)
+        # Detect language and route to correct analyzer
+        raw_source = resolved.get("source", "") or ""
+        source_code = raw_source.get("source", "") if isinstance(raw_source, dict) else raw_source
+        compiler_str = resolved.get("compiler", "") or ""
+        if not compiler_str and isinstance(raw_source, dict):
+            compiler_str = raw_source.get("compiler", "") or ""
+        lang_info = detect_language(source_code, compiler_str)
+        language = lang_info["language"]
+
         analysis = {}
-        if slither_result["success"]:
-            enriched = enrich_findings(slither_result["findings"])
-            analysis = summarize(enriched)
-            analysis["findings"] = enriched
+        if language == "vyper":
+            vyper_version = extract_vyper_version(source_code, compiler_str)
+            vyper_result = vyper_analyze(source_code, version=vyper_version or "")
+            if vyper_result["findings"]:
+                analysis["findings"] = vyper_result["findings"]
+                analysis["summary"] = vyper_result["summary"]
+                analysis["language"] = "vyper"
+        else:
+            slither_result = run_slither(resolved)
+            if slither_result["success"]:
+                enriched = enrich_findings(slither_result["findings"])
+                analysis = summarize(enriched)
+                analysis["findings"] = enriched
+                analysis["language"] = "solidity"
+            # Always run Yul handler on Solidity — catches inline assembly
+            if source_code and lang_info.get("has_inline_yul"):
+                yul_result = yul_analyze(source_code)
+                if yul_result["findings"]:
+                    existing = analysis.get("findings", [])
+                    analysis["findings"] = existing + yul_result["findings"]
+                    analysis["yul_summary"] = yul_result["summary"]
+                    analysis["language"] = analysis.get("language", "solidity") + "+yul"
+            if not analysis.get("language"):
+                analysis["language"] = language
 
         poc_file = None
         report_file = None
@@ -164,6 +208,7 @@ def analyze(address, chain_name, output_json=False):
         }
 
     except Exception as e:
+        import traceback; traceback.print_exc()
         log.error("Analysis failed: " + str(e))
         return {
             "success": False,

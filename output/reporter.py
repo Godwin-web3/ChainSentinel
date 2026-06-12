@@ -23,15 +23,15 @@ def generate_report(result: dict, output_dir: str = "output/reports") -> str:
     seen = set()
     deduped_high = []
     for f in high:
-        if f["check"] not in seen:
-            seen.add(f["check"])
+        if f.get("check", f.get("id", "unknown")) not in seen:
+            seen.add(f.get("check", f.get("id", "unknown")))
             deduped_high.append(f)
 
     seen = set()
     deduped_medium = []
     for f in medium:
-        if f["check"] not in seen:
-            seen.add(f["check"])
+        if f.get("check", f.get("id", "unknown")) not in seen:
+            seen.add(f.get("check", f.get("id", "unknown")))
             deduped_medium.append(f)
 
     timestamp = datetime.now(timezone.utc).isoformat()
@@ -68,7 +68,7 @@ def generate_report(result: dict, output_dir: str = "output/reports") -> str:
             "## Token Info",
             f"| Symbol | Decimals | Total Supply |",
             f"|--------|----------|-------------|",
-            f"| {token.get('symbol', 'N/A')} | {token.get('decimals', 'N/A')} | {'{:,.2f}'.format(token.get('total_supply', 0))} |",
+            f"| {token.get('symbol', 'N/A')} | {token.get('decimals', 'N/A')} | {'{:,.2f}'.format(token.get('total_supply') or 0)} |",
             "",
         ]
 
@@ -88,8 +88,8 @@ def generate_report(result: dict, output_dir: str = "output/reports") -> str:
         for f in deduped_high:
             lines += [
                 f"### {f['title']}",
-                f"- **Check:** `{f['check']}`",
-                f"- **Category:** {f['category']}",
+                f"- **Check:** `{f.get('check', f.get('id', 'N/A'))}`",
+                f"- **Category:** {f.get('category', f.get('type', 'N/A'))}",
                 f"- **Impact:** {f.get('impact', 'N/A')}",
                 f"- **Bounty Potential:** {f.get('bounty_potential', 'N/A')}",
                 f"- **Description:** {f.get('attack_description', f.get('description', 'N/A'))}",
