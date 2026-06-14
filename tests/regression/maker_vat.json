@@ -1,0 +1,16 @@
+{
+  "address": "0x35d1b3f3d7966a1dfe207aa4514c12a259a0492b",
+  "name": "Vat",
+  "chain": "mainnet",
+  "expect": {
+    "rely(address)": "AUTHENTICATED",
+    "deny(address)": "AUTHENTICATED",
+    "init(bytes32)": "AUTHENTICATED",
+    "file(bytes32,uint256)": "AUTHENTICATED",
+    "cage()": "AUTHENTICATED",
+    "suck(address,address,uint256)": "AUTHENTICATED",
+    "fold(bytes32,address,int256)": "AUTHENTICATED",
+    "hope(address)": "UNAUTHENTICATED",
+    "frob(bytes32,address,address,address,int256,int256)": "UNAUTHENTICATED"
+  }
+}

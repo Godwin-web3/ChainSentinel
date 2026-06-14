@@ -5,8 +5,31 @@ from utils.logger import log
 
 # ─── Auth evidence types (ordered by strength) ────────────────────────────────
 # Score: 3=strong, 2=medium, 1=weak
+import hashlib
+
+_CACHE_DIR = os.path.expanduser("~/.exploit-agent-cache/printers")
+
+def _cache_key(resolved: dict) -> str:
+    addr = resolved.get("address", "unknown").lower()
+    chain = str(resolved.get("chain_id", "1"))
+    bytecode = resolved.get("bytecode", "")
+    bhash = hashlib.md5(bytecode.encode()).hexdigest()[:8]
+    return f"{chain}_{addr}_{bhash}"
+
+def _load_printer_cache(key: str, printer: str):
+    path = os.path.join(_CACHE_DIR, f"{key}_{printer}.txt")
+    if os.path.exists(path):
+        return open(path, "r").read()
+    return None
+
+def _save_printer_cache(key: str, printer: str, text: str):
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    path = os.path.join(_CACHE_DIR, f"{key}_{printer}.txt")
+    with open(path, "w") as f:
+        f.write(text)
+
 AUTH_MODIFIER_PATTERNS = [
-    "onlyOwner", "onlyAdmin", "onlyRole", "onlyGov", "onlyGuardian",
+    "onlyOwner", "onlyAdmin", "onlyRole", "onlyGov", "onlyGuardian", "auth",
     "onlyOperator", "onlyMinter", "onlyBurner", "onlyVault", "onlyKeeper",
     "onlyExecutor", "onlyTimelock", "onlyDAO", "onlyWhitelisted",
     "nonReentrant", "whenNotPaused", "whenPaused",
@@ -147,11 +170,16 @@ def score_auth(func: dict, auth: dict) -> dict:
         evidence.append({"type": "internal_auth_call", "value": "internal auth gate detected", "strength": 2})
         score = max(score, 2)
 
+    # Strong: require with auth-indicating error string (catches TMP-collapsed comparisons)
+    if re.search(r'require.*only.*(admin|owner|gov|guardian|operator)', internal, re.I):
+        evidence.append({"type": "require_auth_string", "value": "require with auth error message", "strength": 3})
+        score = max(score, 3)
+
     # Auth signal: layered heuristics
     reads = func.get("reads", [])
     internal = func.get("internal_calls", "")
     PRIV_VARS = {"admin", "owner", "guardian", "operator", "governance",
-                 "pendingadmin", "pauseguardian", "timelock", "dao"}
+                 "pendingadmin", "pauseguardian", "timelock", "dao", "wards"}
     priv_reads = [r for r in reads if r.lower().split('.')[-1] in PRIV_VARS]
     has_sender = "msg.sender" in reads
     has_fail_path = bool(re.search(
@@ -167,21 +195,27 @@ def score_auth(func: dict, auth: dict) -> dict:
         # Medium: privileged var read + failure/revert path (Compound early-return style)
         evidence.append({"type": "priv_var_fail_path",
                          "value": f"reads {priv_reads} + failure path in internal calls",
-                         "strength": 2})
-        score = max(score, 2)
+                         "strength": 3})
+        score = max(score, 3)
     elif priv_reads:
         # Weak: privileged var read only (may be for config, not auth)
         evidence.append({"type": "priv_var_read",
                          "value": f"reads privileged var {priv_reads}", "strength": 0})
     elif has_sender and score == 0:
-        # Weak: msg.sender read only (may be logging or fee routing)
+        # Neutral: msg.sender read only — not auth evidence alone
         evidence.append({"type": "sender_read",
-                         "value": "msg.sender read present", "strength": 1})
-        score = max(score, 1)
+                         "value": "msg.sender read present", "strength": 0})
+        # score unchanged
 
-    if score >= 2:
+    NOISE = {"sender_read", "priv_var_read"}
+    filtered = [e for e in evidence if e["type"] not in NOISE]
+    has_auth_gate = score >= 3
+    has_partial_signal = score >= 2
+    conflict = len(filtered) > 1 and has_partial_signal and not has_auth_gate
+
+    if has_auth_gate:
         auth_state = "AUTHENTICATED"
-    elif score >= 1 or evidence:
+    elif conflict:
         auth_state = "UNKNOWN"
     else:
         auth_state = "UNAUTHENTICATED"
@@ -236,6 +270,51 @@ def detect_dangerous_ordering(func: dict) -> bool:
     return bool(real_ext) and has_write
 
 # ─── Main enricher ────────────────────────────────────────────────────────────
+
+def extract_source_auth(project_root: str, func_name: str) -> list:
+    """
+    Scan source files for require(msg.sender == X) patterns.
+    Fallback for when vars-and-auth printer loses comparisons to TMP variables.
+    Returns list of condition strings like ["msg.sender == owner"].
+    """
+    import glob
+    bare_name = func_name.split("(")[0].strip()
+    patterns = [
+        re.compile(r'require\s*\(\s*msg\.sender\s*==\s*(\w+)', re.I),
+        re.compile(r'require\s*\(\s*(\w+)\s*==\s*msg\.sender', re.I),
+    ]
+    conditions = []
+    in_func = False
+    brace_depth = 0
+
+    sol_files = glob.glob(os.path.join(project_root, "**", "*.sol"), recursive=True)
+    for filepath in sol_files:
+        try:
+            with open(filepath, "r", errors="ignore") as f:
+                lines = f.readlines()
+        except Exception:
+            continue
+
+        for i, line in enumerate(lines):
+            # Detect function start
+            if re.search(rf'\bfunction\s+{re.escape(bare_name)}\b', line):
+                in_func = True
+                brace_depth = 0
+
+            if in_func:
+                brace_depth += line.count("{") - line.count("}")
+                for pat in patterns:
+                    m = pat.search(line)
+                    if m:
+                        var = m.group(1)
+                        cond = f"msg.sender == {var}"
+                        if cond not in conditions:
+                            conditions.append(cond)
+                if brace_depth <= 0 and "{" in "".join(lines[max(0,i-5):i+1]):
+                    in_func = False
+
+    return conditions
+
 def run_enricher(resolved: dict, project_root: str, entry_file: str, solc_version: str) -> dict:
     """
     Run Slither printers and build function feature table.
@@ -261,13 +340,21 @@ def run_enricher(resolved: dict, project_root: str, entry_file: str, solc_versio
 
     # Run function-summary
     log.debug("Enricher: running function-summary printer")
+    _ckey = _cache_key(resolved)
+    _summary_cached = _load_printer_cache(_ckey, "function-summary")
     try:
-        r1 = subprocess.run(
-            base_cmd + ["--print", "function-summary"],
-            capture_output=True, text=True, timeout=360,
-            env=env, cwd=project_root
-        )
-        func_data = parse_function_summary(r1.stderr + r1.stdout)
+        if _summary_cached is not None:
+            log.debug("Enricher: function-summary cache hit")
+            _summary_text = _summary_cached
+        else:
+            r1 = subprocess.run(
+                base_cmd + ["--print", "function-summary"],
+                capture_output=True, text=True, timeout=360,
+                env=env, cwd=project_root
+            )
+            _summary_text = r1.stderr + r1.stdout
+            _save_printer_cache(_ckey, "function-summary", _summary_text)
+        func_data = parse_function_summary(_summary_text)
         log.debug(f"Enricher: parsed {len(func_data)} functions")
     except Exception as e:
         log.warn(f"Enricher function-summary failed: {e}")
@@ -275,13 +362,20 @@ def run_enricher(resolved: dict, project_root: str, entry_file: str, solc_versio
 
     # Run vars-and-auth
     log.debug("Enricher: running vars-and-auth printer")
+    _auth_cached = _load_printer_cache(_ckey, "vars-and-auth")
     try:
-        r2 = subprocess.run(
-            base_cmd + ["--print", "vars-and-auth"],
-            capture_output=True, text=True, timeout=360,
-            env=env, cwd=project_root
-        )
-        auth_data = parse_vars_and_auth(r2.stderr + r2.stdout)
+        if _auth_cached is not None:
+            log.debug("Enricher: vars-and-auth cache hit")
+            _auth_text = _auth_cached
+        else:
+            r2 = subprocess.run(
+                base_cmd + ["--print", "vars-and-auth"],
+                capture_output=True, text=True, timeout=360,
+                env=env, cwd=project_root
+            )
+            _auth_text = r2.stderr + r2.stdout
+            _save_printer_cache(_ckey, "vars-and-auth", _auth_text)
+        auth_data = parse_vars_and_auth(_auth_text)
         log.debug(f"Enricher: parsed {len(auth_data)} auth entries")
     except Exception as e:
         log.warn(f"Enricher vars-and-auth failed: {e}")
@@ -291,6 +385,24 @@ def run_enricher(resolved: dict, project_root: str, entry_file: str, solc_versio
     features = {}
     for key, func in func_data.items():
         auth = auth_data.get(key, {})
+
+        # Source fallback: recover lost msg.sender comparisons
+        # Only triggers when printer saw msg.sender but lost the comparison to TMP
+        if (not auth.get("msg_sender_conditions") and
+                "msg.sender" in func.get("reads", [])):
+            recovered = extract_source_auth(project_root, func.get("name", ""))
+            if recovered:
+                # Filter: only accept if variable is a known priv var
+                PRIV_VARS = {"admin", "owner", "guardian", "operator",
+                             "governance", "pendingadmin", "pauseguardian",
+                             "timelock", "dao"}
+                filtered = [c for c in recovered
+                            if c.split("== ")[-1].lower() in PRIV_VARS]
+                if filtered:
+                    auth = dict(auth)
+                    auth["msg_sender_conditions"] = filtered
+                    auth["source_auth_fallback"] = True
+
         auth_result = score_auth(func, auth)
         asset_flows = detect_asset_flow(func)
         dangerous_order = detect_dangerous_ordering(func)
@@ -322,6 +434,12 @@ def run_enricher(resolved: dict, project_root: str, entry_file: str, solc_versio
     ]
 
     log.debug(f"Enricher: {len(high_priority)} high-priority functions")
+
+
+    # DEBUG DUMP
+    import json as _json
+    with open('/root/enricher_debug.json', 'w') as _f:
+        _json.dump({"features": features, "high_priority": high_priority}, _f, indent=2)
 
     return {
         "success": True,

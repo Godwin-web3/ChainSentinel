@@ -1,0 +1,10 @@
+{
+  "address": "0xc0Da02939E1441F497fd74F78cE7Decb17B66529",
+  "name": "GovernorBravoDelegate",
+  "chain": "mainnet",
+  "expect": {
+    "propose(address[],uint256[],string[],bytes[],string)": "UNAUTHENTICATED",
+    "execute(uint256)": "UNAUTHENTICATED",
+    "_setVotingDelay(uint256)": "AUTHENTICATED"
+  }
+}

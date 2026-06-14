@@ -149,6 +149,7 @@ def analyze(address, chain_name, output_json=False):
                 analysis["language"] = "vyper"
         else:
             slither_result = run_slither(resolved)
+            enrichment = slither_result.get("enrichment", {})
             if slither_result["success"]:
                 enriched = enrich_findings(slither_result["findings"])
                 analysis = summarize(enriched)
@@ -177,7 +178,8 @@ def analyze(address, chain_name, output_json=False):
                 "proxy_depth": resolved["proxy_depth"],
                 "implementation": resolved["implementation"],
                 "token": token_data,
-                "analysis": analysis
+                "analysis": analysis,
+                "enrichment": enrichment
             })
             poc_file = generate_poc(
                 address=address,

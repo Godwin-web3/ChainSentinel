@@ -1,0 +1,10 @@
+{
+  "address": "0xEC568fffba86c094cf06b22134B23074DFE2252c",
+  "name": "AaveGovernanceV2",
+  "chain": "mainnet",
+  "expect": {
+    "queue(uint256)": "UNAUTHENTICATED",
+    "execute(uint256)": "UNAUTHENTICATED",
+    "cancel(uint256)": "UNAUTHENTICATED"
+  }
+}

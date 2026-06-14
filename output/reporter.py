@@ -16,6 +16,19 @@ def generate_report(result: dict, output_dir: str = "output/reports") -> str:
     token = result.get("token") or {}
     impl = result.get("implementation")
 
+    enrichment = result.get("enrichment", {})
+    features = enrichment.get("features", {}) if enrichment else {}
+
+    def get_auth_for_finding(finding):
+        """Match a finding to enricher feature by function name."""
+        fname = finding.get("function_name", "")
+        if not fname:
+            return None
+        for k, v in features.items():
+            if v.get("name", "").split("(")[0] == fname.split("(")[0]:
+                return v
+        return None
+
     high = [f for f in findings if f.get("severity") in ["HIGH", "CRITICAL"]]
     medium = [f for f in findings if f.get("severity") == "MEDIUM"]
 
@@ -93,8 +106,15 @@ def generate_report(result: dict, output_dir: str = "output/reports") -> str:
                 f"- **Impact:** {f.get('impact', 'N/A')}",
                 f"- **Bounty Potential:** {f.get('bounty_potential', 'N/A')}",
                 f"- **Description:** {f.get('attack_description', f.get('description', 'N/A'))}",
-                "",
             ]
+            auth = get_auth_for_finding(f)
+            if auth:
+                lines += [
+                    f"- **Auth State:** `{auth.get('auth_state', 'UNKNOWN')}`",
+                    f"- **Auth Score:** {auth.get('auth_score', 0)}",
+                    f"- **Auth Evidence:** {', '.join(e['type'] for e in auth.get('auth_evidence', []))}",
+                ]
+            lines += [""]
 
     if deduped_medium:
         lines += ["## 🟡 Medium Findings", ""]
@@ -103,8 +123,30 @@ def generate_report(result: dict, output_dir: str = "output/reports") -> str:
                 f"### {f['title']}",
                 f"- **Impact:** {f.get('impact', 'N/A')}",
                 f"- **Description:** {f.get('attack_description', f.get('description', 'N/A'))}",
-                "",
             ]
+            auth = get_auth_for_finding(f)
+            if auth:
+                lines += [
+                    f"- **Auth State:** `{auth.get('auth_state', 'UNKNOWN')}`",
+                    f"- **Auth Score:** {auth.get('auth_score', 0)}",
+                    f"- **Auth Evidence:** {', '.join(e['type'] for e in auth.get('auth_evidence', []))}",
+                ]
+            lines += [""]
+
+    # Enrichment section — high priority functions from auth analysis
+    enrichment = result.get("enrichment", {})
+    high_priority = enrichment.get("high_priority_functions", []) if enrichment else []
+    features = enrichment.get("features", {}) if enrichment else {}
+
+    if high_priority or features:
+        lines += ["## 🔍 Auth Analysis", ""]
+        lines += ["| Function | Auth State | Score | Evidence |"]
+        lines += ["|----------|------------|-------|----------|"]
+        for k, v in features.items():
+            if v.get("is_entry_point") and not v.get("is_view"):
+                evidence = ", ".join(e["type"] for e in v.get("auth_evidence", []))
+                lines += [f"| `{v['name']}` | `{v.get('auth_state','?')}` | {v.get('auth_score',0)} | {evidence or '—'} |"]
+        lines += [""]
 
     safe_name = name.replace(" ", "_").replace("/", "_")
     filename = f"report_{safe_name}_{address[:8]}.md"

@@ -1,0 +1,10 @@
+{
+  "address": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+  "name": "UniswapV3Factory",
+  "chain": "mainnet",
+  "expect": {
+    "setOwner(address)": "AUTHENTICATED",
+    "enableFeeAmount(uint24,int24)": "AUTHENTICATED",
+    "createPool(address,address,uint24)": "UNAUTHENTICATED"
+  }
+}
