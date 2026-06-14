@@ -62,7 +62,7 @@ def parse_function_summary(text: str) -> dict:
             writes = [w.strip().strip("'") for w in writes_raw.split(',') if w.strip()]
 
             key = f"{current_contract}.{func_name}"
-            functions[key] = {
+            new_entry = {
                 "contract": current_contract,
                 "name": func_name,
                 "visibility": visibility,
@@ -74,6 +74,9 @@ def parse_function_summary(text: str) -> dict:
                 "is_entry_point": visibility in ("public", "external"),
                 "is_view": False,  # refined below
             }
+            # Keep richer entry on duplicate keys
+            if key not in functions or len(reads) + len(writes) + len(modifiers) >                len(functions[key]["reads"]) + len(functions[key]["writes"]) + len(functions[key]["modifiers"]):
+                functions[key] = new_entry
 
     return functions
 
@@ -212,14 +215,25 @@ def detect_dangerous_ordering(func: dict) -> bool:
     This is a structural signal, not a confirmed exploit.
     Requires manual verification of call trust.
     """
+    CRYPTO_PRIMITIVES = {"abi.encode", "abi.encodepacked", "keccak256", "ecrecover", "sha256", "ripemd160", "fullmath", "safemath", "math", "safeerc20", "address(", "fixedpoint128", "fixedpoint96", "tickmath", "liquiditymath", "swapmath", "bitmath"}
     ext = func.get("external_calls", "[]")
     if isinstance(ext, str):
         ext = ext.strip()
-        has_external = ext not in ("", "[]", "['']")
+        if ext in ("", "[]", "['']"):
+            real_ext = []
+        else:
+            import ast
+            try:
+                parsed = ast.literal_eval(ext)
+                real_ext = [e for e in parsed if not any(p in e.lower() for p in CRYPTO_PRIMITIVES)]
+            except:
+                real_ext = [] if any(p in ext.lower() for p in CRYPTO_PRIMITIVES) else [ext]
+    elif isinstance(ext, list):
+        real_ext = [e for e in ext if not any(p in e.lower() for p in CRYPTO_PRIMITIVES)]
     else:
-        has_external = bool(ext)
+        real_ext = []
     has_write = bool(func.get("writes", []))
-    return has_external and has_write
+    return bool(real_ext) and has_write
 
 # ─── Main enricher ────────────────────────────────────────────────────────────
 def run_enricher(resolved: dict, project_root: str, entry_file: str, solc_version: str) -> dict:
