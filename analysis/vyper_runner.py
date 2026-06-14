@@ -20,29 +20,41 @@ def load_bugs_db() -> dict:
         return json.load(f)
 
 
-def check_compiler_version(version: str) -> list:
+def check_compiler_version(version: str, source: str = "") -> list:
     findings = []
     if not version:
         return findings
     db = load_bugs_db()
     for bug in db["compiler_bugs"]:
-        if version in bug["affected_versions"]:
-            findings.append({
-                "id": bug["id"],
-                "title": bug["title"],
-                "severity": bug["severity"],
-                "type": "compiler_bug",
-                "description": bug["description"],
-                "exploit_template": bug["exploit_template"],
-                "real_world": bug["real_world"],
-                "immunefi_relevant": bug["immunefi_relevant"],
-                "cwe": bug["cwe"],
-                "references": bug["references"],
-                "fixed_in": bug["fixed_in"],
-                "compiler_version": version,
-                "confidence": "HIGH",
-                "source": "vyper_cve_db"
-            })
+        if version not in bug["affected_versions"]:
+            continue
+        required = bug.get("required_pattern")
+        min_implements = bug.get("min_implements", 0)
+        if required and source:
+            if not re.search(required, source, re.IGNORECASE | re.DOTALL):
+                continue
+        if min_implements and source:
+            count = len(re.findall(r"implements\s*:", source, re.IGNORECASE))
+            if count < min_implements:
+                continue
+        confidence = "HIGH" if (required and source and re.search(required, source, re.IGNORECASE)) else ("LOW" if not source else "INFORMATIONAL")
+        findings.append({
+            "id": bug["id"],
+            "title": bug["title"],
+            "severity": bug["severity"] if confidence == "HIGH" else "INFORMATIONAL",
+            "type": "compiler_bug",
+            "description": bug["description"],
+            "exploit_template": bug["exploit_template"],
+            "real_world": bug["real_world"],
+            "immunefi_relevant": bug["immunefi_relevant"],
+            "cwe": bug["cwe"],
+            "references": bug["references"],
+            "fixed_in": bug["fixed_in"],
+            "compiler_version": version,
+            "confidence": confidence,
+            "source": "vyper_cve_db",
+            "pattern_confirmed": bool(required and source and re.search(required, source, re.IGNORECASE))
+        })
     return findings
 
 
@@ -203,7 +215,7 @@ def analyze(source: str, version: str = "", use_semgrep: bool = True) -> dict:
         "immunefi_relevant": 0
     }
 
-    findings.extend(check_compiler_version(version))
+    findings.extend(check_compiler_version(version, source))
 
     if use_semgrep and source:
         findings.extend(run_semgrep(source))
@@ -225,6 +237,7 @@ def analyze(source: str, version: str = "", use_semgrep: bool = True) -> dict:
             summary["immunefi_relevant"] += 1
 
     summary["total"] = len(findings)
+    summary["severity_counts"] = {"HIGH": summary["high"], "MEDIUM": summary["medium"], "LOW": summary["low"], "CRITICAL": summary["critical"]}
     return {"summary": summary, "findings": findings}
 
 

@@ -36,11 +36,38 @@ def fetch_source(address: str, chain: Chain) -> Optional[dict]:
             "implementation": impl if impl else None
         }
 
+    # Parse multi-file format — Etherscan wraps JSON in {{ }}
+    parsed_source = source
+    file_map = {}
+    if source.startswith("{{"):
+        try:
+            import json
+            inner = source[1:-1]  # strip outer braces
+            obj = json.loads(inner)
+            sources = obj.get("sources", {})
+            file_map = {path: data.get("content", "") for path, data in sources.items()}
+            # Keep full source as concatenated string for pattern matching
+            parsed_source = "\n".join(file_map.values())
+            log.debug(f"Multi-file project: {len(file_map)} files parsed")
+        except Exception as e:
+            log.debug(f"Multi-file parse failed: {e}")
+    elif source.startswith("{"):
+        try:
+            import json
+            obj = json.loads(source)
+            sources = obj.get("sources", {})
+            file_map = {path: data.get("content", "") for path, data in sources.items()}
+            parsed_source = "\n".join(file_map.values())
+            log.debug(f"Multi-file project: {len(file_map)} files parsed")
+        except Exception as e:
+            log.debug(f"Single JSON parse failed: {e}")
+
     log.success(f"Source fetched: {name} ({compiler})")
     return {
         "verified": True,
         "name": name,
-        "source": source,
+        "source": parsed_source,
+        "files": file_map,
         "abi": abi,
         "compiler": compiler,
         "is_proxy": proxy == "1",

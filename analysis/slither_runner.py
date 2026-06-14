@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 from config.settings import SLITHER_TIMEOUT
 from utils.logger import log
+from analysis.enricher import run_enricher
 
 SEVERITY_MAP = {
     "High": 3,
@@ -15,41 +16,48 @@ SEVERITY_MAP = {
     "Optimization": 0
 }
 
-def write_source_file(source_data: dict) -> Optional[str]:
+def write_source_files(source_data: dict) -> Optional[tuple]:
+    """
+    Write source files to temp dir.
+    Returns (root_dir, entry_file) or None.
+    """
     try:
         tmpdir = tempfile.mkdtemp(prefix="exploit-agent-")
-        source = source_data.get("source", "")
 
+        # Use pre-parsed file_map from fetcher if available
+        file_map = source_data.get("files", {})
+        if file_map:
+            entry_file = None
+            contract_name = source_data.get("name", "contract")
+            all_files = []
+            for filepath, content in file_map.items():
+                full_path = os.path.join(tmpdir, filepath)
+                os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                with open(full_path, "w") as f:
+                    f.write(content)
+                all_files.append((filepath, full_path))
+            # Pick entry: exact stem match first, then partial, skip interfaces/libraries
+            def score_entry(fp):
+                stem = os.path.splitext(os.path.basename(fp))[0].lower()
+                name = contract_name.lower()
+                if stem == name: return 0
+                if stem == name and "interfaces" not in fp and "libraries" not in fp: return 1
+                if name in stem and "interfaces" not in fp and "libraries" not in fp: return 2
+                if name in stem: return 3
+                return 99
+            all_files.sort(key=lambda x: score_entry(x[0]))
+            entry_file = all_files[0][1] if all_files else None
+            log.debug(f"Entry file: {all_files[0][0] if all_files else None}")
+            return (tmpdir, entry_file)
+
+        # Single file fallback
+        source = source_data.get("source", "")
         if not source:
             return None
-
-        # Handle multi-file source (Etherscan JSON format)
-        is_json = isinstance(source, str) and (source.startswith("{{") or source.startswith("{"))
-        if is_json:
-            try:
-                raw = source[1:-1] if source.startswith("{{") else source
-                inner = json.loads(raw)
-                sources = inner.get("sources", {})
-                if sources:
-                    first_file = None
-                    for filename, file_data in sources.items():
-                        full_path = os.path.join(tmpdir, filename)
-                        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                        with open(full_path, "w") as f:
-                            f.write(file_data.get("content", ""))
-                        if first_file is None:
-                            first_file = full_path
-                    log.debug(f"Multi-file project: {len(sources)} files, root: {tmpdir}")
-                    return first_file
-            except Exception as e:
-                log.warn(f"Multi-file parse failed: {e}")
-
-        # Single file source
         filepath = os.path.join(tmpdir, "contract.sol")
         with open(filepath, "w") as f:
-            f.write(source if isinstance(source, str) else json.dumps(source))
-
-        return filepath
+            f.write(source)
+        return (tmpdir, filepath)
 
     except Exception as e:
         log.error(f"Source write failed: {e}")
@@ -81,7 +89,8 @@ def parse_slither_output(output: dict) -> list:
             "severity_score": SEVERITY_MAP.get(impact, 0),
             "confidence": confidence,
             "description": description[:300],
-            "affected": affected[:5]
+            "affected": affected[:5],
+            "elements": elements
         })
 
     # Sort by severity
@@ -108,37 +117,43 @@ def run_slither(resolved: dict) -> dict:
 
     log.info(f"Running Slither (solc: {solc_version})")
 
-    filepath = write_source_file(source_data)
-    if not filepath:
+    result_tuple = write_source_files(source_data)
+    if not result_tuple:
         return {
             "success": False,
             "reason": "source_write_failed",
             "findings": []
         }
 
-    # Find tmpdir root (contains lib/ or src/)
-    project_root = filepath
-    for _ in range(15):
-        parent = os.path.dirname(project_root)
-        if parent == project_root:
-            break
-        project_root = parent
-        if os.path.exists(os.path.join(project_root, "lib")) or "exploit-agent-" in os.path.basename(project_root):
-            break
-    # Build remappings for nested dependencies
+    project_root, filepath = result_tuple
+
+    # Use relative path so Slither doesn't walk up and find foundry.toml
+    import os as _os
+    try:
+        filepath = _os.path.relpath(filepath, project_root)
+    except ValueError:
+        pass  # Windows edge case — keep absolute
+
+    # Build remappings from directory structure
     remappings = []
     for root, dirs, files in os.walk(project_root):
         for d in dirs:
-            if d in ["openzeppelin-contracts", "openzeppelin-contracts-upgradeable", "solidity-utils", "aave-v3-origin"]:
-                full = os.path.join(root, d)
-                remappings.append(f"{d}/={full}/")
-    
+            full = os.path.join(root, d)
+            rel = os.path.relpath(full, project_root)
+            # Use relative left side, absolute right side
+            remappings.append(f"{rel}/={full}/")
+            if "/" in rel:
+                short = rel.split("/")[-1]
+                remappings.append(f"{short}/={full}/")
+
+    remappings = list(dict.fromkeys(remappings))
+    log.debug(f"Remappings: {remappings[:5]}")
+
     cmd = ["slither", filepath, "--solc", "solc-wrapper",
            "--solc-args", f"--allow-paths {project_root}",
            "--json", "-"]
     if remappings:
-        cmd += ["--solc-remaps", " ".join(remappings[:10])]
-    log.debug(f"Remappings: {remappings[:3]}")
+        cmd += ["--solc-remaps", " ".join(remappings[:20])]
 
     env = os.environ.copy()
     if solc_version:
@@ -150,13 +165,16 @@ def run_slither(resolved: dict) -> dict:
             capture_output=True,
             text=True,
             timeout=SLITHER_TIMEOUT,
-            env=env
+            env=env,
+            cwd=project_root
         )
 
         output_text = result.stdout.strip()
         log.debug(f"Slither return code: {result.returncode}")
         log.debug(f"Slither stderr: {result.stderr[:300]}")
         log.debug(f"Slither cmd: {cmd}")
+        log.debug(f"Slither stdout: {result.stdout[:500]}")
+        log.debug(f"Slither stderr FULL: {result.stderr[:1000]}")
 
         if not output_text:
             log.warn("Slither produced no output")
@@ -191,9 +209,12 @@ def run_slither(resolved: dict) -> dict:
         medium = sum(1 for f in findings if f["impact"] == "Medium")
         low = sum(1 for f in findings if f["impact"] == "Low")
 
+        enrichment = run_enricher(resolved, project_root, os.path.join(project_root, filepath), solc_version)
         return {
             "success": True,
             "findings": findings,
+            "slither_json": output,
+            "enrichment": enrichment,
             "summary": {
                 "total": len(findings),
                 "high": high,

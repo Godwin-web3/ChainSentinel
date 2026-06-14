@@ -145,6 +145,7 @@ def analyze(address, chain_name, output_json=False):
             if vyper_result["findings"]:
                 analysis["findings"] = vyper_result["findings"]
                 analysis["summary"] = vyper_result["summary"]
+                analysis["severity_counts"] = vyper_result["summary"].get("severity_counts", {})
                 analysis["language"] = "vyper"
         else:
             slither_result = run_slither(resolved)
@@ -185,6 +186,18 @@ def analyze(address, chain_name, output_json=False):
                 findings=analysis["findings"],
                 block_number=0
             )
+            # Run PoC verification
+            verify_result = None
+            if poc_file:
+                try:
+                    verify_result = verify_exploit(poc_file, chain.rpc_url)
+                    if verify_result.get("verified"):
+                        log.info("✓ Exploit VERIFIED — profit: " + str(verify_result.get("profit_eth", 0)) + " ETH")
+                    else:
+                        log.info("PoC not yet exploitable — skeleton needs implementation")
+                except Exception as ve:
+                    log.warn("Verifier error: " + str(ve))
+                    verify_result = {"verified": False, "reason": str(ve)}
 
         return {
             "success": True,

@@ -4,88 +4,209 @@
       "id": "VYPER-2023-001",
       "title": "Reentrancy Guard Failure",
       "severity": "CRITICAL",
-      "affected_versions": ["0.2.15", "0.2.16", "0.3.0"],
+      "affected_versions": [
+        "0.2.15",
+        "0.2.16",
+        "0.3.0"
+      ],
       "fixed_in": "0.3.1",
       "description": "Faulty implementation of the nonreentrant decorator allows reentrancy attacks. The reentrancy lock is not properly set before external calls, enabling attackers to re-enter protected functions.",
-      "exploit_template": "Call vulnerable function → re-enter before lock sets → drain funds",
-      "real_world": "Curve Finance hack July 2023 — $70M+ stolen across multiple pools",
+      "exploit_template": "Call vulnerable function \u2192 re-enter before lock sets \u2192 drain funds",
+      "real_world": "Curve Finance hack July 2023 \u2014 $70M+ stolen across multiple pools",
       "immunefi_relevant": true,
       "cwe": "CWE-841",
-      "references": ["https://github.com/vyperlang/vyper/security/advisories/GHSA-5824-cm3x-3c38"]
+      "references": [
+        "https://github.com/vyperlang/vyper/security/advisories/GHSA-5824-cm3x-3c38"
+      ],
+      "required_pattern": "@nonreentrant"
     },
     {
       "id": "VYPER-2023-002",
       "title": "Storage Slot Collision in Inherited Contracts",
       "severity": "HIGH",
-      "affected_versions": ["0.2.0","0.2.1","0.2.2","0.2.3","0.2.4","0.2.5","0.2.6","0.2.7","0.2.8"],
+      "affected_versions": [
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.2.7",
+        "0.2.8"
+      ],
       "fixed_in": "0.2.9",
       "description": "Storage variables in contracts using multiple inheritance may collide, leading to unexpected state corruption or unauthorized access.",
       "exploit_template": "Manipulate one storage variable to corrupt another via slot collision",
       "real_world": null,
       "immunefi_relevant": true,
       "cwe": "CWE-119",
-      "references": ["https://github.com/vyperlang/vyper/security/advisories/GHSA-22wc-c9wj-6q2v"]
+      "references": [
+        "https://github.com/vyperlang/vyper/security/advisories/GHSA-22wc-c9wj-6q2v"
+      ],
+      "required_pattern": "implements\\s*:.*\\nimplements\\s*:|implements\\s*:\\s*\\w+.*implements\\s*:\\s*\\w+",
+      "min_implements": 2
     },
     {
       "id": "VYPER-2023-003",
       "title": "Integer Bounds Check Bypass on Slice",
       "severity": "HIGH",
-      "affected_versions": ["0.3.1","0.3.2","0.3.3","0.3.4","0.3.5","0.3.6","0.3.7"],
+      "affected_versions": [
+        "0.3.1",
+        "0.3.2",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7"
+      ],
       "fixed_in": "0.3.8",
       "description": "The slice() builtin does not properly validate bounds, allowing out-of-bounds memory reads that can leak sensitive data or cause unexpected behavior.",
-      "exploit_template": "Pass crafted length to slice() → read out-of-bounds memory",
+      "exploit_template": "Pass crafted length to slice() \u2192 read out-of-bounds memory",
       "real_world": null,
       "immunefi_relevant": true,
       "cwe": "CWE-125",
-      "references": ["https://github.com/vyperlang/vyper/security/advisories/GHSA-9p8r-4xp4-gw5w"]
+      "references": [
+        "https://github.com/vyperlang/vyper/security/advisories/GHSA-9p8r-4xp4-gw5w"
+      ],
+      "required_pattern": "slice\\s*\\("
     },
     {
       "id": "VYPER-2024-001",
       "title": "Buffer Overflow in extract32",
       "severity": "HIGH",
-      "affected_versions": ["0.2.0","0.2.1","0.2.2","0.2.3","0.2.4","0.2.5","0.2.6","0.2.7","0.2.8","0.2.9","0.2.10","0.2.11","0.2.12","0.2.13","0.2.14","0.2.15","0.2.16","0.3.0","0.3.1","0.3.2","0.3.3","0.3.4","0.3.5","0.3.6","0.3.7","0.3.8","0.3.9","0.3.10"],
+      "affected_versions": [
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.2.7",
+        "0.2.8",
+        "0.2.9",
+        "0.2.10",
+        "0.2.11",
+        "0.2.12",
+        "0.2.13",
+        "0.2.14",
+        "0.2.15",
+        "0.2.16",
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "0.3.8",
+        "0.3.9",
+        "0.3.10"
+      ],
       "fixed_in": "0.4.0",
       "description": "The extract32 builtin can read beyond allocated memory bounds when the offset parameter is near the end of a bytes array, potentially exposing sensitive data.",
-      "exploit_template": "Pass offset near end of bytes array to extract32() → out-of-bounds read",
+      "exploit_template": "Pass offset near end of bytes array to extract32() \u2192 out-of-bounds read",
       "real_world": null,
       "immunefi_relevant": true,
       "cwe": "CWE-125",
-      "references": ["https://github.com/vyperlang/vyper/security/advisories/GHSA-9p8r-4xp4-gw5w"]
+      "references": [
+        "https://github.com/vyperlang/vyper/security/advisories/GHSA-9p8r-4xp4-gw5w"
+      ],
+      "required_pattern": "extract32\\s*\\("
     },
     {
       "id": "VYPER-2024-002",
       "title": "Incorrect Uint Bounds with Decimal Type",
       "severity": "MEDIUM",
-      "affected_versions": ["0.3.0","0.3.1","0.3.2","0.3.3","0.3.4","0.3.5","0.3.6","0.3.7","0.3.8","0.3.9","0.3.10"],
+      "affected_versions": [
+        "0.3.0",
+        "0.3.1",
+        "0.3.2",
+        "0.3.3",
+        "0.3.4",
+        "0.3.5",
+        "0.3.6",
+        "0.3.7",
+        "0.3.8",
+        "0.3.9",
+        "0.3.10"
+      ],
       "fixed_in": "0.4.0",
       "description": "Decimal type conversions to uint may produce incorrect results near boundary values, leading to arithmetic errors in financial calculations.",
-      "exploit_template": "Pass boundary decimal value → incorrect uint conversion → arithmetic exploit",
+      "exploit_template": "Pass boundary decimal value \u2192 incorrect uint conversion \u2192 arithmetic exploit",
       "real_world": null,
       "immunefi_relevant": true,
       "cwe": "CWE-190",
-      "references": ["https://github.com/vyperlang/vyper/issues/3671"]
+      "references": [
+        "https://github.com/vyperlang/vyper/issues/3671"
+      ],
+      "required_pattern": "decimal|Decimal"
     },
     {
       "id": "VYPER-2022-001",
       "title": "Incorrect ABI Encoding of Structs",
       "severity": "MEDIUM",
-      "affected_versions": ["0.2.0","0.2.1","0.2.2","0.2.3","0.2.4","0.2.5","0.2.6","0.2.7","0.2.8","0.2.9","0.2.10","0.2.11","0.2.12","0.2.13","0.2.14"],
+      "affected_versions": [
+        "0.2.0",
+        "0.2.1",
+        "0.2.2",
+        "0.2.3",
+        "0.2.4",
+        "0.2.5",
+        "0.2.6",
+        "0.2.7",
+        "0.2.8",
+        "0.2.9",
+        "0.2.10",
+        "0.2.11",
+        "0.2.12",
+        "0.2.13",
+        "0.2.14"
+      ],
       "fixed_in": "0.2.15",
       "description": "Structs with dynamic types are incorrectly ABI encoded, which can cause cross-contract calls to pass corrupted data, leading to logic errors or fund misrouting.",
-      "exploit_template": "Call function expecting struct with dynamic field → corrupted data passed → logic bypass",
+      "exploit_template": "Call function expecting struct with dynamic field \u2192 corrupted data passed \u2192 logic bypass",
       "real_world": null,
       "immunefi_relevant": false,
       "cwe": "CWE-20",
-      "references": ["https://github.com/vyperlang/vyper/issues/2935"]
+      "references": [
+        "https://github.com/vyperlang/vyper/issues/2935"
+      ],
+      "required_pattern": "struct\\s+\\w+"
     }
   ],
   "version_risk_summary": {
-    "0.2.15": ["VYPER-2023-001", "VYPER-2023-002", "VYPER-2024-001", "VYPER-2022-001"],
-    "0.2.16": ["VYPER-2023-001", "VYPER-2024-001"],
-    "0.3.0":  ["VYPER-2023-001", "VYPER-2024-001", "VYPER-2024-002"],
-    "0.3.1":  ["VYPER-2023-003", "VYPER-2024-001", "VYPER-2024-002"],
-    "0.3.7":  ["VYPER-2023-003", "VYPER-2024-001", "VYPER-2024-002"],
-    "0.3.10": ["VYPER-2024-001", "VYPER-2024-002"],
-    "0.4.0":  []
+    "0.2.15": [
+      "VYPER-2023-001",
+      "VYPER-2023-002",
+      "VYPER-2024-001",
+      "VYPER-2022-001"
+    ],
+    "0.2.16": [
+      "VYPER-2023-001",
+      "VYPER-2024-001"
+    ],
+    "0.3.0": [
+      "VYPER-2023-001",
+      "VYPER-2024-001",
+      "VYPER-2024-002"
+    ],
+    "0.3.1": [
+      "VYPER-2023-003",
+      "VYPER-2024-001",
+      "VYPER-2024-002"
+    ],
+    "0.3.7": [
+      "VYPER-2023-003",
+      "VYPER-2024-001",
+      "VYPER-2024-002"
+    ],
+    "0.3.10": [
+      "VYPER-2024-001",
+      "VYPER-2024-002"
+    ],
+    "0.4.0": []
   }
 }
