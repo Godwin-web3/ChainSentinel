@@ -30,6 +30,7 @@ def _save_printer_cache(key: str, printer: str, text: str):
 
 AUTH_MODIFIER_PATTERNS = [
     "onlyOwner", "onlyAdmin", "onlyRole", "onlyGov", "onlyGuardian", "auth",
+    "onlyFactoryOwner", "onlyFactory", "onlyPool", "onlyVault", "onlyMinter",
     "onlyOperator", "onlyMinter", "onlyBurner", "onlyVault", "onlyKeeper",
     "onlyExecutor", "onlyTimelock", "onlyDAO", "onlyWhitelisted",
     "nonReentrant", "whenNotPaused", "whenPaused",
@@ -315,6 +316,17 @@ def extract_source_auth(project_root: str, func_name: str) -> list:
 
     return conditions
 
+
+def _detect_framework(project_root):
+    if os.path.exists(os.path.join(project_root, "foundry.toml")):
+        return "foundry"
+    if os.path.exists(os.path.join(project_root, "hardhat.config.js")) or \
+       os.path.exists(os.path.join(project_root, "hardhat.config.ts")):
+        return "hardhat"
+    if os.path.exists(os.path.join(project_root, "truffle-config.js")):
+        return "truffle"
+    return "solc"
+
 def run_enricher(resolved: dict, project_root: str, entry_file: str, solc_version: str) -> dict:
     """
     Run Slither printers and build function feature table.
@@ -325,20 +337,31 @@ def run_enricher(resolved: dict, project_root: str, entry_file: str, solc_versio
         env["SOLC_VERSION"] = solc_version
 
     try:
-        entry_rel = os.path.relpath(entry_file, project_root)
+        entry_rel = os.path.relpath(entry_file, os.path.dirname(project_root))
     except ValueError:
         entry_rel = entry_file
 
+    # Match solc args exactly with slither_runner.py
+    try:
+        major, minor, patch = (int(x) for x in solc_version.split(".")[:3])
+        use_ir = (major, minor) >= (0, 8) and patch >= 13
+    except Exception:
+        use_ir = False
+    solc_extra = " --via-ir --optimize" if use_ir else ""
+
+    remappings = resolved.get("remappings", [])
     base_cmd = [
         "slither", entry_rel,
         "--solc", "solc-wrapper",
-        "--solc-args", f"--allow-paths {project_root}",
+        "--solc-args", f"--allow-paths {project_root}{solc_extra}",
     ]
-    remappings = resolved.get("remappings", [])
+    base_cmd += ["--compile-force-framework", _detect_framework(project_root)]
     if remappings:
-        base_cmd += ["--solc-remaps", " ".join(remappings)]
+        base_cmd += ["--solc-remaps", " ".join(remappings[:50])]
 
     # Run function-summary
+        log.debug(f"Enricher: project_root={project_root} dirname={os.path.dirname(project_root)}")
+        log.debug(f"Enricher: base_cmd={base_cmd}")
     log.debug("Enricher: running function-summary printer")
     _ckey = _cache_key(resolved)
     _summary_cached = _load_printer_cache(_ckey, "function-summary")
@@ -349,10 +372,12 @@ def run_enricher(resolved: dict, project_root: str, entry_file: str, solc_versio
         else:
             r1 = subprocess.run(
                 base_cmd + ["--print", "function-summary"],
-                capture_output=True, text=True, timeout=360,
-                env=env, cwd=project_root
+                capture_output=True, text=True, timeout=900,
+                env=env, cwd=os.path.dirname(project_root)
             )
             _summary_text = r1.stderr + r1.stdout
+            log.debug(f"Enricher: returncode={r1.returncode}")
+            log.debug(f"Enricher: printer full output:\n{_summary_text}")
             _save_printer_cache(_ckey, "function-summary", _summary_text)
         func_data = parse_function_summary(_summary_text)
         log.debug(f"Enricher: parsed {len(func_data)} functions")
@@ -370,8 +395,8 @@ def run_enricher(resolved: dict, project_root: str, entry_file: str, solc_versio
         else:
             r2 = subprocess.run(
                 base_cmd + ["--print", "vars-and-auth"],
-                capture_output=True, text=True, timeout=360,
-                env=env, cwd=project_root
+                capture_output=True, text=True, timeout=900,
+                env=env, cwd=os.path.dirname(project_root)
             )
             _auth_text = r2.stderr + r2.stdout
             _save_printer_cache(_ckey, "vars-and-auth", _auth_text)

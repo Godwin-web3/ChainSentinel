@@ -51,11 +51,12 @@ def resolve(address: str, chain: Chain, depth: int = 0) -> dict:
         log.info(f"Resolving implementation at depth {depth + 1}")
         impl = resolve(impl_address, chain, depth + 1)
         return {
-            "address": address,
+            "address": impl_address,
+            "proxy_address": address,
             "chain": chain.name,
             "chain_id": chain.chain_id,
             "type": "proxy",
-            "bytecode": contract["bytecode"],
+            "bytecode": impl["bytecode"] if impl else contract["bytecode"],
             "name": impl["name"] if impl else contract["name"],
             "verified": impl["verified"] if impl else contract["verified"],
             "source": impl["source"] if impl else contract["source"],

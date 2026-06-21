@@ -1,0 +1,435 @@
+{
+  "patterns": [
+    {
+      "name": "reentrancy-eth",
+      "display_name": "ETH Reentrancy",
+      "category": "reentrancy",
+      "subcategory": "classic-reentrancy",
+      "description": "External call sends ETH before state update. Attacker re-enters the function before balance is decremented, draining the contract.",
+      "indicators": [
+        "external call before state update",
+        "call.value or transfer before balance--",
+        "withdraw pattern without CEI",
+        "receive() or fallback() in attacker contract"
+      ],
+      "requirements": [
+        "function sends ETH to external address",
+        "state update happens after the call",
+        "attacker controls receiving contract"
+      ],
+      "impact": "Complete drain of ETH from contract",
+      "affected_categories": ["vault", "lending", "staking", "dex"],
+      "mitigations": [
+        "checks-effects-interactions pattern",
+        "ReentrancyGuard / nonReentrant modifier",
+        "pull payment pattern"
+      ],
+      "confidence_base": 0.85,
+      "avg_severity": "critical",
+      "slither_checks": ["reentrancy-eth"],
+      "postmortem_examples": ["The DAO 2016 - $60M", "Lendf.Me 2020 - $25M"]
+    },
+    {
+      "name": "reentrancy-token",
+      "display_name": "Token Reentrancy",
+      "category": "reentrancy",
+      "subcategory": "cross-function-reentrancy",
+      "description": "Reentrancy via ERC777 hooks, ERC1155 callbacks, or custom token transfer hooks. State is read in one function and updated in another, creating a window for manipulation.",
+      "indicators": [
+        "ERC777 tokensReceived hook",
+        "ERC1155 onERC1155Received",
+        "safeTransfer before state update",
+        "shared storage read across two functions"
+      ],
+      "requirements": [
+        "token with transfer hook or callback",
+        "state not updated before external token transfer",
+        "attacker controls token receiver"
+      ],
+      "impact": "Drain tokens or manipulate accounting",
+      "affected_categories": ["lending", "vault", "dex", "staking"],
+      "mitigations": [
+        "CEI pattern",
+        "nonReentrant on all state-modifying functions",
+        "avoid ERC777 or validate hooks"
+      ],
+      "confidence_base": 0.75,
+      "avg_severity": "high",
+      "slither_checks": ["reentrancy-no-eth", "reentrancy-benign"],
+      "postmortem_examples": ["Uniswap v1 ERC777 2020", "imBTC Uniswap pool drain"]
+    },
+    {
+      "name": "read-only-reentrancy",
+      "display_name": "Read-Only Reentrancy",
+      "category": "reentrancy",
+      "subcategory": "read-only-reentrancy",
+      "description": "During a reentrant call, view functions return stale state. A second protocol reading price or balance from the first protocol during its own state transition gets a manipulated value.",
+      "indicators": [
+        "view function reads balances during ongoing transaction",
+        "Curve or Balancer LP price used by lending protocol",
+        "get_virtual_price called externally",
+        "no reentrancy lock on view functions"
+      ],
+      "requirements": [
+        "protocol A calls external contract mid-execution",
+        "protocol B reads state from protocol A via view function",
+        "attacker controls the reentrant call"
+      ],
+      "impact": "Price manipulation leading to undercollateralized borrows",
+      "affected_categories": ["lending", "vault", "dex"],
+      "mitigations": [
+        "reentrancy lock covering view functions",
+        "avoid reading external state mid-execution",
+        "use committed state not transient state"
+      ],
+      "confidence_base": 0.70,
+      "avg_severity": "high",
+      "slither_checks": [],
+      "postmortem_examples": ["Curve read-only reentrancy 2023 - multiple protocols"]
+    },
+    {
+      "name": "flash-loan-oracle-manipulation",
+      "display_name": "Flash Loan Oracle Manipulation",
+      "category": "oracle",
+      "subcategory": "spot-price-manipulation",
+      "description": "Attacker borrows large amount via flash loan, manipulates a spot price oracle by moving reserves in a pool, exploits a protocol reading that price, then repays.",
+      "indicators": [
+        "getReserves() used as price source",
+        "token.balanceOf(pool) used as price",
+        "no TWAP or time-weighted price",
+        "price read in same block as swap"
+      ],
+      "requirements": [
+        "protocol uses spot price from AMM pool",
+        "flash loan available for relevant token",
+        "price affects borrowing or liquidation"
+      ],
+      "impact": "Undercollateralized borrow, liquidation manipulation, fund drain",
+      "affected_categories": ["lending", "stability", "vault", "dex"],
+      "mitigations": [
+        "TWAP oracle with sufficient window",
+        "Chainlink price feed",
+        "multi-source oracle with deviation check"
+      ],
+      "confidence_base": 0.80,
+      "avg_severity": "critical",
+      "slither_checks": ["oracle-manipulation"],
+      "postmortem_examples": ["Mango Markets 2022 - $117M", "Cream Finance 2021 - $130M", "Euler Finance 2023 - $197M"]
+    },
+    {
+      "name": "price-manipulation-twap",
+      "display_name": "TWAP Manipulation",
+      "category": "oracle",
+      "subcategory": "twap-manipulation",
+      "description": "Short TWAP windows can be manipulated over multiple blocks by a well-capitalized attacker. Low liquidity pools are especially vulnerable.",
+      "indicators": [
+        "TWAP window under 30 minutes",
+        "low liquidity pool as price source",
+        "single pool TWAP with no fallback",
+        "consult() with short period parameter"
+      ],
+      "requirements": [
+        "TWAP window short enough to manipulate",
+        "attacker has capital to sustain price skew",
+        "protocol relies on single TWAP source"
+      ],
+      "impact": "Gradual price manipulation enabling undercollateralized borrows",
+      "affected_categories": ["lending", "stability", "vault"],
+      "mitigations": [
+        "minimum 30-minute TWAP window",
+        "circuit breaker on large price movements",
+        "multi-source oracle aggregation"
+      ],
+      "confidence_base": 0.60,
+      "avg_severity": "high",
+      "slither_checks": [],
+      "postmortem_examples": ["Inverse Finance 2022 - $15M"]
+    },
+    {
+      "name": "access-control-missing",
+      "display_name": "Missing Access Control",
+      "category": "access_control",
+      "subcategory": "unprotected-function",
+      "description": "Critical functions lack access control modifiers. Any address can call functions that should be restricted to owner, admin, or governance.",
+      "indicators": [
+        "public function modifying critical state",
+        "no onlyOwner or onlyRole modifier",
+        "initialize() callable multiple times",
+        "upgrade function without access check"
+      ],
+      "requirements": [
+        "function is externally callable",
+        "function modifies critical state or moves funds"
+      ],
+      "impact": "Unauthorized fund withdrawal, ownership takeover, protocol destruction",
+      "affected_categories": ["vault", "lending", "bridge", "governance", "multisig"],
+      "mitigations": [
+        "onlyOwner or role-based access control",
+        "initializer modifier on init functions",
+        "timelock on critical admin functions"
+      ],
+      "confidence_base": 0.90,
+      "avg_severity": "critical",
+      "slither_checks": ["arbitrary-send-eth", "unprotected-upgrade", "suicidal"],
+      "postmortem_examples": ["Parity Wallet 2017 - $30M", "Ronin Bridge 2022 - $625M"]
+    },
+    {
+      "name": "controlled-delegatecall",
+      "display_name": "Controlled Delegatecall",
+      "category": "proxy",
+      "subcategory": "delegatecall-injection",
+      "description": "Delegatecall target or calldata is controlled by the caller. Attacker points delegatecall at a malicious contract to execute arbitrary code in the context of the victim contract.",
+      "indicators": [
+        "delegatecall with user-controlled target",
+        "delegatecall with user-controlled calldata",
+        "proxy with no whitelist on implementation",
+        "fallback delegatecall to user input"
+      ],
+      "requirements": [
+        "caller can influence delegatecall target or data",
+        "victim contract has valuable state or funds"
+      ],
+      "impact": "Full storage takeover, ownership hijack, fund drain",
+      "affected_categories": ["vault", "bridge", "multisig"],
+      "mitigations": [
+        "whitelist valid implementation addresses",
+        "validate calldata before delegatecall",
+        "avoid user-controlled delegatecall entirely"
+      ],
+      "confidence_base": 0.88,
+      "avg_severity": "critical",
+      "slither_checks": ["controlled-delegatecall"],
+      "postmortem_examples": ["Parity Wallet 2017 - $30M", "Harvest Finance 2020"]
+    },
+    {
+      "name": "integer-overflow",
+      "display_name": "Integer Overflow / Underflow",
+      "category": "arithmetic",
+      "subcategory": "overflow",
+      "description": "Arithmetic operations overflow or underflow without SafeMath or Solidity 0.8+ checks. Balances wrap around to unexpected values.",
+      "indicators": [
+        "solidity version below 0.8.0",
+        "unchecked block with arithmetic",
+        "manual arithmetic without SafeMath",
+        "balance or supply calculation without bounds"
+      ],
+      "requirements": [
+        "Solidity < 0.8.0 or unchecked block",
+        "arithmetic on user-controlled values"
+      ],
+      "impact": "Balance manipulation, minting unlimited tokens, bypassing limits",
+      "affected_categories": ["token", "lending", "dex", "vault"],
+      "mitigations": [
+        "Solidity 0.8.0+ default overflow checks",
+        "SafeMath library for older versions",
+        "explicit bounds checking in unchecked blocks"
+      ],
+      "confidence_base": 0.85,
+      "avg_severity": "high",
+      "slither_checks": [],
+      "postmortem_examples": ["BeautyChain BEC 2018 - $900M", "SMT Token 2018"]
+    },
+    {
+      "name": "precision-loss",
+      "display_name": "Precision Loss / Rounding",
+      "category": "arithmetic",
+      "subcategory": "precision",
+      "description": "Division before multiplication causes precision loss. In high-value DeFi calculations, rounding errors can be exploited at scale.",
+      "indicators": [
+        "division before multiplication in formula",
+        "integer division truncating significant digits",
+        "share price calculation with rounding",
+        "fee calculation losing precision"
+      ],
+      "requirements": [
+        "arithmetic involves division",
+        "result used in financial calculation",
+        "attacker can scale operations"
+      ],
+      "impact": "Rounding exploitation, fee avoidance, share price manipulation",
+      "affected_categories": ["vault", "lending", "dex", "staking"],
+      "mitigations": [
+        "multiply before divide",
+        "use fixed-point math libraries",
+        "minimum deposit amounts to prevent dust attacks"
+      ],
+      "confidence_base": 0.65,
+      "avg_severity": "medium",
+      "slither_checks": ["divide-before-multiply"],
+      "postmortem_examples": ["Compound rounding bug 2021"]
+    },
+    {
+      "name": "flash-loan-attack",
+      "display_name": "Flash Loan Attack",
+      "category": "flash_loan",
+      "subcategory": "flash-loan-exploit",
+      "description": "Attacker uses flash loan to temporarily hold large capital, manipulate protocol state, extract value, and repay in a single transaction.",
+      "indicators": [
+        "protocol state readable and changeable in single tx",
+        "no flash loan protection",
+        "price or liquidity affects protocol in same block",
+        "large single-tx capital requirement feasible via flash loan"
+      ],
+      "requirements": [
+        "flash loan available for relevant asset",
+        "protocol vulnerable to large single-tx capital",
+        "profit extractable within single transaction"
+      ],
+      "impact": "Liquidation manipulation, price manipulation, governance takeover",
+      "affected_categories": ["lending", "dex", "governance", "stability"],
+      "mitigations": [
+        "commit-reveal schemes",
+        "snapshot balances at block start",
+        "multi-block delay on sensitive operations"
+      ],
+      "confidence_base": 0.75,
+      "avg_severity": "critical",
+      "slither_checks": [],
+      "postmortem_examples": ["bZx 2020 - $1M", "PancakeBunny 2021 - $45M", "Beanstalk 2022 - $182M"]
+    },
+    {
+      "name": "bridge-message-replay",
+      "display_name": "Bridge Message Replay",
+      "category": "bridge",
+      "subcategory": "replay-attack",
+      "description": "Bridge fails to invalidate processed messages. Attacker replays a valid cross-chain message to trigger multiple executions of a single deposit or mint.",
+      "indicators": [
+        "no nonce or message ID tracking",
+        "processedMessages mapping missing",
+        "message hash not stored after execution",
+        "relay function callable multiple times"
+      ],
+      "requirements": [
+        "bridge accepts cross-chain messages",
+        "no replay protection on message execution",
+        "attacker has a valid past message"
+      ],
+      "impact": "Double-spend, infinite minting, fund drain",
+      "affected_categories": ["bridge"],
+      "mitigations": [
+        "store processed message hashes",
+        "nonce per sender",
+        "message ID uniqueness check before execution"
+      ],
+      "confidence_base": 0.82,
+      "avg_severity": "critical",
+      "slither_checks": [],
+      "postmortem_examples": ["Nomad Bridge 2022 - $190M"]
+    },
+    {
+      "name": "governance-flash-loan",
+      "display_name": "Flash Loan Governance Attack",
+      "category": "governance",
+      "subcategory": "flash-loan-voting",
+      "description": "Attacker borrows governance tokens via flash loan, votes on a malicious proposal in the same transaction, then repays. No time-weighted voting means instant governance takeover.",
+      "indicators": [
+        "voting power from current balance not snapshot",
+        "no timelock on proposal execution",
+        "proposal and execution in same block possible",
+        "token balance used directly for votes"
+      ],
+      "requirements": [
+        "governance token available via flash loan",
+        "no snapshot-based voting",
+        "no timelock or insufficient timelock"
+      ],
+      "impact": "Governance takeover, treasury drain, malicious upgrades",
+      "affected_categories": ["governance"],
+      "mitigations": [
+        "snapshot voting power at proposal creation",
+        "minimum timelock of 48+ hours",
+        "quorum requirements"
+      ],
+      "confidence_base": 0.78,
+      "avg_severity": "critical",
+      "slither_checks": [],
+      "postmortem_examples": ["Beanstalk 2022 - $182M governance exploit"]
+    },
+    {
+      "name": "vault-inflation-attack",
+      "display_name": "ERC4626 Vault Inflation Attack",
+      "category": "vault",
+      "subcategory": "share-price-manipulation",
+      "description": "Attacker is first depositor in an ERC4626 vault. Donates assets directly to vault before victim deposits. Share price inflates, victim receives 0 shares due to rounding.",
+      "indicators": [
+        "ERC4626 convertToShares with integer division",
+        "totalAssets() reads token balance directly",
+        "no virtual shares or dead shares protection",
+        "first depositor can set initial share price"
+      ],
+      "requirements": [
+        "vault uses ERC4626 share model",
+        "attacker can be first depositor",
+        "no minimum deposit or virtual share protection"
+      ],
+      "impact": "Victim loses entire deposit to attacker",
+      "affected_categories": ["vault"],
+      "mitigations": [
+        "virtual shares (dead shares) on deployment",
+        "minimum initial deposit burned",
+        "OpenZeppelin ERC4626 with offset decimals"
+      ],
+      "confidence_base": 0.80,
+      "avg_severity": "high",
+      "slither_checks": [],
+      "postmortem_examples": ["Multiple ERC4626 vaults 2022-2023"]
+    },
+    {
+      "name": "liquidation-manipulation",
+      "display_name": "Liquidation Threshold Manipulation",
+      "category": "lending",
+      "subcategory": "liquidation-exploit",
+      "description": "Attacker manipulates collateral price or borrow amount to trigger or avoid liquidation. Can also grief other users by making their positions unliquidatable.",
+      "indicators": [
+        "liquidation uses spot price",
+        "collateral price from single source",
+        "liquidation bonus large enough to profit from manipulation",
+        "no circuit breaker on liquidations"
+      ],
+      "requirements": [
+        "price oracle manipulable",
+        "attacker has open position or can open one",
+        "liquidation bonus exists"
+      ],
+      "impact": "Unfair liquidation of victim positions, protocol insolvency",
+      "affected_categories": ["lending", "stability", "perpetual"],
+      "mitigations": [
+        "robust oracle with TWAP",
+        "liquidation delay",
+        "circuit breaker on large price moves"
+      ],
+      "confidence_base": 0.70,
+      "avg_severity": "high",
+      "slither_checks": [],
+      "postmortem_examples": ["Mango Markets 2022", "Venus Protocol 2021 - $200M"]
+    },
+    {
+      "name": "unchecked-return-value",
+      "display_name": "Unchecked Transfer Return Value",
+      "category": "token",
+      "subcategory": "return-value",
+      "description": "ERC20 transfer or transferFrom return value not checked. Non-standard tokens that return false on failure instead of reverting cause silent accounting errors.",
+      "indicators": [
+        "transfer() without checking return bool",
+        "transferFrom() without checking return bool",
+        "no SafeERC20 wrapper",
+        "USDT or non-standard token interaction"
+      ],
+      "requirements": [
+        "token used does not revert on failure",
+        "protocol does not check transfer return value"
+      ],
+      "impact": "Silent transfer failure, accounting mismatch, fund loss",
+      "affected_categories": ["lending", "dex", "vault", "staking"],
+      "mitigations": [
+        "SafeERC20 from OpenZeppelin",
+        "explicit return value check",
+        "require(token.transfer(...))"
+      ],
+      "confidence_base": 0.80,
+      "avg_severity": "medium",
+      "slither_checks": ["unchecked-transfer"],
+      "postmortem_examples": []
+    }
+  ]
+}

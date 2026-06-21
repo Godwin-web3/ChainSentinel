@@ -86,6 +86,15 @@ def print_result(result):
             for f in hv[:3]:
                 lines.append("  [" + f["severity"] + "] " + f["title"])
 
+        graph = analysis.get("graph")
+        if graph:
+            lines.append(f"  --- Graph Analysis: {graph.get('nodes',0)} nodes | {graph.get('sinks',0)} sinks ---")
+            lines.append(f"  CONFIRMED:{graph.get('confirmed',0)} LIKELY:{graph.get('likely',0)} POSSIBLE:{graph.get('possible',0)} SUPPRESSED:{graph.get('suppressed',0)}")
+            for r in graph.get("findings", []):
+                lines.append(f"  [{r['verdict']}][{r['confidence']}%] {r['constraint_type']}")
+                lines.append(f"    {r['entry']}")
+                lines.append(f"    -> {r['sink']} | {r['immunefi_impact']}")
+
     if result.get("poc_file"):
         lines.append("  PoC        : " + result["poc_file"])
     if result.get("report_file"):
@@ -139,6 +148,7 @@ def analyze(address, chain_name, output_json=False):
         language = lang_info["language"]
 
         analysis = {}
+        enrichment = {}
         if language == "vyper":
             vyper_version = extract_vyper_version(source_code, compiler_str)
             vyper_result = vyper_analyze(source_code, version=vyper_version or "")
@@ -155,6 +165,54 @@ def analyze(address, chain_name, output_json=False):
                 analysis = summarize(enriched)
                 analysis["findings"] = enriched
                 analysis["language"] = "solidity"
+
+                # Graph analysis — path enumeration
+                try:
+                    from core.graph import build_graph
+                    from core.sinks import classify_sinks, top_sinks
+                    from core.paths import enumerate_paths, top_paths
+
+                    p_root = slither_result.get("project_root")
+                    e_file = slither_result.get("entry_file")
+                    s_ver  = slither_result.get("solc_version")
+
+                    if p_root and e_file and s_ver:
+                        remaps = slither_result.get("remappings", [])
+                        nodes, graph_edges = build_graph(p_root, e_file, s_ver, enrichment, remaps)
+                        sinks = classify_sinks(nodes, graph_edges)
+                        paths = enumerate_paths(nodes, graph_edges, sinks)
+                        high_paths = top_paths(paths, min_score=10)
+
+                        from core.constraints import validate_paths
+                        report = validate_paths(paths, nodes, graph_edges)
+
+                        analysis["graph"] = {
+                            "nodes": len(nodes),
+                            "sinks": len(sinks),
+                            "paths": len(paths),
+                            "confirmed": len(report.confirmed),
+                            "likely": len(report.likely),
+                            "possible": len(report.possible),
+                            "suppressed": len(report.suppressed),
+                            "findings": [
+                                {
+                                    "verdict": r.verdict,
+                                    "confidence": r.confidence,
+                                    "constraint_type": r.constraint_type,
+                                    "entry": r.path.entry,
+                                    "sink": r.path.sink.node_id,
+                                    "sink_category": r.path.sink.category,
+                                    "flags": sorted(r.path.constraint_flags),
+                                    "immunefi_impact": r.immunefi_impact,
+                                    "reasoning": r.reasoning[:200],
+                                    "final_score": r.final_score,
+                                }
+                                for r in report.all_findings()[:10]
+                            ]
+                        }
+                        log.success(f"Graph: {len(nodes)} nodes | {len(sinks)} sinks | CONFIRMED:{len(report.confirmed)} LIKELY:{len(report.likely)} POSSIBLE:{len(report.possible)}")
+                except Exception as ge:
+                    log.warn(f"Graph analysis failed: {ge}")
             # Always run Yul handler on Solidity — catches inline assembly
             if source_code and lang_info.get("has_inline_yul"):
                 yul_result = yul_analyze(source_code)
@@ -186,7 +244,8 @@ def analyze(address, chain_name, output_json=False):
                 name=resolved["name"],
                 category=category,
                 findings=analysis["findings"],
-                block_number=0
+                block_number=0,
+                graph_findings=analysis.get("graph", {}).get("findings", [])
             )
             # Run PoC verification
             verify_result = None

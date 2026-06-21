@@ -1,0 +1,423 @@
+"""
+knowledge/ingestion/parsers/markdown_parser.py
+Parses raw markdown audit reports into structured findings.
+Handles Code4rena, Sherlock, and general audit markdown formats.
+"""
+
+import re
+import os
+from typing import Optional
+from utils.logger import log
+
+# Severity mappings across different report formats
+SEVERITY_MAP = {
+    "critical": "critical",
+    "crit":     "critical",
+    "high":     "high",
+    "h-":       "high",
+    "medium":   "medium",
+    "med":      "medium",
+    "m-":       "medium",
+    "low":      "low",
+    "l-":       "low",
+    "informational": "informational",
+    "info":     "informational",
+    "gas":      "gas",
+    "optimization": "gas",
+}
+
+# Patterns to detect finding headers in different formats
+FINDING_HEADER_PATTERNS = [
+    # Code4rena: ## [H-01] Title or ## H-01: Title
+    re.compile(
+        r'^#{1,3}\s*\[?([HMLCGhmlcg][-–]\d+)\]?\s*[:\-–]?\s*(.+)$',
+        re.MULTILINE
+    ),
+    # Sherlock: ## Title (with severity in body)
+    re.compile(
+        r'^##\s+(.+?)\s*$',
+        re.MULTILINE
+    ),
+    # Generic: ### [HIGH] Title or ### HIGH: Title
+    re.compile(
+        r'^#{2,4}\s*\[?(critical|high|medium|low|informational|gas)\]?\s*[:\-–]?\s*(.+)$',
+        re.MULTILINE | re.IGNORECASE
+    ),
+]
+
+# Patterns to extract severity from finding body
+SEVERITY_INLINE_PATTERNS = [
+    re.compile(r'\*\*Severity\*\*\s*[:\-–]\s*(\w+)', re.IGNORECASE),
+    re.compile(r'\*\*Risk\*\*\s*[:\-–]\s*(\w+)', re.IGNORECASE),
+    re.compile(r'Severity\s*[:\-–]\s*(\w+)', re.IGNORECASE),
+    re.compile(r'\*\*(High|Medium|Low|Critical|Informational)\*\*', re.IGNORECASE),
+    re.compile(r'#\s*(High|Medium|Low|Critical|Informational)\s*Risk', re.IGNORECASE),
+]
+
+# Patterns to extract impact
+IMPACT_PATTERNS = [
+    re.compile(r'\*\*Impact\*\*\s*[:\-–]?\s*(.+?)(?=\n\n|\n##|\n\*\*|$)', re.DOTALL | re.IGNORECASE),
+    re.compile(r'##\s*Impact\s*\n(.+?)(?=\n##|$)', re.DOTALL | re.IGNORECASE),
+    re.compile(r'Impact\s*[:\-–]\s*(.+?)(?=\n\n|$)', re.DOTALL | re.IGNORECASE),
+]
+
+# Patterns to extract recommendations
+RECOMMENDATION_PATTERNS = [
+    re.compile(r'\*\*Recommendation\*\*\s*[:\-–]?\s*(.+?)(?=\n\n|\n##|\n\*\*|$)', re.DOTALL | re.IGNORECASE),
+    re.compile(r'##\s*Recommendation[s]?\s*\n(.+?)(?=\n##|$)', re.DOTALL | re.IGNORECASE),
+    re.compile(r'Mitigation\s*[:\-–]?\s*(.+?)(?=\n\n|$)', re.DOTALL | re.IGNORECASE),
+]
+
+# Attack category keywords
+CATEGORY_KEYWORDS = {
+    "reentrancy":     ["reentrancy", "reentrant", "re-entrancy", "reentrancy guard"],
+    "oracle":         ["oracle", "price manipulation", "twap", "spot price", "chainlink", "getreserves"],
+    "access_control": ["access control", "onlyowner", "authorization", "privilege", "unauthorized", "permissioned"],
+    "flash_loan":     ["flash loan", "flashloan", "flash-loan", "aave", "balancer vault"],
+    "arithmetic":     ["overflow", "underflow", "precision", "rounding", "divide", "safemath"],
+    "proxy":          ["delegatecall", "proxy", "upgrade", "implementation", "beacon"],
+    "token":          ["erc20", "transfer", "transferfrom", "safeTransfer", "return value"],
+    "bridge":         ["bridge", "cross-chain", "message replay", "relay", "finalize"],
+    "governance":     ["governance", "voting", "proposal", "quorum", "timelock"],
+    "dos":            ["denial of service", "dos", "gas limit", "unbounded loop"],
+    "logic":          ["logic error", "incorrect", "wrong", "missing check", "invariant"],
+}
+
+
+def _normalize_severity(raw: str) -> str:
+    raw = raw.lower().strip()
+    for key, val in SEVERITY_MAP.items():
+        if raw.startswith(key):
+            return val
+    return "informational"
+
+
+def _extract_severity(text: str, header: str = "") -> str:
+    # Try header prefix first (H-01, M-02, etc.)
+    prefix_match = re.match(r'\[?([HMLCGhmlcg])[-–]\d+\]?', header)
+    if prefix_match:
+        prefix = prefix_match.group(1).lower()
+        mapping = {
+            "h": "high", "m": "medium", "l": "low",
+            "c": "critical", "g": "gas"
+        }
+        return mapping.get(prefix, "informational")
+
+    # Try inline severity patterns
+    for pattern in SEVERITY_INLINE_PATTERNS:
+        match = pattern.search(text[:500])
+        if match:
+            return _normalize_severity(match.group(1))
+
+    return "informational"
+
+
+def _extract_field(text: str, patterns: list) -> str:
+    for pattern in patterns:
+        match = pattern.search(text)
+        if match:
+            raw = match.group(1).strip()
+            # Clean up markdown
+            raw = re.sub(r'\*\*|__', '', raw)
+            raw = re.sub(r'\n+', ' ', raw)
+            return raw[:1000]
+    return ""
+
+
+def _detect_category(text: str) -> str:
+    text_lower = text.lower()
+    scores = {}
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in text_lower)
+        if score > 0:
+            scores[category] = score
+    if scores:
+        return max(scores, key=scores.get)
+    return "logic"
+
+
+def _extract_affected_functions(text: str) -> list:
+    """Extract function names mentioned in finding."""
+    functions = []
+    # Match function signatures
+    fn_pattern = re.compile(r'`(\w+)\s*\([^)]*\)`|function\s+(\w+)\s*\(', re.IGNORECASE)
+    for match in fn_pattern.finditer(text):
+        fn_name = match.group(1) or match.group(2)
+        if fn_name and fn_name not in functions:
+            functions.append(fn_name)
+    return functions[:10]
+
+
+def parse_code4rena(content: str, filename: str) -> list:
+    """
+    Parse Code4rena report format.
+    Each finding starts with ## [H-01], ## [M-02], etc.
+    """
+    findings = []
+
+    # Split on finding headers
+    pattern = re.compile(
+        r'^(#{1,3}\s*\[?[HMLCGhmlcg][-–]\d+\]?.+?)$',
+        re.MULTILINE
+    )
+    splits = pattern.split(content)
+
+    i = 1
+    while i < len(splits) - 1:
+        header = splits[i].strip()
+        body = splits[i + 1] if i + 1 < len(splits) else ""
+        i += 2
+
+        if len(body) < 50:
+            continue
+
+        severity = _extract_severity(body, header)
+        if severity in ("gas", "informational"):
+            continue
+
+        title = re.sub(r'^#{1,3}\s*\[?[HMLCGhmlcg][-–]\d+\]?\s*[:\-–]?\s*', '', header).strip()
+        title = re.sub(r'\*\*', '', title).strip()
+
+        if not title or len(title) < 5:
+            continue
+
+        impact = _extract_field(body, IMPACT_PATTERNS)
+        recommendation = _extract_field(body, RECOMMENDATION_PATTERNS)
+        category = _detect_category(header + " " + body[:500])
+        affected_functions = _extract_affected_functions(body)
+
+        findings.append({
+            "title":              title,
+            "severity":           severity,
+            "category":           category,
+            "description":        body[:2000].strip(),
+            "impact":             impact,
+            "recommendation":     recommendation,
+            "affected_functions": affected_functions,
+            "source_file":        filename,
+            "format":             "code4rena",
+        })
+
+    return findings
+
+
+def parse_sherlock(content: str, filename: str) -> list:
+    """
+    Parse Sherlock report format.
+    Findings are under ## headers with severity in body.
+    """
+    findings = []
+
+    sections = re.split(r'^## ', content, flags=re.MULTILINE)
+
+    for section in sections[1:]:
+        lines = section.strip().split('\n')
+        if not lines:
+            continue
+
+        title = lines[0].strip()
+        body = '\n'.join(lines[1:]).strip()
+
+        if len(body) < 50:
+            continue
+
+        severity = _extract_severity(body)
+        if severity in ("gas", "informational"):
+            continue
+
+        impact = _extract_field(body, IMPACT_PATTERNS)
+        recommendation = _extract_field(body, RECOMMENDATION_PATTERNS)
+        category = _detect_category(title + " " + body[:500])
+        affected_functions = _extract_affected_functions(body)
+
+        findings.append({
+            "title":              title,
+            "severity":           severity,
+            "category":           category,
+            "description":        body[:2000].strip(),
+            "impact":             impact,
+            "recommendation":     recommendation,
+            "affected_functions": affected_functions,
+            "source_file":        filename,
+            "format":             "sherlock",
+        })
+
+    return findings
+
+
+
+def parse_sherlock_judging(content: str, filename: str) -> list:
+    """
+    Parse Sherlock per-finding judging files.
+    Format: warden name, severity, # Title, ### sections
+    """
+    findings = []
+    lines = content.strip().split("\n")
+    if len(lines) < 3:
+        return findings
+
+    # Severity is on line 1 or 2
+    severity = ""
+    title = ""
+    for i, line in enumerate(lines[:5]):
+        normalized = _normalize_severity(line.strip())
+        if normalized in ("critical", "high", "medium", "low"):
+            severity = normalized
+            break
+
+    if not severity:
+        return findings
+
+    # Title is the first # header
+    for line in lines:
+        if line.startswith("# ") and not line.startswith("## "):
+            title = line.lstrip("# ").strip()
+            break
+
+    if not title:
+        return findings
+
+    body = content
+    impact = _extract_field(body, IMPACT_PATTERNS)
+    recommendation = _extract_field(body, RECOMMENDATION_PATTERNS)
+    category = _detect_category(title + " " + body[:500])
+    affected_functions = _extract_affected_functions(body)
+
+    findings.append({
+        "title":              title,
+        "severity":           severity,
+        "category":           category,
+        "description":        body[:2000].strip(),
+        "impact":             impact,
+        "recommendation":     recommendation,
+        "affected_functions": affected_functions,
+        "source_file":        filename,
+        "format":             "sherlock_judging",
+    })
+
+    return findings
+
+def parse_generic(content: str, filename: str) -> list:
+    """
+    Fallback parser for general audit markdown format.
+    Looks for any severity-labeled sections.
+    """
+    findings = []
+
+    sections = re.split(r'^#{1,4}\s+', content, flags=re.MULTILINE)
+
+    for section in sections[1:]:
+        lines = section.strip().split('\n')
+        if not lines:
+            continue
+
+        title = lines[0].strip()
+        body = '\n'.join(lines[1:]).strip()
+
+        if len(body) < 50:
+            continue
+
+        severity = _extract_severity(body, title)
+        if severity == "gas":
+            continue
+
+        impact = _extract_field(body, IMPACT_PATTERNS)
+        recommendation = _extract_field(body, RECOMMENDATION_PATTERNS)
+        category = _detect_category(title + " " + body[:500])
+        affected_functions = _extract_affected_functions(body)
+
+        if severity == "informational" and not impact:
+            continue
+
+        findings.append({
+            "title":              title,
+            "severity":           severity,
+            "category":           category,
+            "description":        body[:2000].strip(),
+            "impact":             impact,
+            "recommendation":     recommendation,
+            "affected_functions": affected_functions,
+            "source_file":        filename,
+            "format":             "generic",
+        })
+
+    return findings
+
+
+def detect_format(content: str, filename: str) -> str:
+    """Detect which audit format this file uses."""
+    if re.search(r'\[?[HMhm][-–]\d+\]?', content[:3000]):
+        return "code4rena"
+    if re.search(r"^[A-Za-z ]+$", content[:100], re.MULTILINE) and re.search(r"^(High|Medium|Low|Critical)$", content[:200], re.MULTILINE):
+        return "sherlock_judging"
+    if "sherlock" in filename.lower():
+        return "sherlock"
+    if re.search(r'\*\*Severity\*\*|\*\*Risk\*\*', content[:3000]):
+        return "sherlock"
+    return "generic"
+
+
+def parse_file(filepath: str) -> list:
+    """
+    Parse a single markdown file into structured findings.
+    Auto-detects format and routes to correct parser.
+    """
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+    except Exception as e:
+        log.error(f"Failed to read {filepath}: {e}")
+        return []
+
+    if len(content) < 100:
+        return []
+
+    filename = os.path.basename(filepath)
+    fmt = detect_format(content, filename)
+
+    if fmt == "code4rena":
+        findings = parse_code4rena(content, filename)
+    elif fmt == "sherlock_judging":
+        findings = parse_sherlock_judging(content, filename)
+    elif fmt == "sherlock":
+        findings = parse_sherlock(content, filename)
+    else:
+        findings = parse_generic(content, filename)
+
+    log.info(f"Parsed {filename}: {len(findings)} findings ({fmt})")
+    return findings
+
+
+def parse_directory(directory: str) -> list:
+    """Parse all markdown files in a directory."""
+    all_findings = []
+
+    md_files = [
+        os.path.join(directory, f)
+        for f in os.listdir(directory)
+        if f.endswith('.md')
+    ]
+
+    log.info(f"Parsing {len(md_files)} markdown files in {directory}")
+
+    for filepath in md_files:
+        findings = parse_file(filepath)
+        all_findings.extend(findings)
+
+    log.success(f"Total findings extracted: {len(all_findings)}")
+    return all_findings
+
+
+if __name__ == "__main__":
+    import sys
+    import json
+
+    target = sys.argv[1] if len(sys.argv) > 1 else "knowledge/storage/raw/markdown"
+
+    if os.path.isfile(target):
+        findings = parse_file(target)
+    else:
+        findings = parse_directory(target)
+
+    print(json.dumps(findings[:3], indent=2))
+    print(f"\nTotal: {len(findings)} findings extracted")

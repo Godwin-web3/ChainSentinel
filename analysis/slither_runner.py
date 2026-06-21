@@ -48,7 +48,7 @@ def write_source_files(source_data: dict) -> Optional[tuple]:
             all_files.sort(key=lambda x: score_entry(x[0]))
             entry_file = all_files[0][1] if all_files else None
             log.debug(f"Entry file: {all_files[0][0] if all_files else None}")
-            return (tmpdir, entry_file)
+            return (tmpdir, entry_file, len(all_files))
 
         # Single file fallback
         source = source_data.get("source", "")
@@ -125,7 +125,8 @@ def run_slither(resolved: dict) -> dict:
             "findings": []
         }
 
-    project_root, filepath = result_tuple
+    project_root, filepath, *_extra = result_tuple
+    is_multifile = _extra[0] > 1 if _extra else False
 
     # Use relative path so Slither doesn't walk up and find foundry.toml
     import os as _os
@@ -147,13 +148,30 @@ def run_slither(resolved: dict) -> dict:
                 remappings.append(f"{short}/={full}/")
 
     remappings = list(dict.fromkeys(remappings))
+
+    # Prioritize known packages that commonly fail remapping in deep lib trees
+    PRIORITY_PACKAGES = {
+        "openzeppelin-contracts", "@openzeppelin", "forge-std",
+        "solmate", "solady", "ds-test", "prb-math",
+    }
+    priority = [r for r in remappings if any(p in r for p in PRIORITY_PACKAGES)]
+    rest = [r for r in remappings if r not in priority]
+    remappings = priority + rest
+
     log.debug(f"Remappings: {remappings[:5]}")
 
+    # --via-ir --optimize only supported in solc >= 0.8.13
+    try:
+        major, minor, patch = (int(x) for x in solc_version.split(".")[:3])
+        use_ir = (major, minor) >= (0, 8) and patch >= 13
+    except Exception:
+        use_ir = False
+    solc_extra = " --via-ir --optimize" if use_ir else ""
     cmd = ["slither", filepath, "--solc", "solc-wrapper",
-           "--solc-args", f"--allow-paths {project_root}",
+           "--solc-args", f"--allow-paths {project_root}{solc_extra}",
            "--json", "-"]
     if remappings:
-        cmd += ["--solc-remaps", " ".join(remappings[:20])]
+        cmd += ["--solc-remaps", " ".join(remappings[:50])]
 
     env = os.environ.copy()
     if solc_version:
@@ -209,12 +227,17 @@ def run_slither(resolved: dict) -> dict:
         medium = sum(1 for f in findings if f["impact"] == "Medium")
         low = sum(1 for f in findings if f["impact"] == "Low")
 
+        resolved["remappings"] = remappings
         enrichment = run_enricher(resolved, project_root, os.path.join(project_root, filepath), solc_version)
         return {
             "success": True,
             "findings": findings,
             "slither_json": output,
             "enrichment": enrichment,
+            "project_root": project_root,
+            "entry_file": os.path.join(project_root, filepath),
+            "solc_version": solc_version,
+            "remappings": remappings,
             "summary": {
                 "total": len(findings),
                 "high": high,

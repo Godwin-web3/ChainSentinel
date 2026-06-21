@@ -1,0 +1,143 @@
+{
+  "sequences": [
+    {
+      "pattern_name": "reentrancy-eth",
+      "steps": [
+        {"step_order": 1, "step_name": "Enter Withdraw", "step_description": "Attacker calls withdraw or claim function", "code_signal": "public/external function with ETH transfer", "slither_check": "reentrancy-eth", "is_optional": 0},
+        {"step_order": 2, "step_name": "Read Balance", "step_description": "Contract reads attacker balance before state update", "code_signal": "balances[msg.sender] read before decrement", "slither_check": null, "is_optional": 0},
+        {"step_order": 3, "step_name": "Send ETH", "step_description": "Contract sends ETH to attacker before updating state", "code_signal": "call.value() or transfer() before balance--", "slither_check": "reentrancy-eth", "is_optional": 0},
+        {"step_order": 4, "step_name": "Reenter", "step_description": "Attacker receive() or fallback() calls withdraw again", "code_signal": "receive() or fallback() with external call back", "slither_check": null, "is_optional": 0},
+        {"step_order": 5, "step_name": "Drain", "step_description": "Loop repeats until contract is empty", "code_signal": "balance not yet decremented on reentry", "slither_check": null, "is_optional": 0}
+      ]
+    },
+    {
+      "pattern_name": "reentrancy-token",
+      "steps": [
+        {"step_order": 1, "step_name": "Enter Function", "step_description": "Attacker calls function that transfers tokens", "code_signal": "safeTransfer or transfer before state update", "slither_check": "reentrancy-no-eth", "is_optional": 0},
+        {"step_order": 2, "step_name": "Token Transfer Triggers Hook", "step_description": "ERC777 tokensReceived or ERC1155 onReceived fires", "code_signal": "tokensReceived() or onERC1155Received()", "slither_check": null, "is_optional": 0},
+        {"step_order": 3, "step_name": "Reenter Second Function", "step_description": "Hook calls a different function that reads stale state", "code_signal": "shared storage variable read in second function", "slither_check": null, "is_optional": 0},
+        {"step_order": 4, "step_name": "Exploit Stale State", "step_description": "Second function acts on balance not yet updated by first", "code_signal": "accounting mismatch between two functions", "slither_check": null, "is_optional": 0}
+      ]
+    },
+    {
+      "pattern_name": "read-only-reentrancy",
+      "steps": [
+        {"step_order": 1, "step_name": "Enter Protocol A", "step_description": "Attacker triggers state transition in Protocol A", "code_signal": "remove_liquidity or withdraw with ETH callback", "slither_check": null, "is_optional": 0},
+        {"step_order": 2, "step_name": "Callback Fires Mid-Execution", "step_description": "ETH callback fires before Protocol A updates its state", "code_signal": "receive() triggered during Curve or Balancer exit", "slither_check": null, "is_optional": 0},
+        {"step_order": 3, "step_name": "Read Stale Price from Protocol A", "step_description": "Inside callback, attacker reads get_virtual_price or similar", "code_signal": "get_virtual_price() or balanceOf() call to Protocol A", "slither_check": null, "is_optional": 0},
+        {"step_order": 4, "step_name": "Exploit Protocol B", "step_description": "Protocol B uses that stale price for borrow or collateral valuation", "code_signal": "external price read used in collateral calculation", "slither_check": null, "is_optional": 0},
+        {"step_order": 5, "step_name": "Borrow Undercollateralized", "step_description": "Inflated collateral value allows undercollateralized borrow", "code_signal": "borrow limit computed from manipulated price", "slither_check": null, "is_optional": 0}
+      ]
+    },
+    {
+      "pattern_name": "flash-loan-oracle-manipulation",
+      "steps": [
+        {"step_order": 1, "step_name": "Borrow Flash Loan", "step_description": "Attacker borrows large amount of token from flash loan provider", "code_signal": "flashLoan() or flashSwap() call", "slither_check": null, "is_optional": 0},
+        {"step_order": 2, "step_name": "Manipulate Pool Reserves", "step_description": "Attacker swaps borrowed amount into target pool, skewing reserves", "code_signal": "swap() or sync() on AMM pool", "slither_check": null, "is_optional": 0},
+        {"step_order": 3, "step_name": "Read Spot Price", "step_description": "Victim protocol reads manipulated spot price from pool", "code_signal": "getReserves() or balanceOf(pool) used as price", "slither_check": "oracle-manipulation", "is_optional": 0},
+        {"step_order": 4, "step_name": "Exploit Price", "step_description": "Attacker borrows against inflated collateral or triggers liquidation", "code_signal": "borrow() or liquidate() using oracle price", "slither_check": null, "is_optional": 0},
+        {"step_order": 5, "step_name": "Repay Flash Loan", "step_description": "Attacker repays flash loan and keeps profit", "code_signal": "repay within same transaction", "slither_check": null, "is_optional": 0}
+      ]
+    },
+    {
+      "pattern_name": "price-manipulation-twap",
+      "steps": [
+        {"step_order": 1, "step_name": "Identify Short TWAP Window", "step_description": "Target protocol uses TWAP with window under 30 minutes", "code_signal": "consult() with period < 1800", "slither_check": null, "is_optional": 0},
+        {"step_order": 2, "step_name": "Sustain Price Skew", "step_description": "Attacker holds skewed position across multiple blocks", "code_signal": "repeated swaps to maintain price deviation", "slither_check": null, "is_optional": 0},
+        {"step_order": 3, "step_name": "TWAP Drifts to Manipulated Price", "step_description": "Time-weighted average shifts toward attacker-controlled price", "code_signal": "observe() returns attacker-influenced cumulative price", "slither_check": null, "is_optional": 0},
+        {"step_order": 4, "step_name": "Exploit Protocol", "step_description": "Attacker borrows or liquidates using now-manipulated TWAP", "code_signal": "borrow limit or liquidation using TWAP output", "slither_check": null, "is_optional": 0}
+      ]
+    },
+    {
+      "pattern_name": "access-control-missing",
+      "steps": [
+        {"step_order": 1, "step_name": "Identify Unprotected Function", "step_description": "Critical function has no access control modifier", "code_signal": "public function without onlyOwner or onlyRole", "slither_check": "arbitrary-send-eth", "is_optional": 0},
+        {"step_order": 2, "step_name": "Call Directly", "step_description": "Attacker calls function from any EOA", "code_signal": "no msg.sender check", "slither_check": null, "is_optional": 0},
+        {"step_order": 3, "step_name": "Execute Privileged Action", "step_description": "Function executes drain, upgrade, or ownership transfer", "code_signal": "transfer() or selfdestruct() or upgradeTo() in body", "slither_check": "unprotected-upgrade", "is_optional": 0}
+      ]
+    },
+    {
+      "pattern_name": "controlled-delegatecall",
+      "steps": [
+        {"step_order": 1, "step_name": "Identify Delegatecall Entry", "step_description": "Contract exposes delegatecall with user-influenced target or data", "code_signal": "delegatecall(target) where target from calldata or storage", "slither_check": "controlled-delegatecall", "is_optional": 0},
+        {"step_order": 2, "step_name": "Supply Malicious Target", "step_description": "Attacker passes address of malicious contract as target", "code_signal": "user-controlled address passed to delegatecall", "slither_check": null, "is_optional": 0},
+        {"step_order": 3, "step_name": "Execute in Victim Context", "step_description": "Malicious contract runs with victim storage and balance", "code_signal": "arbitrary code running in victim contract context", "slither_check": null, "is_optional": 0},
+        {"step_order": 4, "step_name": "Drain or Takeover", "step_description": "Attacker transfers funds or overwrites owner slot", "code_signal": "storage slot 0 overwrite or ETH transfer", "slither_check": null, "is_optional": 0}
+      ]
+    },
+    {
+      "pattern_name": "integer-overflow",
+      "steps": [
+        {"step_order": 1, "step_name": "Identify Unsafe Arithmetic", "step_description": "Contract uses Solidity < 0.8.0 or unchecked block", "code_signal": "pragma solidity ^0.7 or unchecked { arithmetic }", "slither_check": null, "is_optional": 0},
+        {"step_order": 2, "step_name": "Supply Boundary Value", "step_description": "Attacker passes value that causes wrap-around", "code_signal": "user-controlled uint256 near MAX_UINT or 0", "slither_check": null, "is_optional": 0},
+        {"step_order": 3, "step_name": "Arithmetic Wraps", "step_description": "Addition overflows to small number or subtraction underflows to MAX_UINT", "code_signal": "balance or supply wraps to unexpected value", "slither_check": null, "is_optional": 0},
+        {"step_order": 4, "step_name": "Exploit Wrapped Value", "step_description": "Attacker withdraws inflated balance or bypasses limit check", "code_signal": "transfer or mint using wrapped value", "slither_check": null, "is_optional": 0}
+      ]
+    },
+    {
+      "pattern_name": "precision-loss",
+      "steps": [
+        {"step_order": 1, "step_name": "Identify Division Before Multiply", "step_description": "Formula divides before multiplying losing precision", "code_signal": "a / b * c pattern in financial calculation", "slither_check": "divide-before-multiply", "is_optional": 0},
+        {"step_order": 2, "step_name": "Trigger Rounding", "step_description": "Attacker supplies value where division truncates significantly", "code_signal": "small deposit or fee calculation truncating to zero", "slither_check": null, "is_optional": 0},
+        {"step_order": 3, "step_name": "Exploit at Scale", "step_description": "Attacker repeats operation many times to accumulate rounding benefit", "code_signal": "loop or repeated calls extracting dust each time", "slither_check": null, "is_optional": 0}
+      ]
+    },
+    {
+      "pattern_name": "flash-loan-attack",
+      "steps": [
+        {"step_order": 1, "step_name": "Borrow Flash Loan", "step_description": "Attacker borrows maximum available capital in one tx", "code_signal": "flashLoan() call at start of transaction", "slither_check": null, "is_optional": 0},
+        {"step_order": 2, "step_name": "Manipulate Protocol State", "step_description": "Large capital used to move price, liquidity, or votes", "code_signal": "swap/deposit/vote with borrowed amount", "slither_check": null, "is_optional": 0},
+        {"step_order": 3, "step_name": "Extract Value", "step_description": "Attacker exploits manipulated state to withdraw profit", "code_signal": "borrow/liquidate/withdraw after state manipulation", "slither_check": null, "is_optional": 0},
+        {"step_order": 4, "step_name": "Repay and Profit", "step_description": "Flash loan repaid, attacker keeps extracted value", "code_signal": "repay call at end of transaction", "slither_check": null, "is_optional": 0}
+      ]
+    },
+    {
+      "pattern_name": "bridge-message-replay",
+      "steps": [
+        {"step_order": 1, "step_name": "Submit Valid Message", "step_description": "Attacker finds or creates a valid cross-chain message", "code_signal": "executeMessage() or processMessage() call", "slither_check": null, "is_optional": 0},
+        {"step_order": 2, "step_name": "Message Executes Successfully", "step_description": "Bridge processes message and mints or releases funds", "code_signal": "mint() or transfer() triggered by message", "slither_check": null, "is_optional": 0},
+        {"step_order": 3, "step_name": "Check for Replay Protection", "step_description": "Bridge does not mark message as processed", "code_signal": "no processedMessages[hash] = true after execution", "slither_check": null, "is_optional": 0},
+        {"step_order": 4, "step_name": "Replay Message", "step_description": "Attacker submits same message again, funds released again", "code_signal": "same calldata submitted in new transaction", "slither_check": null, "is_optional": 0}
+      ]
+    },
+    {
+      "pattern_name": "governance-flash-loan",
+      "steps": [
+        {"step_order": 1, "step_name": "Borrow Governance Tokens", "step_description": "Attacker flash borrows enough tokens for majority vote", "code_signal": "flashLoan() of governance token", "slither_check": null, "is_optional": 0},
+        {"step_order": 2, "step_name": "Submit or Find Malicious Proposal", "step_description": "Attacker uses or creates proposal to drain treasury", "code_signal": "propose() with malicious calldata", "slither_check": null, "is_optional": 0},
+        {"step_order": 3, "step_name": "Vote with Borrowed Tokens", "step_description": "Voting power from current balance, not snapshot", "code_signal": "balanceOf(msg.sender) used in castVote()", "slither_check": null, "is_optional": 0},
+        {"step_order": 4, "step_name": "Execute Immediately", "step_description": "No timelock allows same-block execution", "code_signal": "execute() callable in same transaction as vote", "slither_check": null, "is_optional": 0},
+        {"step_order": 5, "step_name": "Drain Treasury", "step_description": "Proposal executes fund transfer to attacker", "code_signal": "transfer() to attacker address in proposal payload", "slither_check": null, "is_optional": 0},
+        {"step_order": 6, "step_name": "Repay Flash Loan", "step_description": "Governance tokens returned, attacker keeps treasury funds", "code_signal": "repay at end of transaction", "slither_check": null, "is_optional": 0}
+      ]
+    },
+    {
+      "pattern_name": "vault-inflation-attack",
+      "steps": [
+        {"step_order": 1, "step_name": "Be First Depositor", "step_description": "Attacker deposits 1 wei to receive initial shares", "code_signal": "deposit(1) when totalSupply == 0", "slither_check": null, "is_optional": 0},
+        {"step_order": 2, "step_name": "Donate Assets Directly", "step_description": "Attacker transfers large amount directly to vault, bypassing deposit", "code_signal": "token.transfer(vault, largeAmount) not via deposit()", "slither_check": null, "is_optional": 0},
+        {"step_order": 3, "step_name": "Share Price Inflates", "step_description": "totalAssets() increases but totalSupply stays at 1", "code_signal": "convertToShares returns 0 for small deposits", "slither_check": null, "is_optional": 0},
+        {"step_order": 4, "step_name": "Victim Deposits", "step_description": "Victim deposits reasonable amount, receives 0 shares due to rounding", "code_signal": "deposit() returning 0 shares to victim", "slither_check": null, "is_optional": 0},
+        {"step_order": 5, "step_name": "Attacker Withdraws All", "step_description": "Attacker redeems 1 share for all assets including victim deposit", "code_signal": "redeem(1) returning attacker + victim assets", "slither_check": null, "is_optional": 0}
+      ]
+    },
+    {
+      "pattern_name": "liquidation-manipulation",
+      "steps": [
+        {"step_order": 1, "step_name": "Open or Identify Position", "step_description": "Attacker opens position or finds victim position near liquidation", "code_signal": "borrow() with collateral near threshold", "slither_check": null, "is_optional": 0},
+        {"step_order": 2, "step_name": "Manipulate Collateral Price", "step_description": "Attacker moves spot price of collateral asset", "code_signal": "swap on thin pool affecting oracle price", "slither_check": "oracle-manipulation", "is_optional": 0},
+        {"step_order": 3, "step_name": "Trigger Liquidation", "step_description": "Price drop puts position underwater, liquidation becomes profitable", "code_signal": "liquidate() callable after price manipulation", "slither_check": null, "is_optional": 0},
+        {"step_order": 4, "step_name": "Collect Bonus", "step_description": "Attacker liquidates and collects liquidation bonus", "code_signal": "liquidationBonus applied to collateral seized", "slither_check": null, "is_optional": 0}
+      ]
+    },
+    {
+      "pattern_name": "unchecked-return-value",
+      "steps": [
+        {"step_order": 1, "step_name": "Identify Unchecked Transfer", "step_description": "Protocol calls transfer() or transferFrom() without checking bool return", "code_signal": "token.transfer() not wrapped in require() or SafeERC20", "slither_check": "unchecked-transfer", "is_optional": 0},
+        {"step_order": 2, "step_name": "Transfer Fails Silently", "step_description": "Non-standard token returns false instead of reverting", "code_signal": "USDT or custom token returning false on failure", "slither_check": null, "is_optional": 0},
+        {"step_order": 3, "step_name": "State Updated Anyway", "step_description": "Protocol updates internal accounting despite transfer failure", "code_signal": "balance incremented after silent transfer failure", "slither_check": null, "is_optional": 0},
+        {"step_order": 4, "step_name": "Exploit Accounting Gap", "step_description": "Attacker withdraws credited balance that was never actually transferred in", "code_signal": "withdraw() against balance that was never funded", "slither_check": null, "is_optional": 0}
+      ]
+    }
+  ]
+}
