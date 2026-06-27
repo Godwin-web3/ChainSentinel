@@ -9,7 +9,8 @@ Five sink categories (mapped to Immunefi impact levels):
   ASSET_DRAIN         — direct theft of funds (critical)
   STORAGE_CORRUPTION  — privileged slot write: owner, impl, oracle, pause (critical/high)
   DELEGATION_SINK     — delegatecall to uncertain/attacker-controlled dest (critical)
-  CALLBACK_SINK       — external call mid-state-change (reentrancy surface) (high)
+  CALLBACK_SINK       — untrusted external call mid-state-change (reentrancy surface) (high)
+                        only fired when the external call edge has trusted=False
   SELFDESTRUCT_SINK   — contract destruction (critical)
 """
 
@@ -57,7 +58,10 @@ PRIVILEGED_SLOTS = {
     "interestRate", "liquidationThreshold",
 }
 
-# ERC20 / ETH transfer function names that constitute asset movement
+# ERC20 / ETH transfer function names that constitute asset movement.
+# Matched via membership in ASSET_TRANSFER_FUNCTIONS OR prefix variants
+# (_safeTransfer, _transfer, _safeTransferFrom). Includes Maker-style
+# pull()/push() wrappers and the common `_pull`/`_push` internal helpers.
 ASSET_TRANSFER_FUNCTIONS = {
     "transfer", "transferfrom",
     "safetransfer", "safetransferfrom",
@@ -65,7 +69,32 @@ ASSET_TRANSFER_FUNCTIONS = {
     "withdraw", "withdrawall",
     "redeem", "redeemall",
     "claim", "claimreward",
+    # Maker / Exactly-style wrappers
+    "pull", "push", "move", "suck", "wipe",
+    # Common internal helper names (Slither strips the leading underscore
+    # for some IR ops but not all; we lowercase so the membership check
+    # works either way)
+    "_transfer", "_transferfrom",
+    "_safetransfer", "_safetransferfrom",
+    "_withdraw", "_redeem", "_claim",
 }
+
+# Underscore-prefixed variants whose lowercased form may retain the `_`.
+# Used by the matching helper below so _safeTransfer / _transfer etc.
+# are caught without breaking exact matches above.
+ASSET_TRANSFER_PREFIXES = (
+    "_transfer", "_safetransfer", "_safetransferfrom",
+    "transferfrom", "safetransfer",
+)
+
+
+def _is_asset_transfer(fname: str) -> bool:
+    """Membership + underscore-prefix match for asset-transfer function names."""
+    if not fname:
+        return False
+    if fname in ASSET_TRANSFER_FUNCTIONS:
+        return True
+    return any(fname.startswith(p) for p in ASSET_TRANSFER_PREFIXES)
 
 # Solidity built-ins that indicate selfdestruct
 SELFDESTRUCT_NAMES = {"selfdestruct", "suicide"}
@@ -177,7 +206,7 @@ def _classify_node(node_id: str, node, edges: List[CallEdge]) -> Optional[Sink]:
         fname = (str(edge.function_name) if edge.function_name else "").lower()
         if edge.is_value_transfer:
             asset_evidence.append(f"eth movement via {edge.raw_type} to {edge.dst}")
-        elif fname in ASSET_TRANSFER_FUNCTIONS:
+        elif _is_asset_transfer(fname):
             asset_evidence.append(f"token transfer: {edge.function_name} -> {edge.dst}")
 
     # From node-level asset_flows (already extracted by graph.py)
@@ -211,9 +240,13 @@ def _classify_node(node_id: str, node, edges: List[CallEdge]) -> Optional[Sink]:
             )
 
     # ── 5. Callback into external contract mid-execution ─────────
-    # External call where caller still has open state = reentrancy surface
+    # External call where caller still has open state = reentrancy surface.
+    # Only untrusted external calls count: a call whose destination is a
+    # storage variable written only by auth-scored functions (owner/admin-
+    # gated) is trusted and not a reentrancy surface (e.g. Morpho's
+    # IIrm.borrowRate() where irm is set by owner at market creation).
     for edge in edges:
-        if edge.is_external and not edge.is_delegation:
+        if edge.is_external and not edge.is_delegation and not edge.trusted:
             # Check if there are state writes in the same function
             has_state = hasattr(node, "state_writes") and bool(node.state_writes)
             if has_state:
@@ -221,7 +254,7 @@ def _classify_node(node_id: str, node, edges: List[CallEdge]) -> Optional[Sink]:
                     node_id=node_id,
                     category=CALLBACK_SINK,
                     severity=SINK_SEVERITY[CALLBACK_SINK],
-                    evidence=f"external call to {edge.dst} with open state writes: {node.state_writes}",
+                    evidence=f"untrusted external call to {edge.dst} with open state writes: {node.state_writes}",
                     has_callback=True,
                     state_writes=node.state_writes,
                 )

@@ -25,7 +25,10 @@ Constraint flags:
 from dataclasses import dataclass, field
 from typing import List, Set, Optional
 from core.edges import CallEdge
-from core.sinks import Sink, ASSET_DRAIN, STORAGE_CORRUPTION, DELEGATION_SINK, CALLBACK_SINK, SELFDESTRUCT_SINK
+from core.sinks import (
+    Sink, ASSET_DRAIN, STORAGE_CORRUPTION, DELEGATION_SINK,
+    CALLBACK_SINK, SELFDESTRUCT_SINK, _is_asset_transfer,
+)
 
 # ── Constants ─────────────────────────────────────────────────────
 
@@ -173,12 +176,16 @@ def _dfs(
     if node is None:
         return
 
-    # Track state writes before external calls (reentrancy signal)
+    # Track state writes before external calls (reentrancy signal).
+    # Detect CEI violation: state written AND an external call exists
+    # on the SAME function. The previous condition (external_seen &&
+    # node_has_state && node_has_external) only fired on the second
+    # external call, missing single-hop withdraw() { state--; transfer(); }.
     node_has_state = bool(getattr(node, 'state_writes', set()))
     node_has_external = any(
         e.is_external for e in graph_edges.get(current_id, [])
     )
-    if node_has_state and node_has_external and external_seen:
+    if node_has_state and node_has_external:
         accumulated_flags = accumulated_flags | {STATE_BEFORE_CALL}
 
     # Auth gap on this node
@@ -208,16 +215,22 @@ def _dfs(
         dst = edge.dst
         if dst.startswith("external.") or dst.startswith("lowlevel.") or dst.startswith("eth."):
             # Terminal external call — check if it's a sink pattern
-            if edge.is_value_transfer or (edge.function_name or "").lower() in (
-                "transfer", "transferfrom", "safetransfer", "safetransferfrom"
+            if edge.is_value_transfer or _is_asset_transfer(
+                (edge.function_name or "").lower()
             ):
                 # Synthesize a terminal asset drain path
+                # Inherit state_writes from the calling node so the
+                # structural health-check overlap test in constraints.py
+                # (_node_touches_sink_state / _guard_constrains_sink_state)
+                # can see the same storage the sink mutates. Without this,
+                # MISSING_HEALTH_CHECK is dead for all terminal asset paths.
                 terminal_sink = Sink(
                     node_id=dst,
                     category=ASSET_DRAIN,
                     severity=10,
                     evidence=f"direct asset transfer to {dst}",
                     asset_flows=[str(dst)],
+                    state_writes=set(getattr(node, 'state_writes', set())),
                 )
                 flags = new_flags | {ASSET_SINK}
                 path = _build_path(entry_id, edge_chain + [edge], terminal_sink, flags, nodes)

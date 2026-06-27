@@ -4,6 +4,7 @@ core/edges.py — Typed edge extraction from Slither IR
 Two layers:
   Layer 1 — IR truth: what Slither actually sees
   Layer 2 — Semantic inference: what it means for an attacker
+  Layer 2.5 — Trust: who can write the destination address (data flow)
 
 Edge types (raw):
   internal          InternalCall
@@ -17,6 +18,13 @@ Edge types (raw):
   eth_transfer      Transfer
   new_contract      NewContract
   solidity          SolidityCall
+
+Trust signal (highlevel only):
+  trusted=True  -> destination is a storage variable written only by
+                   auth-scored functions (owner/admin-gated) or the
+                   constructor. Not a reentrancy surface.
+  trusted=False -> destination derives from calldata / msg.sender /
+                   a caller-controlled variable, or source unresolvable.
 """
 
 from dataclasses import dataclass, field
@@ -55,6 +63,14 @@ class CallEdge:
     # Optional metadata
     function_name: Optional[str] = None   # resolved callee name if known
     destination: Optional[str] = None     # destination expression if external
+
+    # Trust signal (highlevel calls only)
+    # True  -> destination is a state variable written only by auth-scored
+    #          functions (owner/admin-gated) or the constructor; not a
+    #          reentrancy surface.
+    # False -> destination derives from calldata / msg.sender / a caller-
+    #          controlled variable, or source is unresolvable (conservative).
+    trusted: bool = False
 
 
 # ── Layer 1: IR normalization ─────────────────────────────────────
@@ -194,77 +210,527 @@ def _semantic_properties(raw_type: str) -> dict:
     ))
 
 
+# ── Layer 2.5: Trust resolution (data flow only, no name lists) ────
+#
+# A highlevel call is trusted when its destination address is a storage
+# variable written only by auth-scored functions (owner/admin-gated) or
+# the constructor. It is untrusted when the destination comes from
+# calldata, msg.sender, or a caller-controlled variable.
+#
+# Trust is decided purely by data flow: who can write the destination
+# address. No name-based allow/deny lists are used.
+
+# Minimum auth_score (from enricher) for a writer to count as privileged.
+# 3 == strong auth (e.g. onlyOwner / onlyRole / msg.sender == owner).
+AUTH_TRUST_THRESHOLD = 3
+
+
+def _is_state_variable(var) -> bool:
+    """True if var is a Slither StateVariable (storage slot)."""
+    try:
+        from slither.core.variables.state_variable import StateVariable
+        return isinstance(var, StateVariable)
+    except Exception:
+        return False
+
+
+def _is_caller_controlled(var) -> bool:
+    """
+    True if var derives from calldata or a caller-controlled source:
+    msg.sender / msg.data / msg.sig, or a function parameter (calldata).
+    """
+    try:
+        s = str(var).lower()
+        if "msg.sender" in s or "msg.data" in s or "msg.sig" in s:
+            return True
+        from slither.core.variables.local_variable import LocalVariable
+        if isinstance(var, LocalVariable):
+            if getattr(var, "is_parameter", False):
+                return True
+            location = str(getattr(var, "location", "")).lower()
+            if "calldata" in location:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _follow_reference(var, max_depth: int = 5):
+    """Follow ReferenceVariable.points_to chains to the underlying variable."""
+    try:
+        from slither.core.variables.reference_variable import ReferenceVariable
+    except Exception:
+        return var
+    seen = set()
+    for _ in range(max_depth):
+        if id(var) in seen:
+            break
+        seen.add(id(var))
+        if not isinstance(var, ReferenceVariable):
+            break
+        try:
+            var = var.points_to
+        except Exception:
+            break
+    return var
+
+
+def _trace_temp_to_source(temp, f, max_depth: int = 5):
+    """
+    Backward-slice a TemporaryVariable to its source variable by scanning
+    the function's IR for the operation that defines it. Returns the
+    underlying source variable, or None if unresolvable.
+    """
+    try:
+        from slither.core.variables.temporary_variable import TemporaryVariable
+    except Exception:
+        return None
+    seen = set()
+    current = temp
+    for _ in range(max_depth):
+        if id(current) in seen:
+            break
+        seen.add(id(current))
+        if not isinstance(current, TemporaryVariable):
+            return current
+        nxt = None
+        try:
+            for node in f.nodes:
+                for ir in node.irs:
+                    lvalue = getattr(ir, "lvalue", None)
+                    if lvalue is None:
+                        lvalue = getattr(ir, "destination", None)
+                    if lvalue is current:
+                        reads = getattr(ir, "read", [])
+                        if reads:
+                            nxt = reads[-1]
+                            break
+                if nxt is not None:
+                    break
+        except Exception:
+            break
+        if nxt is None:
+            break
+        current = nxt
+    return current
+
+
+def _func_canonical_id(func) -> Optional[str]:
+    """Build a canonical_id matching graph.canonical_id for a Slither Function."""
+    try:
+        return f"{func.contract_declarer.name}.{func.full_name}"
+    except Exception:
+        return None
+
+
+def _state_var_writers(state_var, contract) -> list:
+    """
+    Return Slither Function objects that write to state_var.
+    Uses state_var.written first; falls back to scanning the contract's
+    state_variables_written on each function.
+    """
+    writers = []
+    try:
+        for entry in state_var.written:
+            if isinstance(entry, tuple) and len(entry) >= 2:
+                writers.append(entry[1])
+            else:
+                writers.append(entry)
+    except Exception:
+        pass
+    if not writers and contract is not None:
+        try:
+            fns = list(contract.functions) + list(getattr(contract, "modifiers", []) or [])
+            for f in fns:
+                if state_var in f.state_variables_written:
+                    writers.append(f)
+        except Exception:
+            pass
+    seen = set()
+    unique = []
+    for w in writers:
+        if id(w) not in seen:
+            seen.add(id(w))
+            unique.append(w)
+    return unique
+
+
+def _writers_are_trusted(state_var, contract, auth_lookup: Optional[dict]) -> bool:
+    """
+    True if every function that writes to state_var is either the
+    constructor (inherently trusted — runs once at deploy) or an
+    auth-scored function (auth_score >= AUTH_TRUST_THRESHOLD).
+    No writers (immutable/constant) counts as trusted.
+    """
+    writers = _state_var_writers(state_var, contract)
+    if not writers:
+        return True
+    for w in writers:
+        try:
+            if w.is_constructor:
+                continue
+        except Exception:
+            pass
+        wcid = _func_canonical_id(w)
+        if wcid is None:
+            return False
+        auth_score = auth_lookup.get(wcid, 0) if auth_lookup else 0
+        if auth_score < AUTH_TRUST_THRESHOLD:
+            return False
+    return True
+
+
+# ── Layer 2.5b: Registry-validated struct parameters ──────────────
+#
+# A calldata struct parameter may source an external-call destination
+# via one of its address fields (e.g. marketParams.irm). Although the
+# struct itself is caller-supplied, the protocol may have already
+# validated that the struct maps to an on-chain registered entity by
+# reading a storage mapping keyed by an id/hash derived from that same
+# struct inside a require() or if/revert.
+#
+# Pattern (purely structural, no name lists):
+#   calldata struct ─► hash/id derivation ─► storage mapping read
+#                                              in a require/if-revert
+# If found before the external call, the destination is trusted: the
+# protocol already proved the struct corresponds to registered data.
+
+
+def _same_var(a, b) -> bool:
+    """Identity or string-equality match for two Slither variable objects."""
+    if a is b or id(a) == id(b):
+        return True
+    try:
+        sa, sb = str(a), str(b)
+        return bool(sa) and sa == sb
+    except Exception:
+        return False
+
+
+def _is_struct_param(var) -> bool:
+    """True if var is a calldata function parameter of struct type."""
+    try:
+        from slither.core.variables.local_variable import LocalVariable
+        if not isinstance(var, LocalVariable):
+            return False
+        if not getattr(var, "is_parameter", False):
+            return False
+        t = getattr(var, "type", None)
+        if t is None:
+            return False
+        from slither.core.solidity_types import ElementaryType
+        if isinstance(t, ElementaryType):
+            return False
+        # Non-elementary parameter type => user-defined (struct or enum).
+        # Enums are not used as call-destination bases, so this is a struct.
+        return True
+    except Exception:
+        return False
+
+
+def _is_storage_mapping(var) -> bool:
+    """True if var is a StateVariable whose type is (or includes) a mapping."""
+    if not _is_state_variable(var):
+        return False
+    try:
+        from slither.core.solidity_types import MappingType
+        t = getattr(var, "type", None)
+        if t is not None and isinstance(t, MappingType):
+            return True
+        for t in (getattr(var, "types", None) or []):
+            if isinstance(t, MappingType):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_const_value(var) -> bool:
+    """True if var is a literal constant (not a real variable)."""
+    try:
+        from slither.core.variables.constant_variable import ConstantVariable
+        if isinstance(var, ConstantVariable):
+            return True
+    except Exception:
+        pass
+    return type(var).__name__ == "Constant"
+
+
+def _find_defining_op(var, f):
+    """Return the IR operation that assigns to var in function f, or None."""
+    try:
+        for node in f.nodes:
+            for ir in node.irs:
+                lvalue = getattr(ir, "lvalue", None)
+                if lvalue is None:
+                    lvalue = getattr(ir, "destination", None)
+                if _same_var(lvalue, var):
+                    return ir
+    except Exception:
+        pass
+    return None
+
+
+def _op_reads_var(ir, target) -> bool:
+    """True if ir reads target (directly or through a reference chain)."""
+    candidates = list(getattr(ir, "read", []) or [])
+    dest = getattr(ir, "destination", None)
+    if dest is not None:
+        candidates.append(dest)
+    for c in candidates:
+        if _same_var(_follow_reference(c), target):
+            return True
+    return False
+
+
+def _key_derives_from_struct(key, f, struct_param, max_depth: int = 6) -> bool:
+    """
+    Backward-slice a storage mapping key to determine whether it derives
+    from struct_param. Handles id derivation via method calls on the
+    struct (marketParams.id()) and hash derivations
+    (keccak256(abi.encode(marketParams))).
+    """
+    seen = set()
+    current = key
+    for _ in range(max_depth):
+        if id(current) in seen:
+            break
+        seen.add(id(current))
+        current = _follow_reference(current)
+        if _same_var(current, struct_param):
+            return True
+        if _is_state_variable(current) or _is_const_value(current):
+            break
+        defining_op = _find_defining_op(current, f)
+        if defining_op is None:
+            break
+        if _op_reads_var(defining_op, struct_param):
+            return True
+        reads = list(getattr(defining_op, "read", []) or [])
+        dest = getattr(defining_op, "destination", None)
+        if dest is not None:
+            reads.append(dest)
+        next_vars = [r for r in reads if not _is_const_value(r)]
+        if not next_vars:
+            break
+        current = next_vars[0]
+    return False
+
+
+def _node_can_revert(node) -> bool:
+    """True if the node is a validation point that can revert on failure."""
+    try:
+        from slither.core.cfg.node import NodeType
+        # require() / assert() SolidityCall
+        for ir in node.irs:
+            if isinstance(ir, SolidityCall):
+                fname = str(getattr(ir, "function_name", "") or "").lower()
+                if fname.startswith("require") or fname.startswith("assert"):
+                    return True
+        # if (cond) revert  —  IF node with a reverting successor
+        if getattr(node, "type", None) == getattr(NodeType, "IF", None):
+            for son in getattr(node, "sons", []) or []:
+                if getattr(son, "type", None) == getattr(NodeType, "THROW", None):
+                    return True
+                for sir in getattr(son, "irs", []) or []:
+                    if isinstance(sir, SolidityCall):
+                        sname = str(getattr(sir, "function_name", "") or "").lower()
+                        if sname.startswith("revert"):
+                            return True
+        return False
+    except Exception:
+        return False
+
+
+def _registry_validates_struct(f, struct_param, call_node=None) -> bool:
+    """
+    True if function f contains a registry validation of struct_param
+    at or before call_node. A registry validation is a require() or
+    if/revert node that reads a storage mapping keyed by a value derived
+    from struct_param.
+    """
+    try:
+        from slither.slithir.operations import Index
+    except Exception:
+        Index = None
+
+    try:
+        nodes = list(f.nodes)
+        call_idx = None
+        if call_node is not None:
+            try:
+                call_idx = nodes.index(call_node)
+            except ValueError:
+                call_idx = None
+
+        for idx, node in enumerate(nodes):
+            if call_idx is not None and idx > call_idx:
+                break
+            if not _node_can_revert(node):
+                continue
+            for ir in node.irs:
+                if Index is not None:
+                    is_index = isinstance(ir, Index)
+                else:
+                    is_index = type(ir).__name__ == "Index"
+                if not is_index:
+                    continue
+                reads = list(getattr(ir, "read", []) or [])
+                mapping_base = None
+                key = None
+                for r in reads:
+                    rf = _follow_reference(r)
+                    if _is_storage_mapping(rf):
+                        mapping_base = r
+                    else:
+                        key = r
+                if mapping_base is None or key is None:
+                    continue
+                if _key_derives_from_struct(key, f, struct_param):
+                    return True
+        return False
+    except Exception:
+        return False
+
+
+def _resolve_trust(ir, raw_type: str, f, auth_lookup: Optional[dict], node=None) -> bool:
+    """
+    Decide trust for a call edge destination. Only highlevel calls are
+    considered (lowlevel / delegatecall destinations are always untrusted).
+
+    Trusted   -> destination is a storage variable written only by
+                 auth-scored functions or the constructor; OR a field of
+                 a calldata struct parameter validated by a registry
+                 check (storage mapping read keyed by an id/hash derived
+                 from the same struct) earlier in the function.
+    Untrusted -> destination derives from calldata / msg.sender /
+                 a caller-controlled variable.
+    Default   -> untrusted (conservative).
+    """
+    if raw_type != "highlevel":
+        return False
+    if not auth_lookup:
+        return False
+
+    try:
+        dest = ir.destination
+    except Exception:
+        return False
+
+    contract = getattr(f, "contract_declarer", None)
+
+    # Resolve reference chains to the underlying variable
+    dest = _follow_reference(dest)
+
+    # Direct storage variable destination
+    if _is_state_variable(dest):
+        return _writers_are_trusted(dest, contract, auth_lookup)
+
+    # Caller-controlled destination (calldata / msg.sender / parameter)
+    if _is_caller_controlled(dest):
+        # Struct field of a calldata parameter: may be registry-validated.
+        if _is_struct_param(dest) and _registry_validates_struct(f, dest, node):
+            return True
+        return False
+
+    # Temporary variable — backward-slice to its source via the function IR
+    try:
+        from slither.core.variables.temporary_variable import TemporaryVariable
+        if isinstance(dest, TemporaryVariable):
+            source = _trace_temp_to_source(dest, f)
+            if source is not None:
+                source = _follow_reference(source)
+                if _is_state_variable(source):
+                    return _writers_are_trusted(source, contract, auth_lookup)
+                if _is_caller_controlled(source):
+                    # Struct field of a calldata parameter: may be registry-validated.
+                    if _is_struct_param(source) and _registry_validates_struct(f, source, node):
+                        return True
+                    return False
+    except Exception:
+        pass
+
+    # Unresolvable source — conservative: untrusted
+    return False
+
+
 # ── Destination resolution ────────────────────────────────────────
 
-def _resolve_dst(ir, src_id: str, raw_type: str) -> tuple:
+def _resolve_dst(ir, src_id: str, raw_type: str, f=None, auth_lookup: Optional[dict] = None, node=None) -> tuple:
     """
     Attempt to resolve destination canonical ID and name.
-    Returns (dst_id, function_name, destination_str).
-    Unresolvable targets return a labeled unknown.
+    Returns (dst_id, function_name, destination_str, trusted).
+    Unresolvable targets return a labeled unknown with trusted=False.
+    Only highlevel calls may resolve to trusted=True.
     """
     if raw_type == "internal":
         try:
             fn = ir.function
             cid = f"{fn.contract_declarer.name}.{fn.full_name}"
-            return cid, fn.name, None
+            return cid, fn.name, None, False
         except Exception:
-            return f"{src_id}.__unresolved_internal__", None, None
+            return f"{src_id}.__unresolved_internal__", None, None, False
 
     if raw_type == "library":
         try:
             fn = ir.function
             cid = f"{fn.contract_declarer.name}.{fn.full_name}"
-            return cid, fn.name, None
+            return cid, fn.name, None, False
         except Exception:
-            return f"{src_id}.__unresolved_library__", None, None
+            return f"{src_id}.__unresolved_library__", None, None, False
 
     if raw_type == "dynamic":
         # Function pointer — target is unknown at static analysis time
-        return f"{src_id}.__dynamic_target__", None, None
+        return f"{src_id}.__dynamic_target__", None, None, False
 
     if raw_type == "highlevel":
         try:
             dest = str(ir.destination)
             fname = getattr(ir, "function_name", "") or ""
             fname = str(fname) if fname else ""
-            return f"external.{dest}.{fname}", fname, dest
+            trusted = _resolve_trust(ir, raw_type, f, auth_lookup, node)
+            return f"external.{dest}.{fname}", fname, dest, trusted
         except Exception:
-            return f"{src_id}.__unresolved_external__", None, None
+            return f"{src_id}.__unresolved_external__", None, None, False
 
     if raw_type in ("lowlevel_call", "delegatecall", "codecall"):
         try:
             dest = str(ir.destination)
             fname = getattr(ir, "function_name", "") or "call"
-            return f"lowlevel.{dest}.{fname}", fname, dest
+            return f"lowlevel.{dest}.{fname}", fname, dest, False
         except Exception:
-            return f"{src_id}.__unresolved_lowlevel__", None, None
+            return f"{src_id}.__unresolved_lowlevel__", None, None, False
 
     if raw_type in ("eth_send", "eth_transfer"):
         try:
             dest = str(ir.destination)
-            return f"eth.{dest}", None, dest
+            return f"eth.{dest}", None, dest, False
         except Exception:
-            return f"{src_id}.__unresolved_eth__", None, None
+            return f"{src_id}.__unresolved_eth__", None, None, False
 
     if raw_type == "new_contract":
         try:
             contract_name = ir.contract_name if hasattr(ir, "contract_name") else "unknown"
-            return f"new.{contract_name}", contract_name, None
+            return f"new.{contract_name}", contract_name, None, False
         except Exception:
-            return f"{src_id}.__unresolved_new__", None, None
+            return f"{src_id}.__unresolved_new__", None, None, False
 
-    return f"{src_id}.__unresolved__", None, None
+    return f"{src_id}.__unresolved__", None, None, False
 
 
 # ── Public API ────────────────────────────────────────────────────
 
-def extract_edges(src_id: str, f) -> list[CallEdge]:
+def extract_edges(src_id: str, f, auth_lookup: Optional[dict] = None) -> list[CallEdge]:
     """
     Extract all typed call edges from a Slither function object.
 
     Args:
         src_id: canonical ID of the calling function
         f: Slither Function object
+        auth_lookup: optional dict mapping canonical_id -> auth_score (int).
+                     Used to compute the `trusted` flag on highlevel call
+                     edges. When omitted, all highlevel edges default to
+                     trusted=False (conservative).
 
     Returns:
         List of CallEdge objects
@@ -278,7 +744,9 @@ def extract_edges(src_id: str, f) -> list[CallEdge]:
                 if raw_type == "unknown":
                     continue
 
-                dst_id, fname, dest_str = _resolve_dst(ir, src_id, raw_type)
+                dst_id, fname, dest_str, trusted = _resolve_dst(
+                    ir, src_id, raw_type, f, auth_lookup, node
+                )
                 props = _semantic_properties(raw_type)
 
                 edges.append(CallEdge(
@@ -287,6 +755,7 @@ def extract_edges(src_id: str, f) -> list[CallEdge]:
                     raw_type=raw_type,
                     function_name=str(fname) if fname is not None else None,
                     destination=str(dest_str) if dest_str is not None else None,
+                    trusted=trusted,
                     **props,
                 ))
 

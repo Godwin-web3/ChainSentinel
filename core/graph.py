@@ -170,6 +170,7 @@ def build_graph(
                         break
                 reads = set(enricher_data.get("reads", [])) if enricher_data else set()
                 auth_state = enricher_data.get("auth_state", "UNKNOWN")
+                auth_score = enricher_data.get("auth_score", 0)
 
                 nodes[cid] = FunctionNode(
                     id=cid,
@@ -190,6 +191,7 @@ def build_graph(
                     reads=reads,
                     asset_flows=flows,
                 )
+                nodes[cid].auth_score = auth_score
 
             except Exception as e:
                 log.debug(f"Graph: skipping {f.name} in {contract.name}: {e}")
@@ -210,6 +212,11 @@ def build_graph(
 
     # Layer 4 — extract typed edges while Slither objects are in scope
     from core.edges import extract_edges
+    # Build auth_score lookup keyed by canonical_id so edge trust
+    # resolution can check who can write a destination storage variable.
+    auth_lookup = {
+        cid: getattr(node, "auth_score", 0) for cid, node in nodes.items()
+    }
     graph_edges: Dict[str, list] = {}
     for contract in s.contracts:
         if contract.is_interface:
@@ -219,7 +226,7 @@ def build_graph(
             try:
                 cid = canonical_id(contract.name, f.full_name)
                 if cid in nodes:
-                    graph_edges[cid] = extract_edges(cid, f)
+                    graph_edges[cid] = extract_edges(cid, f, auth_lookup)
             except Exception:
                 continue
 

@@ -55,6 +55,11 @@ ECONOMIC_INTERFACES = {
     "deposit", "withdraw", "redeem",
     "addliquidity", "removeliquidity",
     "execute", "multicall",
+    # Morpho / Blue-style permissionless economic interfaces.
+    # Additive only — existing entries preserved for Altitude.fi
+    # and Exactly Protocol which depend on them.
+    "supply", "borrow", "repay", "liquidate",
+    "supplycollateral", "withdrawcollateral", "flashloan",
 }
 
 # Known reentrancy guard patterns in function names / modifiers
@@ -213,11 +218,15 @@ def _validate_path(
     )
     combined_confidence = min(99, int(base + bonus))
 
-    # Verdict upgrades when multiple constraints fire together
+    # Verdict upgrades when multiple constraints fire together.
+    # A single CONFIRMED is pinned — it must NOT be downgraded by the
+    # presence of a weaker second signal. Previous logic let CONFIRMED
+    # fall through to the elif branch (LIKELY) when combined_confidence
+    # dropped below 90 due to a weak secondary constraint.
     verdicts = [r.verdict for r in sorted_results]
-    if combined_confidence >= 90 or verdicts.count(CONFIRMED) >= 2:
+    if verdicts.count(CONFIRMED) >= 1 or combined_confidence >= 90:
         verdict = CONFIRMED
-    elif combined_confidence >= 70 or CONFIRMED in verdicts:
+    elif combined_confidence >= 70:
         verdict = LIKELY
     else:
         verdict = POSSIBLE
@@ -277,10 +286,13 @@ def _check_reentrancy_cei(path, nodes, graph_edges) -> ConstraintResult:
     if has_guard:
         return _suppressed(path, "Reentrancy guard detected on call chain")
 
-    # No guard, CEI violated
+    # No guard, CEI violated. CALLBACK_SINK is the reentrancy surface
+    # itself (external call with open state) — same tier as ASSET_DRAIN.
+    # Previous logic capped CALLBACK_SINK at 75 (LIKELY), missing the
+    # Fei/Cream pattern where the callback IS the exploit vector.
     confidence = 75
-    if path.sink.category == ASSET_DRAIN:
-        confidence = 90  # external call + state write + asset sink = strong signal
+    if path.sink.category in (ASSET_DRAIN, CALLBACK_SINK):
+        confidence = 90  # external call + state write + drain/callback = strong signal
 
     return ConstraintResult(
         path=path,
@@ -464,22 +476,55 @@ def _node_touches_sink_state(node, sink) -> bool:
 def _guard_constrains_sink_state(node, sink) -> bool:
     """
     Structural health-check detection, no name matching.
-    True if `node` has strong auth/guard evidence (auth_score >= 2,
-    i.e. a real modifier or require/revert pattern was found by the
-    enricher) AND it reads at least one variable the sink writes -
+    True if `node` reads at least one variable the sink writes -
     meaning this guard's check is actually a function of the same
-    state the sink mutates. This is the direct fix for the Morpho
-    case: _isHealthy() never matched any name pattern, but it reads
-    the same debt/collateral storage InstallmentsRouter writes.
+    state the sink mutates - AND one of:
+      (a) the node has auth/guard evidence (auth_score >= 2, i.e. a
+          real modifier or require/revert pattern was found by the
+          enricher), OR
+      (b) the node is a view/pure function (read-only by definition,
+          so a call to it is a check, not a mutation — exactly what
+          a health/solvency guard looks like structurally).
+    This is the direct fix for the Morpho case: _isHealthy() never
+    matched any name pattern and has auth_score=0 (it's a view
+    function with no auth patterns — the require() is at the call
+    site, not inside it), but it reads the same debt/collateral
+    storage the sink writes.
     """
     if not sink.state_writes:
         return False
-    auth_score = getattr(node, 'auth_score', 0)
-    if auth_score < 2:
-        return False
     node_reads_lower = {str(v).lower() for v in getattr(node, 'reads', set())}
     sink_vars_lower = {str(v).lower() for v in sink.state_writes}
-    return bool(node_reads_lower & sink_vars_lower)
+    if not bool(node_reads_lower & sink_vars_lower):
+        return False
+    auth_score = getattr(node, 'auth_score', 0)
+    if auth_score >= 2:
+        return True
+    is_view = getattr(node, 'is_view', False)
+    if is_view:
+        return True
+    return False
+
+
+def _accumulate_path_state_writes(path, nodes) -> set:
+    """
+    Collect every state variable written by any node on the path —
+    the entry function, every callee along the edge chain, and the
+    sink's own writes (the terminal mutation). Returns a lower-cased
+    set for case-insensitive overlap comparison.
+    """
+    writes = set()
+    entry_node = nodes.get(path.entry)
+    if entry_node:
+        writes |= set(getattr(entry_node, 'state_writes', set()))
+    for edge in path.edge_chain:
+        callee = nodes.get(edge.dst)
+        if callee:
+            writes |= set(getattr(callee, 'state_writes', set()))
+    sink = path.sink
+    if sink is not None:
+        writes |= set(getattr(sink, 'state_writes', set()))
+    return {str(v).lower() for v in writes}
 
 
 def _check_missing_health_check(path, nodes, graph_edges) -> ConstraintResult:
@@ -494,15 +539,54 @@ def _check_missing_health_check(path, nodes, graph_edges) -> ConstraintResult:
     matching against a word list. A protocol that names its debt
     variable `_b` and its guard `_x()` still gets caught correctly.
     """
-    if path.sink.category != ASSET_DRAIN:
-        print(f"DEBUG-ENTRY entry={path.entry} sink_cat={path.sink.category}")
-        return _suppressed(path, "Not an asset drain path")
-
+    # No sink-category gate: the structural overlap check
+    # (_node_touches_sink_state) below filters paths that don't touch
+    # the sink's storage. This lets CALLBACK_SINK paths like Morpho's
+    # _accrueInterest() reach the health-check logic, while
+    # STORAGE_CORRUPTION / DELEGATION_SINK paths that don't share
+    # state with an asset sink are naturally suppressed.
     sink = path.sink
+
+
+    # Structural suppression (replaces the old entry_name allowlist).
+    # If no auth-scored node anywhere in the contract reads any
+    # variable this path writes, then no guard in the codebase can
+    # possibly validate the state this path mutates — a "missing
+    # health check" is structurally irrelevant to this path, not an
+    # exploitable gap. This catches the same asset-in interfaces the
+    # name list used to catch (deposit, mint, supply, …) without
+    # matching on names: a renamed function still trips it because the
+    # check is over actual storage read/write overlap.
+    path_writes = _accumulate_path_state_writes(path, nodes)
+    if path_writes:
+        guard_reads = {
+            str(v).lower()
+            for n in nodes.values()
+            if getattr(n, 'auth_score', 0) >= 2
+            for v in getattr(n, 'reads', set())
+        }
+        sink_writes = {str(v).lower() for v in getattr(sink, 'state_writes', set())}
+        if not (sink_writes & guard_reads):
+            return _suppressed(
+                path,
+                "No auth-scored guard in the contract reads any variable "
+                "this path writes — health check structurally irrelevant",
+            )
+
+    # Owner-gating: structural auth evidence only (no name lists).
+    # The enricher's auth_score/auth_state already capture modifier
+    # and msg.sender evidence — a separate modifier-name list here
+    # was redundant belt-and-suspenders.
+    entry_node = nodes.get(path.entry)
+    if entry_node is not None:
+        auth_score = getattr(entry_node, 'auth_score', 0)
+        auth_state = getattr(entry_node, 'auth_state', '')
+        if auth_score >= 3 or auth_state == "AUTHENTICATED":
+            return _suppressed(path, "owner-gated function — MHC not applicable")
+
     path_has_debt_context = False
     health_check_found = False
 
-    entry_node = nodes.get(path.entry)
     if entry_node and _node_touches_sink_state(entry_node, sink):
         path_has_debt_context = True
 
@@ -522,11 +606,51 @@ def _check_missing_health_check(path, nodes, graph_edges) -> ConstraintResult:
                     health_check_found = True
                     break
 
+    # Post-sink guard scan (Issue 5): the edge_chain walk above only
+    # inspects callees that lie ON the path to the sink. A guard that
+    # runs AFTER the sink call returns — e.g. Morpho's _isHealthy()
+    # following _accrueInterest() in liquidate() — is invisible to
+    # that walk because it is not on the path TO the sink, it is on
+    # the path AFTER the sink. Scan the entry function's IR (edges in
+    # graph_edges are extracted in source order) for callees that
+    # appear after the first edge of the path and treat a
+    # _guard_constrains_sink_state match there as a health check.
+    #
+    # We locate path.edge_chain[0] — the first call FROM path.entry,
+    # which DFS took directly from graph_edges[path.entry] — by object
+    # identity, then scan every edge after it. This is correct for
+    # both 1-hop paths (edge_chain[0] IS the sink call) and multi-hop
+    # paths (edge_chain[0] is the top-level call that transitively
+    # reaches the sink; anything after it in the entry's IR runs after
+    # the entire nested chain, including the sink, returns). Matching
+    # by identity avoids format mismatches between e.dst and
+    # sink.node_id (contract_declarer.name vs contract.name, etc.).
+    if not health_check_found and path.edge_chain:
+        first_edge = path.edge_chain[0]
+        entry_edges = graph_edges.get(path.entry, [])
+        sink_idx = next(
+            (i for i, e in enumerate(entry_edges) if e is first_edge),
+            None,
+        )
+        if sink_idx is None:
+            sink_idx = next(
+                (i for i, e in enumerate(entry_edges)
+                 if e.dst == first_edge.dst
+                 and (e.function_name or None) == (first_edge.function_name or None)
+                 and e.raw_type == first_edge.raw_type),
+                None,
+            )
+        if sink_idx is not None:
+            for e in entry_edges[sink_idx + 1:]:
+                callee = nodes.get(e.dst)
+                if callee and _guard_constrains_sink_state(callee, sink):
+                    health_check_found = True
+                    break
+
     if not path_has_debt_context:
         return _suppressed(path, "No storage overlap between path and sink — no debt/collateral context")
 
     if health_check_found:
-        print(f"DEBUG-NEW-PATH entry={path.entry} sink={path.sink.node_id} health_check_found={health_check_found} debt_context={path_has_debt_context}")
         return _suppressed(path, "Guard found that reads sink's storage and carries auth evidence (structural health check)")
 
     return ConstraintResult(
@@ -538,7 +662,7 @@ def _check_missing_health_check(path, nodes, graph_edges) -> ConstraintResult:
             f"Path {path.entry} -> {path.sink.node_id} modifies "
             f"debt/collateral state without a downstream health check. "
             f"Pattern matches Euler Finance donateToReserves vulnerability. "
-            f"Missing: {sorted(HEALTH_CHECK_FUNCTIONS)[:4]} or equivalent."
+            f"No auth-scored node in the contract reads the storage this path writes."
         ),
         immunefi_impact="Protocol insolvency / direct theft of user funds",
         final_score=_final_score(path, 85),
