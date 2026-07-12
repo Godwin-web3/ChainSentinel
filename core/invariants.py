@@ -319,30 +319,66 @@ def root_names(keys) -> set:
 from slither.slithir.operations import HighLevelCall, LowLevelCall, LibraryCall as _LibraryCallCheck
 
 
+CALLBACK_CAPABLE = "callback_capable"   # can execute attacker logic
+READ_ONLY = "read_only"                 # view/pure — cannot mutate
+                                          # state during the call
+                                          # (Solidity STATICCALL
+                                          # semantics), so it cannot
+                                          # itself corrupt invariant
+                                          # state mid-transaction
+UNKNOWN_EXTERNAL = "unknown_external"    # target/mutability could
+                                          # not be resolved — treat
+                                          # conservatively as if
+                                          # callback-capable
+
+
 @dataclass
 class CallEvent:
     """One external call in a function, classified by threat shape."""
     node_index: int
     node_expr_str: str
-    can_reenter: bool   # True only for calls that hand control to
-                         # code the callee doesn't control — plain
-                         # external calls with no known-safe target.
-                         # False for read-only-shaped calls we can
-                         # identify structurally (function name
-                         # pattern isn't used — this stays coarse
-                         # until the graph carries real ABI/mutability
-                         # data per call target).
+    call_kind: str   # one of CALLBACK_CAPABLE, READ_ONLY, UNKNOWN_EXTERNAL
+
+
+def _classify_call(ir) -> str:
+    """
+    Classify a single call IR by whether it can execute attacker-
+    controlled logic that mutates state. Based on the CALLED
+    function's declared mutability, resolved by Slither from the
+    interface/contract signature — not a name-based guess.
+
+    view/pure calls are STATICCALL under the hood: the EVM itself
+    prevents state modification during the call, so even if the
+    call target is attacker-controlled, it cannot corrupt this
+    contract's state as part of that call. It can still read state
+    and could theoretically be used for other attacks, but it is
+    not a state-mutation reentrancy vector — which is specifically
+    what CROSS_FUNCTION_STATE_RACE checks for.
+    """
+    fn = getattr(ir, "function", None)
+    if fn is None:
+        return UNKNOWN_EXTERNAL
+    is_view = getattr(fn, "view", None)
+    is_pure = getattr(fn, "pure", None)
+    if is_view is None or is_pure is None:
+        return UNKNOWN_EXTERNAL
+    if is_view or is_pure:
+        return READ_ONLY
+    return CALLBACK_CAPABLE
 
 
 def get_call_events(f) -> list:
     """
     Return every genuine external call in a function as an ordered
-    list of CallEvent, in source order. Excludes LibraryCall (never
-    leaves trust — see graph.py's _extract_calls for the same
-    distinction). This replaces a single "trust boundary index" —
-    a function can have multiple external calls, and each one is
-    an independent point where control could be handed to
-    untrusted code.
+    list of CallEvent, in source order, each classified by whether
+    it can actually mutate state (callback_capable) or is
+    structurally incapable of doing so (read_only, via view/pure).
+    Excludes LibraryCall (never leaves trust — see graph.py's
+    _extract_calls for the same distinction).
+
+    This replaces a single "trust boundary index" — a function can
+    have multiple external calls of different threat shapes, and
+    each is an independent point to reason about separately.
     """
     events = []
     if not getattr(f, "is_implemented", False):
@@ -356,11 +392,7 @@ def get_call_events(f) -> list:
                 events.append(CallEvent(
                     node_index=i,
                     node_expr_str=str(node.expression),
-                    can_reenter=True,  # conservative default — treat
-                                        # every non-library external
-                                        # call as reentrancy-capable
-                                        # until per-target mutability
-                                        # data exists in the graph
+                    call_kind=_classify_call(ir),
                 ))
     return events
 
@@ -390,7 +422,7 @@ def invariant_writes_between_calls(f, invariant_relevant_keys: set) -> list:
 
     findings = []
     for event in events:
-        if not event.can_reenter:
+        if event.call_kind != CALLBACK_CAPABLE:
             continue
         at_risk = set()
         for node in f.nodes[event.node_index:]:
