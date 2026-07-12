@@ -290,3 +290,14 @@ def state_key_to_display(key) -> str:
     if path:
         return f"{root}.{'.'.join(path)}"
     return root
+
+
+def root_names(keys) -> set:
+    """
+    Extract just the bare root variable names from a set of
+    structured state keys — for consumers that only need coarse
+    (variable-level, not field-level) matching, e.g. comparing
+    against the enricher's plain-string reads, a separate data
+    source that was never field-precise to begin with.
+    """
+    return {k[0] for k in keys}

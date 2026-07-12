@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import List, Set, Dict, Optional
 
 from slither.slither import Slither
+from core.invariants import extract_field_precise_writes, extract_field_precise_reads
 from slither.slithir.operations import (
     InternalCall, HighLevelCall, LowLevelCall, SolidityCall
 )
@@ -155,7 +156,7 @@ def build_graph(
 
                 # Layer 1 — IR extraction
                 int_callees, ext_callees, flows = _extract_calls(f)
-                state_writes = set(v.name for v in f.state_variables_written)
+                state_writes = extract_field_precise_writes(f)
 
                 # Layer 3 — auth from enricher
                 possible_keys = [
@@ -168,7 +169,7 @@ def build_graph(
                     if ek in features:
                         enricher_data = features[ek]
                         break
-                reads = set(v.name for v in f.state_variables_read)
+                reads = extract_field_precise_reads(f)
                 auth_state = enricher_data.get("auth_state", "UNKNOWN")
                 auth_score = enricher_data.get("auth_score", 0)
 
