@@ -319,54 +319,85 @@ def root_names(keys) -> set:
 from slither.slithir.operations import HighLevelCall, LowLevelCall, LibraryCall as _LibraryCallCheck
 
 
-def find_trust_boundary_index(f) -> Optional[int]:
+@dataclass
+class CallEvent:
+    """One external call in a function, classified by threat shape."""
+    node_index: int
+    node_expr_str: str
+    can_reenter: bool   # True only for calls that hand control to
+                         # code the callee doesn't control — plain
+                         # external calls with no known-safe target.
+                         # False for read-only-shaped calls we can
+                         # identify structurally (function name
+                         # pattern isn't used — this stays coarse
+                         # until the graph carries real ABI/mutability
+                         # data per call target).
+
+
+def get_call_events(f) -> list:
     """
-    Return the index into f.nodes of the first node containing a
-    genuine external call — one that actually leaves the trusted
-    execution context (HighLevelCall or LowLevelCall), explicitly
-    excluding LibraryCall (which is a HighLevelCall subclass but
-    never leaves trust — see graph.py's _extract_calls for the same
-    distinction). Returns None if no such call exists in this
-    function at all.
+    Return every genuine external call in a function as an ordered
+    list of CallEvent, in source order. Excludes LibraryCall (never
+    leaves trust — see graph.py's _extract_calls for the same
+    distinction). This replaces a single "trust boundary index" —
+    a function can have multiple external calls, and each one is
+    an independent point where control could be handed to
+    untrusted code.
     """
+    events = []
     if not getattr(f, "is_implemented", False):
-        return None
+        return events
 
     for i, node in enumerate(f.nodes):
         for ir in node.irs:
             if isinstance(ir, _LibraryCallCheck):
                 continue
             if isinstance(ir, (HighLevelCall, LowLevelCall)):
-                return i
-    return None
+                events.append(CallEvent(
+                    node_index=i,
+                    node_expr_str=str(node.expression),
+                    can_reenter=True,  # conservative default — treat
+                                        # every non-library external
+                                        # call as reentrancy-capable
+                                        # until per-target mutability
+                                        # data exists in the graph
+                ))
+    return events
 
 
-def writes_after_trust_boundary(f, invariant_relevant_keys: set) -> set:
+def invariant_writes_between_calls(f, invariant_relevant_keys: set) -> list:
     """
-    Given a function and a set of structured state keys known to be
-    invariant-relevant (from extract_invariants' state_vars() across
-    the contract), return the subset of those keys that get WRITTEN
-    at or after the trust-boundary node (i.e. after the first real
-    external call).
+    Walk every external-call event in source order. For each call,
+    check whether any invariant-relevant field gets written strictly
+    AFTER that call and before the function ends (or the next call —
+    doesn't matter which, since ANY post-call invariant write is a
+    potential race regardless of what follows it).
 
-    Empty result means: every invariant-relevant field this function
-    touches was already finalized before any external call — the
-    CEI-safe case, and the correct suppression condition for
-    CROSS_FUNCTION_STATE_RACE. A non-empty result means a real
-    reentrancy window exists against a field that actually matters.
+    Returns a list of (CallEvent, at_risk_keys) for every call that
+    has at least one invariant-relevant write after it. Empty list
+    means the function is safe under this check: every invariant-
+    relevant write happens before every external call, no window
+    exists anywhere in the function, not just relative to one call.
 
-    This deliberately does NOT check "all writes" — a post-call
-    write to an irrelevant field (e.g. an event timestamp) should
-    not block suppression. Only invariant-relevant writes count.
+    This fixes the single-anchor bug: "first call" misses writes
+    after later calls; "last call" misses writes after earlier
+    calls but before a later one. Checking every call independently
+    catches both.
     """
-    boundary = find_trust_boundary_index(f)
-    if boundary is None:
-        return set()  # no external call at all — no window to check
+    events = get_call_events(f)
+    if not events:
+        return []
 
-    at_risk = set()
-    for node in f.nodes[boundary:]:
-        key = get_node_write(node)
-        if key is not None and key in invariant_relevant_keys:
-            at_risk.add(key)
+    findings = []
+    for event in events:
+        if not event.can_reenter:
+            continue
+        at_risk = set()
+        for node in f.nodes[event.node_index:]:
+            key = get_node_write(node)
+            if key is not None and key in invariant_relevant_keys:
+                at_risk.add(key)
+        if at_risk:
+            findings.append((event, at_risk))
 
-    return at_risk
+    return findings
