@@ -187,12 +187,9 @@ def extract_field_precise_writes(f) -> Set[str]:
         left = expr.expression_left
         resolved = _resolve_operand(left)
 
-        if resolved.is_state:
-            if resolved.member_path:
-                path = f"{resolved.state_var_name}.{'.'.join(resolved.member_path)}"
-            else:
-                path = resolved.state_var_name
-            writes.add(path)
+        key = _resolved_to_key(resolved)
+        if key is not None:
+            writes.add(key)
 
     return writes
 
@@ -210,26 +207,23 @@ def _collect_all_state_refs(expr, found: set):
 
     if isinstance(expr, MemberAccess):
         resolved = _resolve_operand(expr)
-        if resolved.is_state:
-            if resolved.member_path:
-                path = f"{resolved.state_var_name}.{'.'.join(resolved.member_path)}"
-            else:
-                path = resolved.state_var_name
-            found.add(path)
+        key = _resolved_to_key(resolved)
+        if key is not None:
+            found.add(key)
         return  # _resolve_operand already recursed the base for us
 
     if isinstance(expr, IndexAccess):
         resolved = _resolve_operand(expr)
-        if resolved.is_state:
-            found.add(resolved.state_var_name)
-        # also check the index key itself in case it's state-derived
+        key = _resolved_to_key(resolved)
+        if key is not None:
+            found.add((key[0], ()))  # bare root var, no member path at this level
         _collect_all_state_refs(expr.expression_right, found)
         return
 
     if isinstance(expr, Identifier):
         val = expr.value
         if type(val).__name__ == "StateVariable":
-            found.add(val.name)
+            found.add((val.name, ()))
         return
 
     if isinstance(expr, BinaryOperation):
@@ -269,3 +263,30 @@ def extract_field_precise_reads(f) -> Set[str]:
         _collect_all_state_refs(expr, reads)
 
     return reads
+
+
+def _resolved_to_key(resolved: ResolvedOperand):
+    """
+    Convert a ResolvedOperand into a structured, hashable key:
+    (root_state_var, member_path_tuple). This is the canonical
+    internal representation — NOT a joined string — so downstream
+    code can query by root variable alone, by full path, or extend
+    to arrays/nested structs without string-parsing hacks.
+
+    Returns None if the operand isn't state.
+    """
+    if not resolved.is_state:
+        return None
+    return (resolved.state_var_name, tuple(resolved.member_path))
+
+
+def state_key_to_display(key) -> str:
+    """
+    Human-readable form of a structured state key, for reports only.
+    E.g. ('market', ('totalSupplyAssets',)) -> 'market.totalSupplyAssets'
+    Never parse this string back — use the tuple key for logic.
+    """
+    root, path = key
+    if path:
+        return f"{root}.{'.'.join(path)}"
+    return root
