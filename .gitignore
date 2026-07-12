@@ -21,3 +21,5 @@ docs/
 __pycache__/
 *.pyc
 output/reports/*.md
+*.json
+*.log

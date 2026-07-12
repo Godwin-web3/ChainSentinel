@@ -178,13 +178,13 @@ def analyze(address, chain_name, output_json=False):
 
                     if p_root and e_file and s_ver:
                         remaps = slither_result.get("remappings", [])
-                        nodes, graph_edges = build_graph(p_root, e_file, s_ver, enrichment, remaps)
+                        nodes, graph_edges, state_writers, state_readers = build_graph(p_root, e_file, s_ver, enrichment, remaps)
                         sinks = classify_sinks(nodes, graph_edges)
                         paths = enumerate_paths(nodes, graph_edges, sinks)
                         high_paths = top_paths(paths, min_score=10)
 
                         from core.constraints import validate_paths
-                        report = validate_paths(paths, nodes, graph_edges)
+                        report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers)
 
                         analysis["graph"] = {
                             "nodes": len(nodes),

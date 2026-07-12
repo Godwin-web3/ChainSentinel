@@ -37,6 +37,7 @@ CONFIRMED  = "CONFIRMED"   # high confidence, minimal FP risk
 LIKELY     = "LIKELY"      # strong signal, needs manual confirmation
 POSSIBLE   = "POSSIBLE"    # weak signal, worth investigating
 SUPPRESSED = "SUPPRESSED"  # path is NOT exploitable — drop it
+CROSS_FUNCTION_STATE_RACE = "CROSS_FUNCTION_STATE_RACE"
 
 VERDICT_SCORE = {
     CONFIRMED:  100,
@@ -151,6 +152,8 @@ def validate_paths(
     paths: List[ExploitPath],
     nodes: dict,
     graph_edges: dict,
+    state_writers: dict = None,
+    state_readers: dict = None,
 ) -> ValidationReport:
     """
     Validate all exploit paths against protocol invariants.
@@ -166,7 +169,7 @@ def validate_paths(
     report = ValidationReport()
 
     for path in paths:
-        result = _validate_path(path, nodes, graph_edges)
+        result = _validate_path(path, nodes, graph_edges, state_writers, state_readers)
         if result.verdict == CONFIRMED:
             report.confirmed.append(result)
         elif result.verdict == LIKELY:
@@ -185,6 +188,8 @@ def _validate_path(
     path: ExploitPath,
     nodes: dict,
     graph_edges: dict,
+    state_writers: dict = None,
+    state_readers: dict = None,
 ) -> ConstraintResult:
     """
     Run all constraint checks on a single path.
@@ -200,6 +205,8 @@ def _validate_path(
     results.append(_check_flashloan_window(path, nodes, graph_edges))
     results.append(_check_unchecked_return(path, nodes, graph_edges))
     results.append(_check_share_inflation(path, nodes, graph_edges))
+    if state_writers is not None and state_readers is not None:
+        results.append(_check_cross_function_state_race(path, nodes, graph_edges, state_writers, state_readers))
 
     non_suppressed = [r for r in results if r.verdict != SUPPRESSED]
 
@@ -547,6 +554,13 @@ def _check_missing_health_check(path, nodes, graph_edges) -> ConstraintResult:
     # state with an asset sink are naturally suppressed.
     sink = path.sink
 
+    if sink.category not in (ASSET_DRAIN, STORAGE_CORRUPTION, DELEGATION_SINK):
+        return _suppressed(
+            path,
+            f"Sink category {sink.category} is not a health-check surface — "
+            "reentrancy/callback risk is covered by REENTRANCY_CEI"
+        )
+
 
     # Structural suppression (replaces the old entry_name allowlist).
     # If no auth-scored node anywhere in the contract reads any
@@ -667,6 +681,69 @@ def _check_missing_health_check(path, nodes, graph_edges) -> ConstraintResult:
         immunefi_impact="Protocol insolvency / direct theft of user funds",
         final_score=_final_score(path, 85),
     )
+
+
+# ── Constraint 8: Cross-function state race ──────────────────────
+
+def _check_cross_function_state_race(path, nodes, graph_edges, state_writers, state_readers) -> ConstraintResult:
+    """
+    Detect state shared across functions with no reentrancy guard
+    spanning both. Catches read-only reentrancy and cross-function
+    reentrancy: bugs where the vulnerable write and the exploited
+    read live in DIFFERENT functions, invisible to single-path
+    storage-overlap checks.
+
+    Pattern: entry function makes an external call, then writes
+    state X. A different function elsewhere in the same contract
+    also touches state X. Neither shares a reentrancy-lock modifier.
+    That gap is the race window.
+    """
+    entry_node = nodes.get(path.entry)
+    if entry_node is None:
+        return _suppressed(path, "no entry node")
+
+    if not entry_node.external_callees:
+        return _suppressed(path, "entry makes no external call — no reentrancy window")
+
+    entry_modifiers = set(entry_node.modifiers)
+    contract = entry_node.contract
+
+    for var in entry_node.state_writes:
+        key = f"{contract}.{var}"
+        touchers = set(state_writers.get(key, [])) | set(state_readers.get(key, []))
+        touchers.discard(path.entry)
+
+        for other_cid in touchers:
+            other_node = nodes.get(other_cid)
+            if other_node is None:
+                continue
+
+            other_modifiers = set(other_node.modifiers)
+            shared_guard = entry_modifiers & other_modifiers
+            has_lock_word = any(
+                "lock" in m.lower() or "nonreentrant" in m.lower() or "guard" in m.lower()
+                for m in shared_guard
+            )
+            if has_lock_word:
+                continue
+
+            return ConstraintResult(
+                path=path,
+                verdict=LIKELY,
+                confidence=70,
+                constraint_type="CROSS_FUNCTION_STATE_RACE",
+                reasoning=(
+                    f"{path.entry} writes {contract}.{var} after an external call, "
+                    f"with no shared reentrancy lock. {other_cid} independently "
+                    f"reads or writes the same variable. A reentrant call during "
+                    f"{path.entry}'s external call can let {other_cid} observe or "
+                    f"corrupt state mid-transaction."
+                ),
+                immunefi_impact="State corruption or fund loss via cross-function reentrancy",
+                final_score=_final_score(path, 70),
+            )
+
+    return _suppressed(path, "no unguarded cross-function state overlap found")
 
 
 # ── Constraint 4: Oracle dependency ──────────────────────────────

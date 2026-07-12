@@ -130,7 +130,7 @@ def build_graph(
         os.chdir(orig_dir)
     except Exception as e:
         log.warning(f"Graph: Slither API failed: {e}")
-        return {}, {}
+        return {}, {}, {}, {}
 
     features = enrichment.get("features", {}) if enrichment else {}
     nodes: Dict[str, FunctionNode] = {}
@@ -168,7 +168,7 @@ def build_graph(
                     if ek in features:
                         enricher_data = features[ek]
                         break
-                reads = set(enricher_data.get("reads", [])) if enricher_data else set()
+                reads = set(v.name for v in f.state_variables_read)
                 auth_state = enricher_data.get("auth_state", "UNKNOWN")
                 auth_score = enricher_data.get("auth_score", 0)
 
@@ -203,6 +203,17 @@ def build_graph(
             if callee_id in nodes:
                 nodes[callee_id].callers.append(cid)
 
+    # Layer 4 — global state read/write index (cross-function view)
+    state_writers = {}
+    state_readers = {}
+    for cid, node in nodes.items():
+        for var in node.state_writes:
+            key = f"{node.contract}.{var}"
+            state_writers.setdefault(key, []).append(cid)
+        for var in node.reads:
+            key = f"{node.contract}.{var}"
+            state_readers.setdefault(key, []).append(cid)
+
     # Layer 4 — reachability (using real canonical edges)
     _compute_reachability(nodes)
 
@@ -231,7 +242,7 @@ def build_graph(
                 continue
 
     log.debug(f"Graph: built {len(nodes)} nodes, {sum(len(e) for e in graph_edges.values())} edges")
-    return nodes, graph_edges
+    return nodes, graph_edges, state_writers, state_readers
 
 
 # ── Layer 4: Reachability ────────────────────────────────────────
