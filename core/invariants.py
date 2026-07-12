@@ -157,3 +157,41 @@ def extract_invariants(f, contract_name: str, function_id: str) -> list:
         invariants.append(inv)
 
     return invariants
+
+
+from slither.core.expressions.assignment_operation import AssignmentOperation
+
+
+def extract_field_precise_writes(f) -> Set[str]:
+    """
+    Walk a function's nodes and extract every state write, resolved
+    to field precision where possible: "market.totalSupplyShares"
+    instead of just "market". Falls back to the bare variable name
+    when the write target has no member access (e.g. a plain state
+    var assignment with no struct/mapping field).
+
+    Reuses _resolve_operand — the same AST resolution path proven
+    against require() operands works identically for assignment
+    targets, since both are ordinary Solidity expressions.
+    """
+    writes = set()
+
+    if not getattr(f, "is_implemented", False):
+        return writes
+
+    for node in f.nodes:
+        expr = node.expression
+        if expr is None or not isinstance(expr, AssignmentOperation):
+            continue
+
+        left = expr.expression_left
+        resolved = _resolve_operand(left)
+
+        if resolved.is_state:
+            if resolved.member_path:
+                path = f"{resolved.state_var_name}.{'.'.join(resolved.member_path)}"
+            else:
+                path = resolved.state_var_name
+            writes.add(path)
+
+    return writes
