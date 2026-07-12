@@ -195,3 +195,77 @@ def extract_field_precise_writes(f) -> Set[str]:
             writes.add(path)
 
     return writes
+
+
+def _collect_all_state_refs(expr, found: set):
+    """
+    Recursively walk ANY expression subtree and collect every
+    field-precise state variable path found anywhere inside it —
+    not just at the top level. Needed for reads, since a read can
+    appear nested inside arithmetic, function args, etc, unlike a
+    write which is always the clean top-level assignment target.
+    """
+    if expr is None:
+        return
+
+    if isinstance(expr, MemberAccess):
+        resolved = _resolve_operand(expr)
+        if resolved.is_state:
+            if resolved.member_path:
+                path = f"{resolved.state_var_name}.{'.'.join(resolved.member_path)}"
+            else:
+                path = resolved.state_var_name
+            found.add(path)
+        return  # _resolve_operand already recursed the base for us
+
+    if isinstance(expr, IndexAccess):
+        resolved = _resolve_operand(expr)
+        if resolved.is_state:
+            found.add(resolved.state_var_name)
+        # also check the index key itself in case it's state-derived
+        _collect_all_state_refs(expr.expression_right, found)
+        return
+
+    if isinstance(expr, Identifier):
+        val = expr.value
+        if type(val).__name__ == "StateVariable":
+            found.add(val.name)
+        return
+
+    if isinstance(expr, BinaryOperation):
+        _collect_all_state_refs(expr.expression_left, found)
+        _collect_all_state_refs(expr.expression_right, found)
+        return
+
+    if isinstance(expr, AssignmentOperation):
+        # for reads, we care about the RIGHT side only (what's being read)
+        _collect_all_state_refs(expr.expression_right, found)
+        return
+
+    # CallExpression (function calls, library calls) — walk arguments
+    if hasattr(expr, "arguments") and expr.arguments:
+        for arg in expr.arguments:
+            _collect_all_state_refs(arg, found)
+        return
+
+
+def extract_field_precise_reads(f) -> Set[str]:
+    """
+    Walk a function's nodes and extract every state variable READ,
+    field-precise where possible. Unlike writes, reads can appear
+    anywhere in an expression — inside requires, arithmetic, function
+    calls — so this walks every node's full expression tree rather
+    than just checking assignment targets.
+    """
+    reads = set()
+
+    if not getattr(f, "is_implemented", False):
+        return reads
+
+    for node in f.nodes:
+        expr = node.expression
+        if expr is None:
+            continue
+        _collect_all_state_refs(expr, reads)
+
+    return reads
