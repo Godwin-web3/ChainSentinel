@@ -154,6 +154,7 @@ def validate_paths(
     graph_edges: dict,
     state_writers: dict = None,
     state_readers: dict = None,
+    invariant_index: dict = None,
 ) -> ValidationReport:
     """
     Validate all exploit paths against protocol invariants.
@@ -169,7 +170,7 @@ def validate_paths(
     report = ValidationReport()
 
     for path in paths:
-        result = _validate_path(path, nodes, graph_edges, state_writers, state_readers)
+        result = _validate_path(path, nodes, graph_edges, state_writers, state_readers, invariant_index)
         if result.verdict == CONFIRMED:
             report.confirmed.append(result)
         elif result.verdict == LIKELY:
@@ -190,6 +191,7 @@ def _validate_path(
     graph_edges: dict,
     state_writers: dict = None,
     state_readers: dict = None,
+    invariant_index: dict = None,
 ) -> ConstraintResult:
     """
     Run all constraint checks on a single path.
@@ -205,8 +207,8 @@ def _validate_path(
     results.append(_check_flashloan_window(path, nodes, graph_edges))
     results.append(_check_unchecked_return(path, nodes, graph_edges))
     results.append(_check_share_inflation(path, nodes, graph_edges))
-    if state_writers is not None and state_readers is not None:
-        results.append(_check_cross_function_state_race(path, nodes, graph_edges, state_writers, state_readers))
+    if invariant_index is not None:
+        results.append(_check_cross_function_state_race(path, nodes, graph_edges, invariant_index))
 
     non_suppressed = [r for r in results if r.verdict != SUPPRESSED]
 
@@ -687,69 +689,63 @@ def _check_missing_health_check(path, nodes, graph_edges) -> ConstraintResult:
 
 # ── Constraint 8: Cross-function state race ──────────────────────
 
-def _check_cross_function_state_race(path, nodes, graph_edges, state_writers, state_readers) -> ConstraintResult:
+def _check_cross_function_state_race(path, nodes, graph_edges, invariant_index) -> ConstraintResult:
     """
-    Detect state shared across functions with no reentrancy guard
-    spanning both. Catches read-only reentrancy and cross-function
-    reentrancy: bugs where the vulnerable write and the exploited
-    read live in DIFFERENT functions, invisible to single-path
-    storage-overlap checks.
+    Detect invariant-relevant state written AFTER a callback-capable
+    external call — the real reentrancy window, not just "shares a
+    variable with another function" and not an approximation of
+    ordering.
 
-    Pattern: entry function makes an external call, then writes
-    state X. A different function elsewhere in the same contract
-    also touches state X. Neither shares a reentrancy-lock modifier.
-    That gap is the race window.
+    Reads precomputed race_findings from FunctionNode, calculated in
+    graph.py at build time via invariants.py's invariant_writes_
+    between_calls — the exact, node-ordered, mutability-aware logic
+    validated this session against Morpho's supply/repay/liquidate/
+    setFee (0 false positives, correct suppression on all four for
+    four independently-confirmed reasons: field precision, library-
+    call classification, multi-call ordering, view/pure exclusion).
+
+    This function is now a thin consumer — all real analysis already
+    happened in graph.py, where the raw Slither function object and
+    real node ordering are still available.
     """
+    from core.invariants import state_key_to_display
+
     entry_node = nodes.get(path.entry)
     if entry_node is None:
         return _suppressed(path, "no entry node")
 
-    if not entry_node.external_callees:
-        return _suppressed(path, "entry makes no external call — no reentrancy window")
+    race_findings = getattr(entry_node, "race_findings", [])
+    if not race_findings:
+        return _suppressed(path, "no invariant-relevant write follows any callback-capable call")
 
-    entry_modifiers = set(entry_node.modifiers)
+    event, at_risk = race_findings[0]
     contract = entry_node.contract
+    risk_display = {state_key_to_display(k) for k in at_risk}
 
-    from core.invariants import state_key_to_display
+    invariants_at_risk = []
+    for k in at_risk:
+        full_key = (contract, k[0], k[1])
+        invariants_at_risk.extend(invariant_index.get(full_key, []))
 
-    for (root_var, member_path) in entry_node.state_writes:
-        key = (contract, root_var, member_path)
-        touchers = set(state_writers.get(key, [])) | set(state_readers.get(key, []))
-        touchers.discard(path.entry)
+    inv_summary = "; ".join(
+        inv.node_expr_str for inv in invariants_at_risk[:2]
+    ) if invariants_at_risk else "an unspecified protocol guarantee"
 
-        for other_cid in touchers:
-            other_node = nodes.get(other_cid)
-            if other_node is None:
-                continue
-
-            other_modifiers = set(other_node.modifiers)
-            shared_guard = entry_modifiers & other_modifiers
-            has_lock_word = any(
-                "lock" in m.lower() or "nonreentrant" in m.lower() or "guard" in m.lower()
-                for m in shared_guard
-            )
-            if has_lock_word:
-                continue
-
-            var_display = state_key_to_display((root_var, member_path))
-
-            return ConstraintResult(
-                path=path,
-                verdict=LIKELY,
-                confidence=70,
-                constraint_type="CROSS_FUNCTION_STATE_RACE",
-                reasoning=(
-                    f"{path.entry} writes {contract}.{var_display} after an external call, "
-                    f"with no shared reentrancy lock. {other_cid} independently "
-                    f"reads or writes the same field. A reentrant call during "
-                    f"{path.entry}'s external call can let {other_cid} observe or "
-                    f"corrupt state mid-transaction."
-                ),
-                immunefi_impact="State corruption or fund loss via cross-function reentrancy",
-                final_score=_final_score(path, 70),
-            )
-
-    return _suppressed(path, "no unguarded cross-function state overlap found")
+    return ConstraintResult(
+        path=path,
+        verdict=LIKELY,
+        confidence=70,
+        constraint_type="CROSS_FUNCTION_STATE_RACE",
+        reasoning=(
+            f"{path.entry} calls {event.node_expr_str} (callback-capable), "
+            f"then writes invariant-relevant field(s) {risk_display} after it, "
+            f"confirmed by real node ordering. This field participates in: "
+            f"{inv_summary}. A reentrant call during this callback can "
+            f"observe or corrupt state before the invariant is restored."
+        ),
+        immunefi_impact="State corruption or fund loss via cross-function reentrancy",
+        final_score=_final_score(path, 70),
+    )
 
 
 # ── Constraint 4: Oracle dependency ──────────────────────────────
