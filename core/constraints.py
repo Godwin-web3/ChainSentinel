@@ -472,11 +472,12 @@ def _node_touches_sink_state(node, sink) -> bool:
     still trips this because it's checking the actual storage overlap,
     not the variable's name.
     """
+    from core.invariants import root_names
     if not sink.state_writes:
         return False
     node_vars = set(getattr(node, 'state_writes', set())) | set(getattr(node, 'reads', set()))
-    node_vars_lower = {str(v).lower() for v in node_vars}
-    sink_vars_lower = {str(v).lower() for v in sink.state_writes}
+    node_vars_lower = {v.lower() for v in root_names(node_vars)}
+    sink_vars_lower = {v.lower() for v in root_names(sink.state_writes)}
     return bool(node_vars_lower & sink_vars_lower)
 
 
@@ -498,10 +499,11 @@ def _guard_constrains_sink_state(node, sink) -> bool:
     site, not inside it), but it reads the same debt/collateral
     storage the sink writes.
     """
+    from core.invariants import root_names
     if not sink.state_writes:
         return False
-    node_reads_lower = {str(v).lower() for v in getattr(node, 'reads', set())}
-    sink_vars_lower = {str(v).lower() for v in sink.state_writes}
+    node_reads_lower = {v.lower() for v in root_names(getattr(node, 'reads', set()))}
+    sink_vars_lower = {v.lower() for v in root_names(sink.state_writes)}
     if not bool(node_reads_lower & sink_vars_lower):
         return False
     auth_score = getattr(node, 'auth_score', 0)
@@ -708,8 +710,10 @@ def _check_cross_function_state_race(path, nodes, graph_edges, state_writers, st
     entry_modifiers = set(entry_node.modifiers)
     contract = entry_node.contract
 
-    for var in entry_node.state_writes:
-        key = f"{contract}.{var}"
+    from core.invariants import state_key_to_display
+
+    for (root_var, member_path) in entry_node.state_writes:
+        key = (contract, root_var, member_path)
         touchers = set(state_writers.get(key, [])) | set(state_readers.get(key, []))
         touchers.discard(path.entry)
 
@@ -727,15 +731,17 @@ def _check_cross_function_state_race(path, nodes, graph_edges, state_writers, st
             if has_lock_word:
                 continue
 
+            var_display = state_key_to_display((root_var, member_path))
+
             return ConstraintResult(
                 path=path,
                 verdict=LIKELY,
                 confidence=70,
                 constraint_type="CROSS_FUNCTION_STATE_RACE",
                 reasoning=(
-                    f"{path.entry} writes {contract}.{var} after an external call, "
+                    f"{path.entry} writes {contract}.{var_display} after an external call, "
                     f"with no shared reentrancy lock. {other_cid} independently "
-                    f"reads or writes the same variable. A reentrant call during "
+                    f"reads or writes the same field. A reentrant call during "
                     f"{path.entry}'s external call can let {other_cid} observe or "
                     f"corrupt state mid-transaction."
                 ),

@@ -15,7 +15,7 @@ from typing import List, Set, Dict, Optional
 from slither.slither import Slither
 from core.invariants import extract_field_precise_writes, extract_field_precise_reads
 from slither.slithir.operations import (
-    InternalCall, HighLevelCall, LowLevelCall, SolidityCall
+    InternalCall, HighLevelCall, LowLevelCall, SolidityCall, LibraryCall
 )
 
 log = logging.getLogger("chainsentinel")
@@ -89,6 +89,16 @@ def _extract_calls(f) -> tuple:
 
                 elif isinstance(ir, SolidityCall):
                     int_callees.append(f"solidity.{ir.function.name}")
+
+                elif isinstance(ir, LibraryCall):
+                    # LibraryCall is a subclass of HighLevelCall in Slither's
+                    # IR, so it must be checked BEFORE the HighLevelCall
+                    # branch below, or it silently falls through as an
+                    # external call. Library code is linked into the
+                    # contract and never leaves the trusted execution
+                    # context — it cannot be a reentrancy vector.
+                    fname = ir.function_name if hasattr(ir, 'function_name') else ''
+                    int_callees.append(f"library.{fname}")
 
                 elif isinstance(ir, HighLevelCall):
                     dest = str(ir.destination) if hasattr(ir, 'destination') else '?'
@@ -205,14 +215,18 @@ def build_graph(
                 nodes[callee_id].callers.append(cid)
 
     # Layer 4 — global state read/write index (cross-function view)
+    # Keys are structured: (contract, root_var, member_path_tuple).
+    # NOT joined strings — this preserves field precision so
+    # supply()'s market.totalSupplyAssets and setFee()'s market.fee
+    # are distinct keys, not collapsed into one "market" bucket.
     state_writers = {}
     state_readers = {}
     for cid, node in nodes.items():
-        for var in node.state_writes:
-            key = f"{node.contract}.{var}"
+        for (root_var, member_path) in node.state_writes:
+            key = (node.contract, root_var, member_path)
             state_writers.setdefault(key, []).append(cid)
-        for var in node.reads:
-            key = f"{node.contract}.{var}"
+        for (root_var, member_path) in node.reads:
+            key = (node.contract, root_var, member_path)
             state_readers.setdefault(key, []).append(cid)
 
     # Layer 4 — reachability (using real canonical edges)

@@ -225,16 +225,20 @@ def _classify_node(node_id: str, node, edges: List[CallEdge]) -> Optional[Sink]:
 
     # ── 4. Privileged storage write ──────────────────────────────
     if hasattr(node, "state_writes") and node.state_writes:
-        priv_writes = {
-            v for v in node.state_writes
-            if isinstance(v, str) and v.lower() in PRIVILEGED_SLOTS
-        }
-        if priv_writes:
+        from core.invariants import root_names, state_key_to_display
+        priv_slots_lower = {s.lower() for s in PRIVILEGED_SLOTS}
+        priv_root_names = {v.lower() for v in root_names(node.state_writes)}
+        priv_hit = priv_root_names & priv_slots_lower
+        if priv_hit:
+            priv_writes = {
+                k for k in node.state_writes if k[0].lower() in priv_hit
+            }
+            priv_display = {state_key_to_display(k) for k in priv_writes}
             return Sink(
                 node_id=node_id,
                 category=STORAGE_CORRUPTION,
                 severity=SINK_SEVERITY[STORAGE_CORRUPTION],
-                evidence=f"privileged slot write: {priv_writes}",
+                evidence=f"privileged slot write: {priv_display}",
                 state_writes=node.state_writes,
                 privileged_writes=priv_writes,
             )
@@ -250,11 +254,13 @@ def _classify_node(node_id: str, node, edges: List[CallEdge]) -> Optional[Sink]:
             # Check if there are state writes in the same function
             has_state = hasattr(node, "state_writes") and bool(node.state_writes)
             if has_state:
+                from core.invariants import state_key_to_display
+                writes_display = {state_key_to_display(k) for k in node.state_writes}
                 return Sink(
                     node_id=node_id,
                     category=CALLBACK_SINK,
                     severity=SINK_SEVERITY[CALLBACK_SINK],
-                    evidence=f"untrusted external call to {edge.dst} with open state writes: {node.state_writes}",
+                    evidence=f"untrusted external call to {edge.dst} with open state writes: {writes_display}",
                     has_callback=True,
                     state_writes=node.state_writes,
                 )
