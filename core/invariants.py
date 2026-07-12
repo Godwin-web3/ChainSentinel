@@ -162,6 +162,26 @@ def extract_invariants(f, contract_name: str, function_id: str) -> list:
 from slither.core.expressions.assignment_operation import AssignmentOperation
 
 
+def get_node_write(node):
+    """
+    Check a single node for a state-write assignment and return its
+    structured key, or None if this node isn't a state-write.
+
+    Node-level primitive — factored out so ordering analysis can
+    call this on individual nodes or slices (e.g. only the nodes
+    after an external call), not just whole-function scans. Named
+    for what it does (extract a node's write), not what it returns,
+    so it can grow to carry more than a key later without a rename.
+    """
+    expr = node.expression
+    if expr is None or not isinstance(expr, AssignmentOperation):
+        return None
+
+    left = expr.expression_left
+    resolved = _resolve_operand(left)
+    return _resolved_to_key(resolved)
+
+
 def extract_field_precise_writes(f) -> Set[str]:
     """
     Walk a function's nodes and extract every state write, resolved
@@ -170,9 +190,9 @@ def extract_field_precise_writes(f) -> Set[str]:
     when the write target has no member access (e.g. a plain state
     var assignment with no struct/mapping field).
 
-    Reuses _resolve_operand — the same AST resolution path proven
-    against require() operands works identically for assignment
-    targets, since both are ordinary Solidity expressions.
+    Thin wrapper around get_node_write() applied to every node in
+    the function — the real logic lives at node granularity so it
+    can be reused for partial/sliced node lists (ordering analysis).
     """
     writes = set()
 
@@ -180,14 +200,7 @@ def extract_field_precise_writes(f) -> Set[str]:
         return writes
 
     for node in f.nodes:
-        expr = node.expression
-        if expr is None or not isinstance(expr, AssignmentOperation):
-            continue
-
-        left = expr.expression_left
-        resolved = _resolve_operand(left)
-
-        key = _resolved_to_key(resolved)
+        key = get_node_write(node)
         if key is not None:
             writes.add(key)
 
@@ -301,3 +314,59 @@ def root_names(keys) -> set:
     source that was never field-precise to begin with.
     """
     return {k[0] for k in keys}
+
+
+from slither.slithir.operations import HighLevelCall, LowLevelCall, LibraryCall as _LibraryCallCheck
+
+
+def find_trust_boundary_index(f) -> Optional[int]:
+    """
+    Return the index into f.nodes of the first node containing a
+    genuine external call — one that actually leaves the trusted
+    execution context (HighLevelCall or LowLevelCall), explicitly
+    excluding LibraryCall (which is a HighLevelCall subclass but
+    never leaves trust — see graph.py's _extract_calls for the same
+    distinction). Returns None if no such call exists in this
+    function at all.
+    """
+    if not getattr(f, "is_implemented", False):
+        return None
+
+    for i, node in enumerate(f.nodes):
+        for ir in node.irs:
+            if isinstance(ir, _LibraryCallCheck):
+                continue
+            if isinstance(ir, (HighLevelCall, LowLevelCall)):
+                return i
+    return None
+
+
+def writes_after_trust_boundary(f, invariant_relevant_keys: set) -> set:
+    """
+    Given a function and a set of structured state keys known to be
+    invariant-relevant (from extract_invariants' state_vars() across
+    the contract), return the subset of those keys that get WRITTEN
+    at or after the trust-boundary node (i.e. after the first real
+    external call).
+
+    Empty result means: every invariant-relevant field this function
+    touches was already finalized before any external call — the
+    CEI-safe case, and the correct suppression condition for
+    CROSS_FUNCTION_STATE_RACE. A non-empty result means a real
+    reentrancy window exists against a field that actually matters.
+
+    This deliberately does NOT check "all writes" — a post-call
+    write to an irrelevant field (e.g. an event timestamp) should
+    not block suppression. Only invariant-relevant writes count.
+    """
+    boundary = find_trust_boundary_index(f)
+    if boundary is None:
+        return set()  # no external call at all — no window to check
+
+    at_risk = set()
+    for node in f.nodes[boundary:]:
+        key = get_node_write(node)
+        if key is not None and key in invariant_relevant_keys:
+            at_risk.add(key)
+
+    return at_risk
