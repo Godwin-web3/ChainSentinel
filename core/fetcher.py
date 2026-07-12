@@ -55,8 +55,22 @@ def fetch_source(address: str, chain: Chain) -> Optional[dict]:
         try:
             import json
             obj = json.loads(source)
-            sources = obj.get("sources", {})
-            file_map = {path: data.get("content", "") for path, data in sources.items()}
+            # Etherscan has two shapes for single-brace JSON:
+            # (a) {"language":..., "sources": {"File.sol": {"content":...}}}
+            # (b) {"File.sol": {"content":...}, "Other.sol": {"content":...}}
+            #     — a flat file map with NO "sources" wrapper, seen on
+            #     older verified contracts (e.g. Compound-era, pre-2020
+            #     compiler tooling). Detect which shape this is instead
+            #     of assuming (a) and silently getting an empty map.
+            if "sources" in obj and isinstance(obj.get("sources"), dict):
+                sources = obj["sources"]
+            else:
+                sources = obj
+            file_map = {
+                path: data.get("content", "")
+                for path, data in sources.items()
+                if isinstance(data, dict) and "content" in data
+            }
             parsed_source = "\n".join(file_map.values())
             log.debug(f"Multi-file project: {len(file_map)} files parsed")
         except Exception as e:
