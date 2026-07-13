@@ -146,7 +146,24 @@ def build_graph(
         os.chdir(project_root)
         rel_entry = os.path.relpath(entry_file, project_root)
         solc_remaps = " ".join(remappings[:50]) if remappings else ""
-        s = Slither(rel_entry, solc='solc-wrapper', solc_args='--via-ir --optimize', solc_remaps=solc_remaps)
+        # --via-ir did not exist before Solidity 0.8.13 — passing it to
+        # an older compiler is a hard failure, not a warning, and Slither
+        # silently returns nothing usable. Only include it when the
+        # target compiler version actually supports it.
+        def _supports_via_ir(version_str: str) -> bool:
+            try:
+                parts = version_str.split(".")
+                major, minor, patch = int(parts[0]), int(parts[1]), int(parts[2])
+                return (major, minor, patch) >= (0, 8, 13)
+            except (ValueError, IndexError):
+                return False  # unknown/malformed version — safest default
+
+        if _supports_via_ir(solc_version):
+            solc_args = '--via-ir --optimize'
+        else:
+            solc_args = '--optimize'
+
+        s = Slither(rel_entry, solc='solc-wrapper', solc_args=solc_args, solc_remaps=solc_remaps)
         os.chdir(orig_dir)
     except Exception as e:
         log.warning(f"Graph: Slither API failed: {e}")
