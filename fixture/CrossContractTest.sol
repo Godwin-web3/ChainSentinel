@@ -36,3 +36,18 @@ contract Vault {
         balances[msg.sender] += msg.value;
     }
 }
+
+contract VaultImmutable {
+    IOracle public immutable oracle;
+    mapping(address => uint256) public balances;
+
+    constructor(address _oracle) {
+        oracle = IOracle(_oracle);
+    }
+
+    function getValue(address user) external view returns (uint256) {
+        uint256 bal = balances[user];
+        uint256 price = oracle.getPrice();
+        return bal * price;
+    }
+}

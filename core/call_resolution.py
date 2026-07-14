@@ -66,8 +66,30 @@ def resolve_call(call_ir, function, slither) -> CallResolution:
     resolved_function = None
     if resolution.status == ResolutionStatus.RESOLVED and resolved_fn is not None:
         resolved_function = resolved_fn.name
-        if resolved_fn.contract is not None:
-            resolved_contract = resolved_fn.contract.name
+        target_contract = resolved_fn.contract
+
+        # If the call target is an interface, the interface itself has no
+        # function body — the graph has no node for it. Substitute the
+        # concrete implementer when exactly one exists in this compilation.
+        # With zero or multiple candidates, we genuinely do not know which
+        # contract is deployed at this address from source alone, so the
+        # edge should not claim a destination it cannot prove.
+        if target_contract is not None and target_contract.is_interface:
+            implementers = [
+                c for c in slither.contracts
+                if not c.is_interface and target_contract in c.inheritance
+            ]
+            if len(implementers) == 1:
+                impl_fn = implementers[0].get_function_from_signature(resolved_fn.full_name)                     if hasattr(implementers[0], "get_function_from_signature") else None
+                resolved_contract = implementers[0].name
+                if impl_fn is not None:
+                    resolved_function = impl_fn.name
+            else:
+                # zero or ambiguous implementers — don not claim a destination
+                resolved_contract = None
+                resolved_function = None
+        elif target_contract is not None:
+            resolved_contract = target_contract.name
 
     return CallResolution(
         origin=origin,
