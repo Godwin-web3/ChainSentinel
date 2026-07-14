@@ -197,6 +197,30 @@ def build_graph(
                 int_callees, ext_callees, flows = _extract_calls(f)
                 state_writes = extract_field_precise_writes(f)
 
+                # Cross-contract call resolution
+                try:
+                    from core.call_resolution import resolve_call
+                    from core.cross_contract import build_cross_contract_edge
+                    from slither.slithir.operations import HighLevelCall, LibraryCall, LowLevelCall
+
+                    cross_contract_edges = []
+
+                    for node in f.nodes:
+                        for ir in node.irs:
+                            if not isinstance(ir, (HighLevelCall, LibraryCall, LowLevelCall)):
+                                continue
+                            resolution = resolve_call(ir, f, s)
+                            edge = build_cross_contract_edge(
+                                caller_contract=contract.name,
+                                caller_function=f.full_name,
+                                resolution=resolution,
+                            )
+                            cross_contract_edges.append(edge)
+
+                except Exception as e:
+                    log.debug(f"Cross-contract resolution failed for {cid}: {e}")
+                    cross_contract_edges = []
+
                 # Layer 3 — auth from enricher
                 possible_keys = [
                     f"vars.{f.full_name}",
@@ -235,6 +259,8 @@ def build_graph(
                     asset_flows=flows,
                     call_events=call_events,
                 )
+
+                nodes[cid].cross_contract_edges = cross_contract_edges
                 nodes[cid].auth_score = auth_score
 
             except Exception as e:

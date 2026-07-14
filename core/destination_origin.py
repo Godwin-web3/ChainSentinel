@@ -2,14 +2,10 @@
 DestinationOrigin — classifies where a call's target address came from,
 using only Slither's resolved IR. No names, no heuristics, no protocol-
 specific logic — everything derives from actual data flow.
-
-This traces a call's destination variable backward through the function's
-IR (Assignment, Member, Index, TypeConversion) until it reaches a variable
-whose origin is structurally unambiguous.
 """
 
 from enum import Enum
-from typing import Optional
+from typing import Tuple
 
 from slither.core.declarations.solidity_variables import (
     SolidityVariable,
@@ -44,109 +40,99 @@ class DestinationOrigin(Enum):
 
 
 def resolve_destination_origin(call_ir, function) -> DestinationOrigin:
+    """Classification only. Thin wrapper over resolve_destination()."""
+    origin, _ = resolve_destination(call_ir, function)
+    return origin
+
+
+def resolve_destination_variable(call_ir, function):
+    """The resolved variable only, or None if never resolved to one."""
+    _, var = resolve_destination(call_ir, function)
+    return var
+
+
+def resolve_destination(call_ir, function) -> Tuple[DestinationOrigin, object]:
     """
-    Entry point. Given a call IR operation (HighLevelCall, LibraryCall, etc.)
-    and the function it appears in, resolve the origin of its destination.
+    Entry point. Returns (origin, resolved_variable_or_None).
     """
+    if isinstance(call_ir, LibraryCall):
+        return DestinationOrigin.UNKNOWN, None
+
     destination = getattr(call_ir, "destination", None)
     if destination is None:
-        return DestinationOrigin.UNKNOWN
+        return DestinationOrigin.UNKNOWN, None
 
     return _resolve_variable(destination, function, seen=set())
 
 
-def _resolve_variable(var, function, seen: set) -> DestinationOrigin:
-    # Cycle guard — IR tracing should never loop, but never trust that blindly.
+def _resolve_variable(var, function, seen: set) -> Tuple[DestinationOrigin, object]:
     var_id = id(var)
     if var_id in seen:
-        return DestinationOrigin.UNKNOWN
+        return DestinationOrigin.UNKNOWN, var
     seen.add(var_id)
 
-    # msg.sender / tx.origin — SolidityVariableComposed covers both.
     if isinstance(var, SolidityVariableComposed):
         if str(var) in ("msg.sender", "tx.origin"):
-            return DestinationOrigin.MSG_SENDER
-        return DestinationOrigin.UNKNOWN
+            return DestinationOrigin.MSG_SENDER, var
+        return DestinationOrigin.UNKNOWN, var
 
     if isinstance(var, SolidityVariable):
-        return DestinationOrigin.UNKNOWN
+        return DestinationOrigin.UNKNOWN, var
 
-    # Literal address baked into bytecode.
     if isinstance(var, Constant):
-        return DestinationOrigin.CONSTANT
+        return DestinationOrigin.CONSTANT, var
 
-    # State variable — split constant/immutable/plain mutable storage.
     if isinstance(var, StateVariable):
         if var.is_constant:
-            return DestinationOrigin.CONSTANT
+            return DestinationOrigin.CONSTANT, var
         if var.is_immutable:
-            return DestinationOrigin.IMMUTABLE
-        return DestinationOrigin.STATE_VARIABLE
+            return DestinationOrigin.IMMUTABLE, var
+        return DestinationOrigin.STATE_VARIABLE, var
 
-    # Local variable — distinguish a real function parameter from a
-    # local declared and assigned inside the function body.
     if isinstance(var, LocalVariable):
         if var in function.parameters:
-            return DestinationOrigin.PARAMETER
+            return DestinationOrigin.PARAMETER, var
         return _trace_local_assignment(var, function, seen)
 
-    # ReferenceVariable — Member/Index access (e.g. struct field, array slot).
-    # Slither tracks its base directly via points_to when available.
     if isinstance(var, ReferenceVariable):
         base = getattr(var, "points_to", None)
         if base is not None:
             return _resolve_variable(base, function, seen)
         return _trace_reference(var, function, seen)
 
-    # TemporaryVariable — produced by some IR op (call return, cast, etc.).
-    # Must search the function body for the IR that assigned it.
     if isinstance(var, TemporaryVariable):
         return _trace_temporary(var, function, seen)
 
-    return DestinationOrigin.UNKNOWN
+    return DestinationOrigin.UNKNOWN, var
 
 
-def _trace_local_assignment(var, function, seen) -> DestinationOrigin:
-    """
-    A non-parameter local — find the IR node where it was assigned and
-    resolve the right-hand side instead.
-    """
+def _trace_local_assignment(var, function, seen) -> Tuple[DestinationOrigin, object]:
     for node in function.nodes:
         for ir in node.irs:
             if isinstance(ir, Assignment) and ir.lvalue == var:
                 return _resolve_variable(ir.rvalue, function, seen)
             if isinstance(ir, TypeConversion) and ir.lvalue == var:
                 return _resolve_variable(ir.variable, function, seen)
-    return DestinationOrigin.LOCAL_VARIABLE
+    return DestinationOrigin.LOCAL_VARIABLE, var
 
 
-def _trace_reference(var, function, seen) -> DestinationOrigin:
-    """
-    Fallback for ReferenceVariable when points_to isn't populated —
-    search for the Member/Index op that produced it.
-    """
+def _trace_reference(var, function, seen) -> Tuple[DestinationOrigin, object]:
     for node in function.nodes:
         for ir in node.irs:
             if isinstance(ir, (Member, Index)) and ir.lvalue == var:
                 base = getattr(ir, "variable_left", None) or getattr(ir, "variable", None)
                 if base is not None:
                     return _resolve_variable(base, function, seen)
-    return DestinationOrigin.UNKNOWN
+    return DestinationOrigin.UNKNOWN, var
 
 
-def _trace_temporary(var, function, seen) -> DestinationOrigin:
-    """
-    Search for the IR operation that assigned this temporary. If it came
-    from a call's return value, treat as a terminal boundary (RETURN_VALUE)
-    rather than recursing into the called function — matches the design
-    decision to ship this as a terminal boundary for now.
-    """
+def _trace_temporary(var, function, seen) -> Tuple[DestinationOrigin, object]:
     for node in function.nodes:
         for ir in node.irs:
             if getattr(ir, "lvalue", None) != var:
                 continue
             if isinstance(ir, (HighLevelCall, LibraryCall, InternalCall, LowLevelCall)):
-                return DestinationOrigin.RETURN_VALUE
+                return DestinationOrigin.RETURN_VALUE, var
             if isinstance(ir, Assignment):
                 return _resolve_variable(ir.rvalue, function, seen)
             if isinstance(ir, TypeConversion):
@@ -155,4 +141,4 @@ def _trace_temporary(var, function, seen) -> DestinationOrigin:
                 base = getattr(ir, "variable_left", None) or getattr(ir, "variable", None)
                 if base is not None:
                     return _resolve_variable(base, function, seen)
-    return DestinationOrigin.UNKNOWN
+    return DestinationOrigin.UNKNOWN, var
