@@ -57,6 +57,23 @@ def classify_resolvability(facts: CallTargetFacts) -> ResolutionInfo:
         )
 
     if facts.is_literal:
+        # The ADDRESS is fixed and provable from source. But if it points
+        # at an interface type with multiple concrete implementers in this
+        # compilation, the address alone does not tell us WHICH contract's
+        # code actually runs there — that is genuine ambiguity, not a
+        # resolved destination. implementation_count == 1 covers both a
+        # concrete (non-interface) type and an interface with exactly one
+        # known implementer, both real resolved cases.
+        if facts.implementation_count > 1:
+            return ResolutionInfo(
+                status=ResolutionStatus.AMBIGUOUS,
+                method=ResolutionMethod.NONE,
+                notes=(
+                    f"address is fixed, but interface type has "
+                    f"{facts.implementation_count} candidate implementations, "
+                    f"none provably selected"
+                ),
+            )
         return ResolutionInfo(
             status=ResolutionStatus.RESOLVED,
             method=ResolutionMethod.LITERAL_CONSTANT,

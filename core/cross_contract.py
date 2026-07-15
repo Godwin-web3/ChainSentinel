@@ -49,9 +49,21 @@ def build_cross_contract_edge(
             resolution=resolution.resolution,
         )
 
+    # A boundary can arise two distinct ways: the resolvability classifier
+    # said REQUIRES_RUNTIME/AMBIGUOUS/UNRESOLVABLE (expected), or it said
+    # RESOLVED (address is known) but no concrete resolved_contract could be
+    # attached — e.g. a low-level call on a fixed address where Slither
+    # cannot determine which function is actually invoked. That second case
+    # must not be labeled "resolved", since nothing was actually resolved
+    # to a traversable destination.
+    if resolution.resolution.status == ResolutionStatus.RESOLVED:
+        reason = "address_resolved_no_target_function"
+    else:
+        reason = resolution.resolution.status.value
+
     return BoundaryNode(
         contract=caller_contract,
         function=caller_function,
-        reason=resolution.resolution.status.value,
+        reason=reason,
         details=resolution.resolution.notes or resolution.resolution.trust_anchor,
     )

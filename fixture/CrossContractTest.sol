@@ -51,3 +51,24 @@ contract VaultImmutable {
         return bal * price;
     }
 }
+
+contract OracleAlt is IOracle {
+    uint256 public price = 200;
+
+    function getPrice() external view override returns (uint256) {
+        return price;
+    }
+
+    function setPrice(uint256 _price) external {
+        price = _price;
+    }
+}
+
+contract MultiImplTest {
+    // Parameter origin, interface type, two concrete implementers
+    // (Oracle, OracleAlt) exist in this same compilation — genuinely
+    // ambiguous, cannot be resolved from source alone.
+    function readPrice(IOracle oracleRef) external view returns (uint256) {
+        return oracleRef.getPrice();
+    }
+}
