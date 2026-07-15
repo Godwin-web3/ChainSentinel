@@ -76,6 +76,16 @@ def fetch_source(address: str, chain: Chain) -> Optional[dict]:
         except Exception as e:
             log.debug(f"Single JSON parse failed: {e}")
 
+    # Flat, non-JSON single-file source (older verified contracts, e.g.
+    # pre-2020 compiler tooling) never enters either JSON branch above,
+    # so file_map stays empty even though parsed_source has real content.
+    # Fall back to a single synthetic file rather than silently writing
+    # nothing to disk.
+    if not file_map and parsed_source:
+        synthetic_name = f"{name or 'Contract'}.sol"
+        file_map = {synthetic_name: parsed_source}
+        log.debug(f"Flat single-file source — wrote as synthetic file {synthetic_name}")
+
     log.success(f"Source fetched: {name} ({compiler})")
     return {
         "verified": True,
