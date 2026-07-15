@@ -3,7 +3,10 @@ src = "contracts"
 test = "test"
 out = "out"
 libs = ["lib"]
-solc_version = "0.8.19"
+solc_version = "0.8.27"
+remappings = [
+    "openzeppelin-contracts/=fixture/aave/PoolImpl/lib/aave-helpers/lib/aave-address-book/lib/aave-v3-origin/lib/solidity-utils/lib/openzeppelin-contracts-upgradeable/lib/openzeppelin-contracts/",
+]
 
 [rpc_endpoints]
 mainnet = "${MAINNET_RPC_URL}"
