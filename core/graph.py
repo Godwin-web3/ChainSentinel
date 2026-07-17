@@ -119,7 +119,8 @@ def _extract_calls(f) -> tuple:
                 elif isinstance(ir, LowLevelCall):
                     dest = str(ir.destination) if hasattr(ir, 'destination') else '?'
                     ext_callees.append(f"{dest}.lowlevel")
-                    flows.append("eth.lowlevel")
+                    if ir.can_send_eth():
+                        flows.append("eth.lowlevel")
 
             except Exception:
                 continue
@@ -163,11 +164,27 @@ def build_graph(
         else:
             solc_args = '--optimize'
 
-        s = Slither(rel_entry, solc='solc-wrapper', solc_args=solc_args, solc_remaps=solc_remaps)
+        # Guard against crytic-compile's upward-walking Foundry detection.
+        # `locate_project_root` resolves the target to an absolute path and
+        # walks every ancestor looking for foundry.toml. When project_root has
+        # no foundry.toml of its own (e.g. fixture/morpho_blue), the walk
+        # escapes past it and finds the repo-root foundry.toml (pinned to
+        # 0.8.27), causing a solc version mismatch against the contract's own
+        # pragma. Passing foundry_ignore=True disables Foundry platform
+        # detection entirely and falls back to plain solc compilation.
+        _has_local_foundry = os.path.isfile(os.path.join(project_root, "foundry.toml"))
+
+        s = Slither(
+            rel_entry,
+            solc='solc-wrapper',
+            solc_args=solc_args,
+            solc_remaps=solc_remaps,
+            foundry_ignore=not _has_local_foundry,
+        )
         os.chdir(orig_dir)
     except Exception as e:
         log.warning(f"Graph: Slither API failed: {e}")
-        return {}, {}, {}, {}, {}
+        return {}, {}, {}, {}, {}, []
 
     features = enrichment.get("features", {}) if enrichment else {}
     nodes: Dict[str, FunctionNode] = {}
@@ -339,6 +356,7 @@ def build_graph(
         cid: getattr(node, "auth_score", 0) for cid, node in nodes.items()
     }
     graph_edges: Dict[str, list] = {}
+    unresolved_deps: list = []
     for contract in s.contracts:
         if contract.is_interface:
             continue
@@ -347,12 +365,12 @@ def build_graph(
             try:
                 cid = canonical_id(contract.name, f.full_name)
                 if cid in nodes:
-                    graph_edges[cid] = extract_edges(cid, f, auth_lookup)
+                    graph_edges[cid] = extract_edges(cid, f, auth_lookup, slither=s, unresolved_deps=unresolved_deps)
             except Exception:
                 continue
 
     log.debug(f"Graph: built {len(nodes)} nodes, {sum(len(e) for e in graph_edges.values())} edges")
-    return nodes, graph_edges, state_writers, state_readers, invariant_index
+    return nodes, graph_edges, state_writers, state_readers, invariant_index, unresolved_deps
 
 
 # ── Layer 4: Reachability ────────────────────────────────────────

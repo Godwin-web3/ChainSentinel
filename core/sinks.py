@@ -215,6 +215,8 @@ def _classify_node(node_id: str, node, edges: List[CallEdge]) -> Optional[Sink]:
             asset_evidence.append(f"asset flow: {flow}")
 
     if asset_evidence:
+        if "InitializableImmutableAdminUpgradeabilityProxy.initialize" in node_id:
+            print(f"TEMP_DEBUG sink triggered on {node_id}: evidence={asset_evidence}")
         return Sink(
             node_id=node_id,
             category=ASSET_DRAIN,
