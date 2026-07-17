@@ -148,6 +148,27 @@ def generate_report(result: dict, output_dir: str = "output/reports") -> str:
                 lines += [f"| `{v['name']}` | `{v.get('auth_state','?')}` | {v.get('auth_score',0)} | {evidence or '—'} |"]
         lines += [""]
 
+    graph = result.get("graph", {})
+    if graph:
+        lines += ["## \U0001F578\uFE0F Graph Analysis", ""]
+        lines += [
+            f"| Nodes | Sinks | Confirmed | Likely | Possible | Suppressed |",
+            f"|-------|-------|-----------|--------|----------|------------|",
+            f"| {graph.get('nodes', 0)} | {graph.get('sinks', 0)} | {graph.get('confirmed', 0)} | "
+            f"{graph.get('likely', 0)} | {graph.get('possible', 0)} | {graph.get('suppressed', 0)} |",
+            "",
+        ]
+        graph_findings = graph.get("findings", [])
+        if graph_findings:
+            lines += ["### Constraint Engine Findings", ""]
+            for gf in graph_findings:
+                lines += [
+                    f"- **{gf.get('verdict', 'UNKNOWN')}** ({gf.get('confidence', 0)}%) "
+                    f"`{gf.get('constraint_type', 'N/A')}` \u2014 {gf.get('entry', '?')} \u2192 {gf.get('sink', '?')}",
+                    f"  - {gf.get('reasoning', '')}",
+                ]
+            lines += [""]
+
     safe_name = name.replace(" ", "_").replace("/", "_")
     filename = f"report_{safe_name}_{address[:8]}.md"
     filepath = os.path.join(output_dir, filename)

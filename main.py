@@ -341,7 +341,8 @@ def analyze(address, chain_name, output_json=False):
                 "implementation": resolved["implementation"],
                 "token": token_data,
                 "analysis": analysis,
-                "enrichment": enrichment
+                "enrichment": enrichment,
+                "graph": analysis.get("graph", {})
             })
             poc_file = generate_poc(
                 address=address,
