@@ -7,7 +7,7 @@ from utils.logger import log
 # Score: 3=strong, 2=medium, 1=weak
 import hashlib
 
-_CACHE_DIR = os.path.expanduser("~/.exploit-agent-cache/printers")
+_CACHE_DIR = os.path.expanduser("~/.chainsentinel-cache/printers")
 
 def _cache_key(resolved: dict) -> str:
     addr = resolved.get("address", "unknown").lower()

@@ -22,7 +22,7 @@ def write_source_files(source_data: dict) -> Optional[tuple]:
     Returns (root_dir, entry_file) or None.
     """
     try:
-        tmpdir = tempfile.mkdtemp(prefix="exploit-agent-")
+        tmpdir = tempfile.mkdtemp(prefix="chainsentinel-")
 
         # Use pre-parsed file_map from fetcher if available
         file_map = source_data.get("files", {})
@@ -135,6 +135,15 @@ def run_slither(resolved: dict) -> dict:
     except ValueError:
         pass  # Windows edge case — keep absolute
 
+    # Guard against crytic-compile's upward-walking Foundry detection.
+    # Even with a relative path, crytic-compile resolves it back to absolute
+    # (using the cwd) and then walks every ancestor for foundry.toml. When
+    # project_root has no foundry.toml of its own, the walk escapes past it
+    # and finds the repo-root foundry.toml (pinned to 0.8.27), causing a
+    # version mismatch against the contract's pragma. --foundry-ignore disables
+    # the Foundry platform entirely and falls back to plain solc.
+    _has_local_foundry = _os.path.isfile(_os.path.join(project_root, "foundry.toml"))
+
     # Build remappings from directory structure
     remappings = []
     for root, dirs, files in os.walk(project_root):
@@ -170,6 +179,8 @@ def run_slither(resolved: dict) -> dict:
     cmd = ["slither", filepath, "--solc", "solc-wrapper",
            "--solc-args", f"--allow-paths {project_root}{solc_extra}",
            "--json", "-"]
+    if not _has_local_foundry:
+        cmd.append("--foundry-ignore")
     if remappings:
         cmd += ["--solc-remaps", " ".join(remappings[:50])]
 

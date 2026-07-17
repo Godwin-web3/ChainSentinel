@@ -3,7 +3,7 @@ import sys
 from datetime import datetime
 
 class ExploitAgentLogger:
-    def __init__(self, name: str = "exploit-agent"):
+    def __init__(self, name: str = "chainsentinel"):
         self.logger = logging.getLogger(name)
         self.logger.setLevel(logging.DEBUG)
 

@@ -24,7 +24,7 @@ ANVIL_TIMEOUT = 60
 
 # Output
 REPORTS_DIR = "output/reports"
-TEMP_DIR = "/tmp/exploit-agent"
+TEMP_DIR = "/tmp/chainsentinel"
 
 # Supported proxy types
 PROXY_SLOTS = {
