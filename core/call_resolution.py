@@ -23,6 +23,14 @@ class CallResolution:
     resolution: ResolutionInfo
     resolved_contract: Optional[str] = None
     resolved_function: Optional[str] = None
+    resolved_variable_name: Optional[str] = None
+    # The interface/declared function's own full typed signature
+    # (name + arg types), taken directly from Slither's IR regardless
+    # of whether a concrete implementer was found. This is real,
+    # provable data — not a name guess — and is what any downstream
+    # cross-compilation matching (core/multi_compile.py) should key on,
+    # never bare function names.
+    interface_signature: Optional[str] = None
 
 
 def resolve_call(call_ir, function, slither) -> CallResolution:
@@ -33,12 +41,13 @@ def resolve_call(call_ir, function, slither) -> CallResolution:
     is_immutable = origin == DestinationOrigin.IMMUTABLE
 
     public_getter = None
-    if origin == DestinationOrigin.STATE_VARIABLE and variable is not None:
+    if origin in (DestinationOrigin.STATE_VARIABLE, DestinationOrigin.IMMUTABLE) and variable is not None:
         if getattr(variable, "visibility", None) == "public":
             public_getter = variable.name
 
     resolved_fn = getattr(call_ir, "function", None)
     resolved_contract_obj = resolved_fn.contract if resolved_fn else None
+    interface_signature = resolved_fn.full_name if resolved_fn is not None else None
 
     implementation_count = 0
     if resolved_contract_obj is not None:
@@ -95,8 +104,10 @@ def resolve_call(call_ir, function, slither) -> CallResolution:
             resolved_function = resolved_fn.full_name
 
     return CallResolution(
+        interface_signature=interface_signature,
         origin=origin,
         resolution=resolution,
         resolved_contract=resolved_contract,
         resolved_function=resolved_function,
+        resolved_variable_name=public_getter,
     )

@@ -3,7 +3,7 @@ from core.graph import build_graph
 from core.cross_contract import CrossContractEdge, BoundaryNode
 from core.cross_contract_dfs import CrossContractDFS
 
-nodes, graph_edges, state_writers, state_readers, invariant_index = build_graph(
+nodes, graph_edges, state_writers, state_readers, invariant_index, unresolved_deps = build_graph(
     project_root=os.path.abspath('fixture'),
     entry_file=os.path.abspath('fixture/CrossContractTest.sol'),
     solc_version='0.8.13',

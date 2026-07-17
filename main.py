@@ -178,7 +178,111 @@ def analyze(address, chain_name, output_json=False):
 
                     if p_root and e_file and s_ver:
                         remaps = slither_result.get("remappings", [])
-                        nodes, graph_edges, state_writers, state_readers, invariant_index = build_graph(p_root, e_file, s_ver, enrichment, remaps)
+                        nodes, graph_edges, state_writers, state_readers, invariant_index, unresolved_deps = build_graph(p_root, e_file, s_ver, enrichment, remaps)
+
+                        # Auto-fetch missing sibling contracts. Only for calls whose
+                        # destination is a fixed state variable / immutable on THIS
+                        # deployed instance (never for runtime-arbitrary destinations
+                        # like msg.sender or function parameters — those are correctly
+                        # left unresolved by design).
+                        #
+                        # Writing a dependency's source to disk is not enough — Slither
+                        # only compiles what's reachable via import from the entry file.
+                        # So once any new dependency is merged, we compile via a small
+                        # generated wrapper file that imports the real entry plus every
+                        # resolved dependency's top-level contract, instead of e_file
+                        # directly. This is purely a compilation-unit mechanism — it
+                        # does not change how resolve_call or the DFS reason.
+                        max_fetch_retries = 3
+                        fetched_vars = set()
+                        dependency_entry_files = []
+                        # var_name -> entry_file, kept alongside the flat list above
+                        # so the multi-version fallback knows which dependency file
+                        # belongs to which unresolved variable.
+                        dependency_map = {}
+                        retry_count = 0
+                        compile_entry = e_file
+                        # Preserve the pre-retry build in case the wrapper attempt
+                        # fails outright and we need a clean base to merge onto.
+                        base_build = (nodes, graph_edges, state_writers, state_readers, invariant_index, unresolved_deps)
+
+                        while unresolved_deps and retry_count < max_fetch_retries:
+                            new_vars = [v for v in set(unresolved_deps) if v not in fetched_vars]
+                            if not new_vars:
+                                break
+                            any_merged = False
+                            for var_name in new_vars:
+                                fetched_vars.add(var_name)
+                                try:
+                                    from core.dependency_fetcher import fetch_dependency_by_var
+                                    merge_result = fetch_dependency_by_var(address, var_name, chain, p_root)
+                                    if merge_result and merge_result.entry_file:
+                                        log.info(f"Auto-fetched dependency for {var_name} -> {merge_result.address}")
+                                        dependency_entry_files.append(merge_result.entry_file)
+                                        dependency_map[var_name] = merge_result.entry_file
+                                        any_merged = True
+                                except Exception as fe:
+                                    log.warn(f"Auto-fetch failed for {var_name}: {fe}")
+                            retry_count += 1
+                            if not any_merged:
+                                break
+
+                            # Attempt 1: single-compile wrapper. Cheap, correct whenever
+                            # the entry file and every dependency's pragma ranges overlap
+                            # (the common case — most sibling contracts in an active
+                            # protocol get redeployed against similar-ish solc versions).
+                            wrapper_nodes = {}
+                            try:
+                                from core.dependency_fetcher import build_wrapper_entry
+                                compile_entry = build_wrapper_entry(p_root, e_file, dependency_entry_files)
+                                wrapper_nodes, wrapper_edges, wrapper_writers, wrapper_readers, wrapper_invariants, wrapper_unresolved = build_graph(p_root, compile_entry, s_ver, enrichment, remaps)
+                            except Exception as we:
+                                log.warn(f"Wrapper build failed: {we}")
+
+                            if wrapper_nodes:
+                                # Wrapper compiled successfully — use its output directly.
+                                nodes, graph_edges, state_writers, state_readers, invariant_index, unresolved_deps = (
+                                    wrapper_nodes, wrapper_edges, wrapper_writers, wrapper_readers, wrapper_invariants, wrapper_unresolved
+                                )
+                                continue
+
+                            # Attempt 2: wrapper failed — almost certainly a genuine
+                            # pragma conflict (e.g. an exact-pinned older sibling
+                            # contract vs a newer entry file, proven case: Aave's
+                            # Pool at 0.8.27 vs PoolAddressesProvider pinned to
+                            # 0.8.10 exactly). Compile each dependency separately at
+                            # its own real pragma, merge by canonical_id, then rewrite
+                            # the synthetic external.{var}.{signature} labels using the
+                            # dependency's real FunctionNodes — matched by EXACT full
+                            # signature only (never bare name — see core/multi_compile.py).
+                            log.info("Wrapper compile failed (likely pragma conflict) — falling back to separate multi-version compilation")
+                            from core.multi_compile import extract_pragma_version, merge_build_results, rewrite_unresolved_edges
+
+                            merged = base_build
+                            for var_name, dep_entry in dependency_map.items():
+                                dep_version = extract_pragma_version(dep_entry) or s_ver
+                                try:
+                                    dep_result = build_graph(p_root, dep_entry, dep_version, {}, remaps)
+                                except Exception as de:
+                                    log.warn(f"Separate compile failed for dependency of {var_name} at {dep_version}: {de}")
+                                    continue
+                                if not dep_result[0]:
+                                    log.warn(f"Separate compile for dependency of {var_name} produced no nodes at {dep_version}")
+                                    continue
+                                merged = merge_build_results(merged, dep_result)
+                                rewritten = rewrite_unresolved_edges(merged[1], dep_result[0], var_name)
+                                log.info(f"Rewrote {rewritten} edges for {var_name} using separately-compiled dependency at {dep_version}")
+
+                            nodes, graph_edges, state_writers, state_readers, invariant_index, unresolved_deps = merged
+                            base_build = merged
+                            # unresolved_deps from the merge still reflects the
+                            # original entry compile's list — recompute against
+                            # what's actually still unresolved after rewriting.
+                            still_unresolved = [
+                                v for v in unresolved_deps
+                                if any(str(e.dst).startswith(f"external.{v}.") for edges in graph_edges.values() for e in edges)
+                            ]
+                            unresolved_deps = still_unresolved
                         sinks = classify_sinks(nodes, graph_edges)
                         paths = enumerate_paths(nodes, graph_edges, sinks)
                         high_paths = top_paths(paths, min_score=10)

@@ -656,7 +656,7 @@ def _resolve_trust(ir, raw_type: str, f, auth_lookup: Optional[dict], node=None)
 
 # ── Destination resolution ────────────────────────────────────────
 
-def _resolve_dst(ir, src_id: str, raw_type: str, f=None, auth_lookup: Optional[dict] = None, node=None) -> tuple:
+def _resolve_dst(ir, src_id: str, raw_type: str, f=None, auth_lookup: Optional[dict] = None, node=None, slither=None, unresolved_deps=None) -> tuple:
     """
     Attempt to resolve destination canonical ID and name.
     Returns (dst_id, function_name, destination_str, trusted).
@@ -689,6 +689,46 @@ def _resolve_dst(ir, src_id: str, raw_type: str, f=None, auth_lookup: Optional[d
             fname = getattr(ir, "function_name", "") or ""
             fname = str(fname) if fname else ""
             trusted = _resolve_trust(ir, raw_type, f, auth_lookup, node)
+
+            # Attempt real cross-contract resolution. Only when a concrete
+            # destination is PROVEN (RESOLVED) do we return a canonical ID
+            # that could actually match a node in the graph — everything
+            # else keeps the prior synthetic-label behavior unchanged, so
+            # existing single-contract findings are not affected.
+            if slither is not None and f is not None:
+                try:
+                    from core.call_resolution import resolve_call
+                    from core.resolution import ResolutionStatus
+                    resolution = resolve_call(ir, f, slither)
+                    if (
+                        resolution.resolution.status == ResolutionStatus.RESOLVED
+                        and resolution.resolved_contract
+                        and resolution.resolved_function
+                    ):
+                        real_cid = f"{resolution.resolved_contract}.{resolution.resolved_function}"
+                        return real_cid, fname, dest, trusted
+                    elif (
+                        resolution.resolved_variable_name
+                        and unresolved_deps is not None
+                    ):
+                        # Status may be RESOLVED-but-empty (ambiguous/zero implementers,
+                        # e.g. missing sibling contract) or otherwise non-RESOLVED, but we
+                        # have a real fixed variable name (STATE_VARIABLE/IMMUTABLE origin
+                        # only — never PARAMETER/MSG_SENDER). Record it so the caller can
+                        # attempt to fetch the missing dependency and retry.
+                        unresolved_deps.append(resolution.resolved_variable_name)
+
+                        # Carry the real typed signature (name + arg types),
+                        # taken directly from Slither's IR on the interface's
+                        # own declared function — real data, not a guess —
+                        # into the synthetic label. This is what lets a later
+                        # cross-compilation merge (core/multi_compile.py)
+                        # match by exact signature instead of bare name.
+                        if resolution.interface_signature:
+                            fname = resolution.interface_signature
+                except Exception:
+                    pass  # fall through to prior synthetic-label behavior
+
             return f"external.{dest}.{fname}", fname, dest, trusted
         except Exception:
             return f"{src_id}.__unresolved_external__", None, None, False
@@ -720,7 +760,7 @@ def _resolve_dst(ir, src_id: str, raw_type: str, f=None, auth_lookup: Optional[d
 
 # ── Public API ────────────────────────────────────────────────────
 
-def extract_edges(src_id: str, f, auth_lookup: Optional[dict] = None) -> list[CallEdge]:
+def extract_edges(src_id: str, f, auth_lookup: Optional[dict] = None, slither=None, unresolved_deps=None) -> list[CallEdge]:
     """
     Extract all typed call edges from a Slither function object.
 
@@ -745,7 +785,7 @@ def extract_edges(src_id: str, f, auth_lookup: Optional[dict] = None) -> list[Ca
                     continue
 
                 dst_id, fname, dest_str, trusted = _resolve_dst(
-                    ir, src_id, raw_type, f, auth_lookup, node
+                    ir, src_id, raw_type, f, auth_lookup, node, slither, unresolved_deps
                 )
                 props = _semantic_properties(raw_type)
 
