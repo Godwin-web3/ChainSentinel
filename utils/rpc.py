@@ -59,3 +59,29 @@ def etherscan_request(params: dict, chain: Chain) -> Optional[dict]:
     except Exception as e:
         log.error(f"Etherscan request failed: {e}")
         return None
+
+def get_public_var_address(target_address: str, var_name: str, chain: Chain) -> Optional[str]:
+    """
+    Calls the auto-generated getter for a public state variable or immutable
+    (e.g. ADDRESSES_PROVIDER()) on a deployed contract, and decodes the
+    returned value as an address. Used to resolve cross-contract call
+    destinations that are provably fixed at a specific deployed instance,
+    not runtime-arbitrary (msg.sender, function parameters).
+    """
+    try:
+        w3 = get_web3(chain)
+        selector = w3.keccak(text=f"{var_name}()")[:4]
+        result = w3.eth.call({
+            "to": Web3.to_checksum_address(target_address),
+            "data": selector,
+        })
+        if not result or len(result) < 32:
+            return None
+        addr = "0x" + result[-20:].hex()
+        if addr == "0x" + "0" * 40:
+            return None
+        return Web3.to_checksum_address(addr)
+    except Exception as e:
+        log.error(f"get_public_var_address failed for {var_name} at {target_address}: {e}")
+        return None
+
