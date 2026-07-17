@@ -716,7 +716,15 @@ def _resolve_dst(ir, src_id: str, raw_type: str, f=None, auth_lookup: Optional[d
                         # have a real fixed variable name (STATE_VARIABLE/IMMUTABLE origin
                         # only — never PARAMETER/MSG_SENDER). Record it so the caller can
                         # attempt to fetch the missing dependency and retry.
-                        unresolved_deps.append(resolution.resolved_variable_name)
+                        declaring_contract = (
+                            f.contract_declarer.name
+                            if f is not None and f.contract_declarer is not None
+                            else None
+                        )
+                        unresolved_deps.append({
+                            "variable_name": resolution.resolved_variable_name,
+                            "declaring_contract": declaring_contract,
+                        })
 
                         # Carry the real typed signature (name + arg types),
                         # taken directly from Slither's IR on the interface's

@@ -200,6 +200,7 @@ def analyze(address, chain_name, output_json=False):
                         # so the multi-version fallback knows which dependency file
                         # belongs to which unresolved variable.
                         dependency_map = {}
+                        dependency_resolution_log = []
                         retry_count = 0
                         compile_entry = e_file
                         # Preserve the pre-retry build in case the wrapper attempt
@@ -207,12 +208,41 @@ def analyze(address, chain_name, output_json=False):
                         base_build = (nodes, graph_edges, state_writers, state_readers, invariant_index, unresolved_deps)
 
                         while unresolved_deps and retry_count < max_fetch_retries:
-                            new_vars = [v for v in set(unresolved_deps) if v not in fetched_vars]
-                            if not new_vars:
+                            seen_names = set()
+                            new_deps = []
+                            for d in unresolved_deps:
+                                vn = d["variable_name"]
+                                if vn not in fetched_vars and vn not in seen_names:
+                                    seen_names.add(vn)
+                                    new_deps.append(d)
+                            if not new_deps:
                                 break
                             any_merged = False
-                            for var_name in new_vars:
+                            for dep in new_deps:
+                                var_name = dep["variable_name"]
+                                declaring_contract = dep.get("declaring_contract")
                                 fetched_vars.add(var_name)
+                                # Only auto-fetch when the variable is declared on the
+                                # entry contract itself. Variables declared on an unrelated
+                                # sibling contract type (e.g. CToken's interestRateModel,
+                                # seen while compiling Comptroller) aren't reachable this way
+                                # — there's no single address to fetch, since the entry
+                                # contract doesn't hold that state itself. Real fix for that
+                                # case is enumeration (e.g. getAllMarkets()), not a direct
+                                # getter read, and isn't implemented yet.
+                                if declaring_contract and declaring_contract != resolved["name"]:
+                                    log.info(
+                                        f"Skipping auto-fetch for {var_name} — declared on "
+                                        f"{declaring_contract}, not entry contract {resolved['name']} "
+                                        f"(cross-contract enumeration not yet supported)"
+                                    )
+                                    dependency_resolution_log.append({
+                                        "variable_name": var_name,
+                                        "declaring_contract": declaring_contract,
+                                        "status": "skipped",
+                                        "reason": "declared on unrelated sibling contract — enumeration not yet supported",
+                                    })
+                                    continue
                                 try:
                                     from core.dependency_fetcher import fetch_dependency_by_var
                                     merge_result = fetch_dependency_by_var(address, var_name, chain, p_root)
@@ -221,8 +251,27 @@ def analyze(address, chain_name, output_json=False):
                                         dependency_entry_files.append(merge_result.entry_file)
                                         dependency_map[var_name] = merge_result.entry_file
                                         any_merged = True
+                                        dependency_resolution_log.append({
+                                            "variable_name": var_name,
+                                            "declaring_contract": declaring_contract,
+                                            "status": "fetched",
+                                            "resolved_address": merge_result.address,
+                                        })
+                                    else:
+                                        dependency_resolution_log.append({
+                                            "variable_name": var_name,
+                                            "declaring_contract": declaring_contract,
+                                            "status": "failed",
+                                            "reason": "no entry file returned",
+                                        })
                                 except Exception as fe:
                                     log.warn(f"Auto-fetch failed for {var_name}: {fe}")
+                                    dependency_resolution_log.append({
+                                        "variable_name": var_name,
+                                        "declaring_contract": declaring_contract,
+                                        "status": "failed",
+                                        "reason": str(fe),
+                                    })
                             retry_count += 1
                             if not any_merged:
                                 break
@@ -265,13 +314,31 @@ def analyze(address, chain_name, output_json=False):
                                     dep_result = build_graph(p_root, dep_entry, dep_version, {}, remaps)
                                 except Exception as de:
                                     log.warn(f"Separate compile failed for dependency of {var_name} at {dep_version}: {de}")
+                                    dependency_resolution_log.append({
+                                        "variable_name": var_name,
+                                        "status": "compile_failed",
+                                        "pragma_version": dep_version,
+                                        "reason": str(de),
+                                    })
                                     continue
                                 if not dep_result[0]:
                                     log.warn(f"Separate compile for dependency of {var_name} produced no nodes at {dep_version}")
+                                    dependency_resolution_log.append({
+                                        "variable_name": var_name,
+                                        "status": "compile_empty",
+                                        "pragma_version": dep_version,
+                                        "reason": "produced no nodes",
+                                    })
                                     continue
                                 merged = merge_build_results(merged, dep_result)
                                 rewritten = rewrite_unresolved_edges(merged[1], dep_result[0], var_name)
                                 log.info(f"Rewrote {rewritten} edges for {var_name} using separately-compiled dependency at {dep_version}")
+                                dependency_resolution_log.append({
+                                    "variable_name": var_name,
+                                    "status": "cross_contract_resolved",
+                                    "pragma_version": dep_version,
+                                    "edges_rewritten": rewritten,
+                                })
 
                             nodes, graph_edges, state_writers, state_readers, invariant_index, unresolved_deps = merged
                             base_build = merged
@@ -279,8 +346,8 @@ def analyze(address, chain_name, output_json=False):
                             # original entry compile's list — recompute against
                             # what's actually still unresolved after rewriting.
                             still_unresolved = [
-                                v for v in unresolved_deps
-                                if any(str(e.dst).startswith(f"external.{v}.") for edges in graph_edges.values() for e in edges)
+                                d for d in unresolved_deps
+                                if any(str(e.dst).startswith(f"external.{d['variable_name']}.") for edges in graph_edges.values() for e in edges)
                             ]
                             unresolved_deps = still_unresolved
                         sinks = classify_sinks(nodes, graph_edges)
@@ -298,6 +365,7 @@ def analyze(address, chain_name, output_json=False):
                             "likely": len(report.likely),
                             "possible": len(report.possible),
                             "suppressed": len(report.suppressed),
+            "dependency_resolution": dependency_resolution_log,
                             "findings": [
                                 {
                                     "verdict": r.verdict,

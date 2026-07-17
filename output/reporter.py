@@ -169,6 +169,24 @@ def generate_report(result: dict, output_dir: str = "output/reports") -> str:
                 ]
             lines += [""]
 
+        dep_log = graph.get("dependency_resolution", [])
+        if dep_log:
+            lines += ["### Cross-Contract Dependency Resolution", ""]
+            lines += ["| Variable | Declaring Contract | Status | Detail |"]
+            lines += ["|----------|--------------------|--------|--------|"]
+            for d in dep_log:
+                status = d.get("status", "unknown")
+                detail = (
+                    d.get("resolved_address")
+                    or (f"{d.get('edges_rewritten', 0)} edges rewritten @ {d.get('pragma_version', '?')}" if status == "cross_contract_resolved" else None)
+                    or d.get("reason", "")
+                )
+                lines += [
+                    f"| `{d.get('variable_name', '?')}` | {d.get('declaring_contract', '—')} | "
+                    f"{status} | {detail} |"
+                ]
+            lines += [""]
+
     safe_name = name.replace(" ", "_").replace("/", "_")
     filename = f"report_{safe_name}_{address[:8]}.md"
     filepath = os.path.join(output_dir, filename)

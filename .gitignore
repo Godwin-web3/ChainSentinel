@@ -25,3 +25,4 @@ output/reports/*.md
 *.log
 scratch/
 output/
+ape-finance/
