@@ -85,3 +85,35 @@ def get_public_var_address(target_address: str, var_name: str, chain: Chain) -> 
         log.error(f"get_public_var_address failed for {var_name} at {target_address}: {e}")
         return None
 
+
+def get_address_array(target_address: str, function_signature: str, chain: Chain, limit: int = 5) -> Optional[list]:
+    """
+    Calls a no-argument view function that returns address[] (e.g.
+    "getAllMarkets()") and decodes the ABI-encoded dynamic array.
+    Returns up to `limit` addresses, or None on failure.
+    """
+    try:
+        w3 = get_web3(chain)
+        selector = w3.keccak(text=function_signature)[:4]
+        result = w3.eth.call({
+            "to": Web3.to_checksum_address(target_address),
+            "data": selector,
+        })
+        if not result or len(result) < 64:
+            return None
+        length = int.from_bytes(result[32:64], "big")
+        if length == 0:
+            return None
+        addresses = []
+        for i in range(min(length, limit)):
+            start = 64 + i * 32
+            end = start + 32
+            if end > len(result):
+                break
+            addr = "0x" + result[end - 20:end].hex()
+            if addr != "0x" + "0" * 40:
+                addresses.append(Web3.to_checksum_address(addr))
+        return addresses or None
+    except Exception as e:
+        log.error(f"get_address_array failed for {function_signature} at {target_address}: {e}")
+        return None

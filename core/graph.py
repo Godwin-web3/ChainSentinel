@@ -78,6 +78,11 @@ class FunctionNode:
     reachable_from_untrusted: bool = False
     exploit_score: int = 0
 
+    # Enumeration discovery — real Slither return-type data, used to find
+    # one-to-many dependency getters (e.g. Comptroller.getAllMarkets()
+    # returning CToken[]), never a name guess.
+    returns_address_collection: bool = False
+
 
 # ── Layer 1: IR extraction ───────────────────────────────────────
 def _extract_calls(f) -> tuple:
@@ -256,6 +261,25 @@ def build_graph(
                 auth_state = enricher_data.get("auth_state", "UNKNOWN")
                 auth_score = enricher_data.get("auth_score", 0)
 
+                # Structural check (real Slither return-type IR, never a
+                # name guess): does this function return an array whose
+                # element type is address, or a contract type (e.g.
+                # CToken[], ApeToken[])? Used later to discover one-to-many
+                # enumeration dependencies (factory/comptroller patterns).
+                returns_address_collection = False
+                if f.return_type:
+                    from slither.core.solidity_types import ArrayType, ElementaryType, UserDefinedType
+                    from slither.core.declarations.contract import Contract
+                    for rt in f.return_type:
+                        if isinstance(rt, ArrayType):
+                            elem = rt.type
+                            if isinstance(elem, ElementaryType) and elem.name == "address":
+                                returns_address_collection = True
+                                break
+                            if isinstance(elem, UserDefinedType) and isinstance(elem.type, Contract):
+                                returns_address_collection = True
+                                break
+
                 nodes[cid] = FunctionNode(
                     id=cid,
                     name=f.name,
@@ -275,6 +299,7 @@ def build_graph(
                     reads=reads,
                     asset_flows=flows,
                     call_events=call_events,
+                    returns_address_collection=returns_address_collection,
                 )
 
                 nodes[cid].cross_contract_edges = cross_contract_edges
