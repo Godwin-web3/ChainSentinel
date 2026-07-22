@@ -568,8 +568,26 @@ def _self_scoped_and_unsafe_writes(f, max_depth: int, _visited: set, known_msg_s
             key_origin, _ = _resolve_operand(defining_index.variable_right, f, known_msg_sender)
             if _is_msg_sender_origin(key_origin):
                 self_scoped.add(write_key)
-            else:
-                unsafe.add(write_key)
+                continue
+            # The innermost key isn't msg.sender, but for a NESTED
+            # mapping the OUTERMOST key might be — the real MakerDAO
+            # Vat.hope()/nope() shape: `can[msg.sender][usr] = 1`. The
+            # outer index (msg.sender) confines the ENTIRE write to the
+            # caller's own subtree of storage — no choice of the inner
+            # key (usr) can ever reach another caller's data — exactly
+            # the same guarantee ERC20's allowances[owner][spender]
+            # pattern relies on. Distinct from (and checked only after)
+            # the innermost-key case above, which is the renounceRole
+            # shape (`_roles[role].members[account]`, where the OUTER
+            # key is attacker-irrelevant `role` and only the INNER key
+            # `account` matters).
+            outer_key = _outermost_index_key(defining_index, f)
+            if outer_key is not None:
+                outer_origin, _ = _resolve_operand(outer_key, f, known_msg_sender)
+                if _is_msg_sender_origin(outer_origin):
+                    self_scoped.add(write_key)
+                    continue
+            unsafe.add(write_key)
 
     if max_depth > 0:
         for node in nodes:
@@ -582,6 +600,44 @@ def _self_scoped_and_unsafe_writes(f, max_depth: int, _visited: set, known_msg_s
                     self_scoped |= nested_scoped
                     unsafe |= nested_unsafe
     return self_scoped, unsafe
+
+
+def _outermost_index_key(index_ir, f, max_depth: int = 6):
+    """
+    Walk BACKWARD through an Index chain (via variable_left) from a
+    given Index op to find the OUTERMOST index — the one applied
+    directly to the root mapping state variable — and return its key
+    operand (variable_right), or None if unresolvable.
+
+    E.g. for `can[msg.sender][usr] = 1`, real IR:
+        Index REF_2 -> can[msg.sender]      (variable_left=can, variable_right=msg.sender)
+        Index REF_3 -> REF_2[usr]           (variable_left=REF_2, variable_right=usr)
+    starting from the INNER index (REF_3, key=usr), this walks back via
+    REF_3.variable_left (REF_2) to find REF_2's OWN defining Index —
+    confirmed its variable_left (can) IS the state variable root, so
+    REF_2's Index is outermost — and returns its key, msg.sender.
+
+    A Member hop (struct field access) anywhere in the chain bails
+    (returns None) rather than guessing — outer/inner scoping doesn't
+    have a well-defined meaning once a struct field is involved.
+    """
+    current = index_ir
+    seen: Set[int] = set()
+    for _ in range(max_depth):
+        base = getattr(current, "variable_left", None)
+        if base is None:
+            return None
+        resolved_base = _follow_reference(base)
+        if _is_state_variable(resolved_base):
+            return current.variable_right
+        if id(resolved_base) in seen:
+            return None
+        seen.add(id(resolved_base))
+        defining_op = _find_defining_op(base, f)
+        if not isinstance(defining_op, Index):
+            return None
+        current = defining_op
+    return None
 
 
 # Real ERC20/721/1155 transfer-shaped signatures, split by which

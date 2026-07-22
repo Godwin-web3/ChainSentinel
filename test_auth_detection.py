@@ -209,6 +209,50 @@ def test_self_scoped_write_suppressed_without_weakening():
           "setOperatorForSelf suppressed, corruptOperator still", dangerous_gap[0].verdict)
 
 
+def test_nested_mapping_outer_key_self_scoping():
+    """
+    Reproduces the real MakerDAO Vat.hope()/nope() false positive found
+    live this session: `can[msg.sender][usr] = 1` writes a NESTED
+    mapping where the OUTER key is msg.sender and the INNER key (usr)
+    is an arbitrary, caller-chosen parameter — the opposite shape from
+    AccessControl.renounceRole's `_roles[role].members[account]` (outer
+    key attacker-irrelevant, inner key must be msg.sender), which
+    find_self_scoped_writes already handled. Checking only the
+    innermost index missed this real, common delegation/approval
+    pattern (identical in shape to ERC20's allowances[owner][spender]).
+
+    corruptAllowance() proves this doesn't weaken detection: neither the
+    outer key (victim) nor the inner key (spender) is msg.sender — must
+    NOT be self-scoped, ACCESS_CONTROL_GAP must still fire.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("NestedMappingSelfScope.sol")
+
+    hope = nodes["NestedMappingSelfScope.hope(address)"]
+    assert ("can", ()) in hope.self_scoped_write_keys
+
+    dangerous = nodes["NestedMappingSelfScope.corruptAllowance(address,address,uint256)"]
+    assert dangerous.self_scoped_write_keys == set(), (
+        "corruptAllowance writes allowances[victim][spender] — neither key is msg.sender — "
+        "must NOT be marked self-scoped"
+    )
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible + report.suppressed
+
+    safe_gap = [r for r in all_results if r.path.entry == hope.id and "ACCESS_CONTROL_GAP" in r.constraint_type]
+    assert not safe_gap, f"hope() is self-scoped via its outer key — ACCESS_CONTROL_GAP should not fire, got {safe_gap}"
+
+    dangerous_gap = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == dangerous.id and "ACCESS_CONTROL_GAP" in r.constraint_type
+    ]
+    assert dangerous_gap, "corruptAllowance is a genuine access-control gap — must still fire"
+    print("test_nested_mapping_outer_key_self_scoping: PASS —",
+          "hope suppressed, corruptAllowance still", dangerous_gap[0].verdict)
+
+
 def test_self_scoped_asset_move_replaces_economic_interfaces_list():
     """
     Reproduces the real Liquity StabilityPool.withdrawFromSP() false
@@ -382,6 +426,7 @@ if __name__ == "__main__":
     test_reentrancy_cei_suppressed_by_custom_guard()
     test_delegated_reentrancy_guard_detected()
     test_self_scoped_write_suppressed_without_weakening()
+    test_nested_mapping_outer_key_self_scoping()
     test_self_scoped_asset_move_replaces_economic_interfaces_list()
     test_self_scoped_asset_move_suppression_reaches_intermediate_hops()
     test_self_scoped_liability_reduction_replaces_missing_precision()
