@@ -82,6 +82,15 @@ class CallEdge:
     # core/edges.py::_writers_are_governance_gated.
     governance_gated: bool = False
 
+    # True if this highlevel call's real, resolved argument types match a
+    # canonical ERC20/721/1155 transfer-shaped signature (see
+    # TOKEN_TRANSFER_SIGNATURES) — grounded in Slither's resolved types,
+    # never the calling function's own name. A custom 3-arg
+    # transfer(address,uint256,bytes) does NOT match; a real
+    # transfer(address,uint256) does, regardless of what the surrounding
+    # function is called.
+    is_token_transfer: bool = False
+
 
 # ── Layer 1: IR normalization ─────────────────────────────────────
 
@@ -248,10 +257,15 @@ def _is_caller_controlled(var) -> bool:
     """
     True if var derives from calldata or a caller-controlled source:
     msg.sender / msg.data / msg.sig, or a function parameter (calldata).
+
+    The composed-global check is isinstance-gated (SolidityVariableComposed)
+    before any string comparison — proves var IS one of Slither's known
+    global composed variables before checking WHICH one, rather than a
+    bare substring match on an arbitrary stringified expression.
     """
     try:
-        s = str(var).lower()
-        if "msg.sender" in s or "msg.data" in s or "msg.sig" in s:
+        from slither.core.declarations.solidity_variables import SolidityVariableComposed
+        if isinstance(var, SolidityVariableComposed) and str(var) in ("msg.sender", "msg.data", "msg.sig"):
             return True
         from slither.core.variables.local_variable import LocalVariable
         if isinstance(var, LocalVariable):
@@ -573,10 +587,17 @@ def _node_can_revert(node) -> bool:
     """True if the node is a validation point that can revert on failure."""
     try:
         from slither.core.cfg.node import NodeType
-        # require() / assert() SolidityCall
+        # require() / assert() SolidityCall — SolidityCall exposes its
+        # callee as ir.function (a SolidityFunction with .name), NOT
+        # ir.function_name (that attribute belongs to HighLevelCall /
+        # LowLevelCall / InternalCall / LibraryCall, not SolidityCall —
+        # getattr(..., "") silently swallowed the AttributeError here,
+        # making this branch a no-op for every require()/assert() call
+        # until fixed).
         for ir in node.irs:
             if isinstance(ir, SolidityCall):
-                fname = str(getattr(ir, "function_name", "") or "").lower()
+                callee = getattr(ir, "function", None)
+                fname = str(getattr(callee, "name", "") or "").lower()
                 if fname.startswith("require") or fname.startswith("assert"):
                     return True
         # if (cond) revert  —  IF node with a reverting successor
@@ -586,7 +607,8 @@ def _node_can_revert(node) -> bool:
                     return True
                 for sir in getattr(son, "irs", []) or []:
                     if isinstance(sir, SolidityCall):
-                        sname = str(getattr(sir, "function_name", "") or "").lower()
+                        callee = getattr(sir, "function", None)
+                        sname = str(getattr(callee, "name", "") or "").lower()
                         if sname.startswith("revert"):
                             return True
         return False
@@ -839,6 +861,57 @@ def _resolve_dst(ir, src_id: str, raw_type: str, f=None, auth_lookup: Optional[d
     return f"{src_id}.__unresolved__", None, None, False, False
 
 
+# ── Token-transfer detection (real resolved types, never a name guess) ──
+
+# Canonical ERC20/721/1155 transfer-shaped signatures, matched against
+# Slither's REAL resolved argument types — the callee's own
+# solidity_signature when statically resolvable, or reconstructed from
+# the call IR's own argument types otherwise. A custom, differently-typed
+# transfer(address,uint256,bytes) does not match; a same-named function
+# on an unrelated interface with these exact argument types does — this
+# is intentional, since the signature IS the ABI-level contract, real
+# data derived from resolved types, not a guess about the developer's
+# naming convention.
+TOKEN_TRANSFER_SIGNATURES = {
+    "transfer(address,uint256)",                                       # ERC20
+    "transferFrom(address,address,uint256)",                           # ERC20
+    "safeTransfer(address,uint256)",                                   # common ERC20 wrapper
+    "safeTransferFrom(address,address,uint256)",                       # ERC721 / SafeERC20-style
+    "safeTransferFrom(address,address,uint256,bytes)",                 # ERC721 with data
+    "safeTransferFrom(address,address,uint256,uint256,bytes)",         # ERC1155 single
+    "safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)",  # ERC1155 batch
+}
+
+
+def _is_token_transfer_call(ir) -> bool:
+    """
+    True if this HighLevelCall's real signature — the resolved callee's
+    own solidity_signature when statically known, or one reconstructed
+    from the call IR's own resolved argument types otherwise — matches a
+    canonical token-transfer-shaped signature.
+    """
+    try:
+        if not isinstance(ir, HighLevelCall):
+            return False
+        fn = getattr(ir, "function", None)
+        if fn is not None and hasattr(fn, "solidity_signature"):
+            if fn.solidity_signature in TOKEN_TRANSFER_SIGNATURES:
+                return True
+        fname = str(getattr(ir, "function_name", "") or "")
+        if not fname:
+            return False
+        from slither.utils.type import convert_type_for_solidity_signature_to_string
+        arg_types = []
+        for a in (getattr(ir, "arguments", None) or []):
+            t = getattr(a, "type", None)
+            if t is None:
+                return False
+            arg_types.append(convert_type_for_solidity_signature_to_string(t))
+        return f"{fname}({','.join(arg_types)})" in TOKEN_TRANSFER_SIGNATURES
+    except Exception:
+        return False
+
+
 # ── Public API ────────────────────────────────────────────────────
 
 def extract_edges(src_id: str, f, auth_lookup: Optional[dict] = None, slither=None, unresolved_deps=None) -> list[CallEdge]:
@@ -878,6 +951,7 @@ def extract_edges(src_id: str, f, auth_lookup: Optional[dict] = None, slither=No
                     destination=str(dest_str) if dest_str is not None else None,
                     trusted=trusted,
                     governance_gated=governance_gated,
+                    is_token_transfer=_is_token_transfer_call(ir) if raw_type == "highlevel" else False,
                     **props,
                 ))
 

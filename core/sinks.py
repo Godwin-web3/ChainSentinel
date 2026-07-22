@@ -36,65 +36,19 @@ SINK_SEVERITY = {
     CALLBACK_SINK:       6,
 }
 
-# ── Privileged storage variable names ────────────────────────────
-# Writes to these slots after an auth gap = storage corruption sink
-PRIVILEGED_SLOTS = {
-    # Ownership
-    "owner", "admin", "governance", "controller",
-    "pendingOwner", "pendingAdmin",
-    # Proxy / upgrade
-    "implementation", "_implementation", "logic",
-    "beacon", "_beacon",
-    # Oracle / price
-    "oracle", "priceOracle", "priceFeed",
-    "price", "spot", "twap",
-    # Pause / emergency
-    "paused", "pausing", "frozen", "emergency",
-    # Auth mappings
-    "wards", "roles", "whitelist", "blacklist",
-    "authorized", "operators",
-    # Fee / parameter
-    "fee", "feeRate", "protocolFee",
-    "interestRate", "liquidationThreshold",
-}
+# A state variable is "privileged" structurally, not by name — see
+# _privileged_vars_for_contract() below: it's EVER (anywhere in the
+# contract) a delegatecall target, or the real variable a genuine
+# msg.sender/tx.origin auth check compares against
+# (FunctionNode.structural_auth_var, core/auth_detection.py). A renamed
+# `owner` or a French-named `proprietaire` are caught identically,
+# because both get proven the same way — by how they're actually used,
+# not what they're called.
 
-# ERC20 / ETH transfer function names that constitute asset movement.
-# Matched via membership in ASSET_TRANSFER_FUNCTIONS OR prefix variants
-# (_safeTransfer, _transfer, _safeTransferFrom). Includes Maker-style
-# pull()/push() wrappers and the common `_pull`/`_push` internal helpers.
-ASSET_TRANSFER_FUNCTIONS = {
-    "transfer", "transferfrom",
-    "safetransfer", "safetransferfrom",
-    "send", "call",                    # ETH
-    "withdraw", "withdrawall",
-    "redeem", "redeemall",
-    "claim", "claimreward",
-    # Maker / Exactly-style wrappers
-    "pull", "push", "move", "suck", "wipe",
-    # Common internal helper names (Slither strips the leading underscore
-    # for some IR ops but not all; we lowercase so the membership check
-    # works either way)
-    "_transfer", "_transferfrom",
-    "_safetransfer", "_safetransferfrom",
-    "_withdraw", "_redeem", "_claim",
-}
-
-# Underscore-prefixed variants whose lowercased form may retain the `_`.
-# Used by the matching helper below so _safeTransfer / _transfer etc.
-# are caught without breaking exact matches above.
-ASSET_TRANSFER_PREFIXES = (
-    "_transfer", "_safetransfer", "_safetransferfrom",
-    "transferfrom", "safetransfer",
-)
-
-
-def _is_asset_transfer(fname: str) -> bool:
-    """Membership + underscore-prefix match for asset-transfer function names."""
-    if not fname:
-        return False
-    if fname in ASSET_TRANSFER_FUNCTIONS:
-        return True
-    return any(fname.startswith(p) for p in ASSET_TRANSFER_PREFIXES)
+# Real token transfers are detected structurally via
+# core/edges.py::CallEdge.is_token_transfer (matched against Slither's
+# resolved argument types, e.g. transfer(address,uint256)) — no name list.
+# ETH movement is covered separately by CallEdge.is_value_transfer.
 
 # Solidity built-ins that indicate selfdestruct
 SELFDESTRUCT_NAMES = {"selfdestruct", "suicide"}
@@ -130,20 +84,59 @@ def classify_sinks(nodes: dict, graph_edges: dict) -> dict:
         dict of canonical_id -> Sink (only nodes that are sinks)
     """
     sinks = {}
+    privileged_by_contract = _privileged_vars_by_contract(nodes, graph_edges)
 
     for node_id, node in nodes.items():
-        found = _classify_node(node_id, node, graph_edges.get(node_id, []))
+        priv_vars = privileged_by_contract.get(getattr(node, "contract", None), set())
+        found = _classify_node(node_id, node, graph_edges.get(node_id, []), priv_vars)
         if found:
             sinks[node_id] = found
 
     return sinks
 
 
-def _classify_node(node_id: str, node, edges: List[CallEdge]) -> Optional[Sink]:
+def _privileged_vars_by_contract(nodes: dict, graph_edges: dict) -> dict:
+    """
+    Structurally derive, per contract, the set of state variable names
+    that count as "privileged" for STORAGE_CORRUPTION — no name list.
+    A variable qualifies if it is EVER, anywhere in the contract:
+      (a) a delegatecall/codecall destination (proxy implementation
+          slot-shaped — the actual routing mechanism, not a name guess), or
+      (b) the real variable a genuine msg.sender/tx.origin auth check
+          compares against or looks up by (FunctionNode.structural_auth_var,
+          core/auth_detection.py — direct comparison or role-mapping
+          evidence) — i.e. a variable the contract itself already treats
+          as governing who's allowed to act, proven by usage.
+    """
+    by_contract: dict = {}
+    for cid, node in nodes.items():
+        contract = getattr(node, "contract", None)
+        if contract is None:
+            continue
+        bucket = by_contract.setdefault(contract, set())
+        auth_var = getattr(node, "structural_auth_var", None)
+        if auth_var:
+            bucket.add(str(auth_var).lower())
+        for edge in graph_edges.get(cid, []):
+            if edge.raw_type in ("delegatecall", "codecall") and edge.destination:
+                dest_str = str(edge.destination)
+                # Only a simple bare-variable reference is a real state
+                # variable name (e.g. `implementation`) — a compound
+                # expression (a call, a member access) isn't a name we
+                # can safely treat as one, so it's left alone rather
+                # than guessed at.
+                if dest_str.isidentifier():
+                    bucket.add(dest_str.lower())
+    return by_contract
+
+
+def _classify_node(node_id: str, node, edges: List[CallEdge], privileged_vars: Optional[Set[str]] = None) -> Optional[Sink]:
     """
     Classify a single node. Returns Sink if it qualifies, None otherwise.
     Priority: ASSET_DRAIN > DELEGATION_SINK > SELFDESTRUCT > STORAGE_CORRUPTION > CALLBACK_SINK
     """
+    if privileged_vars is None:
+        privileged_vars = set()
 
     # ── 0. Hard exclusions ───────────────────────────────────────
     # View/pure functions cannot drain assets or corrupt state
@@ -203,10 +196,9 @@ def _classify_node(node_id: str, node, edges: List[CallEdge]) -> Optional[Sink]:
 
     # From edge-level asset flows (TransferHelper.safeTransfer, etc.)
     for edge in edges:
-        fname = (str(edge.function_name) if edge.function_name else "").lower()
         if edge.is_value_transfer:
             asset_evidence.append(f"eth movement via {edge.raw_type} to {edge.dst}")
-        elif _is_asset_transfer(fname):
+        elif edge.is_token_transfer:
             asset_evidence.append(f"token transfer: {edge.function_name} -> {edge.dst}")
 
     # From node-level asset_flows (already extracted by graph.py)
@@ -215,8 +207,6 @@ def _classify_node(node_id: str, node, edges: List[CallEdge]) -> Optional[Sink]:
             asset_evidence.append(f"asset flow: {flow}")
 
     if asset_evidence:
-        if "InitializableImmutableAdminUpgradeabilityProxy.initialize" in node_id:
-            print(f"TEMP_DEBUG sink triggered on {node_id}: evidence={asset_evidence}")
         return Sink(
             node_id=node_id,
             category=ASSET_DRAIN,
@@ -226,11 +216,10 @@ def _classify_node(node_id: str, node, edges: List[CallEdge]) -> Optional[Sink]:
         )
 
     # ── 4. Privileged storage write ──────────────────────────────
-    if hasattr(node, "state_writes") and node.state_writes:
+    if hasattr(node, "state_writes") and node.state_writes and privileged_vars:
         from core.invariants import root_names, state_key_to_display
-        priv_slots_lower = {s.lower() for s in PRIVILEGED_SLOTS}
         priv_root_names = {v.lower() for v in root_names(node.state_writes)}
-        priv_hit = priv_root_names & priv_slots_lower
+        priv_hit = priv_root_names & privileged_vars
         if priv_hit:
             priv_writes = {
                 k for k in node.state_writes if k[0].lower() in priv_hit

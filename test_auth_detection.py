@@ -1,0 +1,102 @@
+"""
+Regression tests for core/auth_detection.py — structural auth and
+reentrancy-guard detection, replacing name/string-matching heuristics.
+
+Each fixture is deliberately named to NOT match the old name lists
+(AUTH_MODIFIER_PATTERNS, REENTRANCY_GUARDS/PREFIXES, PRIV_VARS) it
+replaces — proving the fix removes false NEGATIVES (custom-named real
+guards), not just the false POSITIVES found live this session
+(Ownable2Step.acceptOwnership() on a real Fraxlend run).
+"""
+import os
+
+from core.graph import build_graph
+from core.sinks import classify_sinks
+from core.paths import enumerate_paths
+from core.constraints import validate_paths
+
+FIXTURE_DIR = os.path.abspath("fixture/auth_detection")
+
+
+def _build(filename):
+    entry = os.path.join(FIXTURE_DIR, filename)
+    return build_graph(
+        project_root=FIXTURE_DIR,
+        entry_file=entry,
+        solc_version="0.8.19",
+        enrichment={},
+    )
+
+
+def test_custom_named_auth_modifier_detected():
+    nodes, *_ = _build("CustomAuthModifier.sol")
+    fn = nodes["CustomAuthModifier.acceptOwnership()"]
+    assert fn.auth_score >= 3, f"expected structural auth evidence, got {fn.auth_score}"
+    assert fn.auth_state == "AUTHENTICATED"
+    print("test_custom_named_auth_modifier_detected: PASS —", fn.auth_score, fn.auth_state)
+
+
+def test_access_control_role_mapping_detected():
+    nodes, *_ = _build("AccessControlRoles.sol")
+    fn = nodes["AccessControlRoles.setCriticalParam(uint256)"]
+    assert fn.auth_score >= 3, f"expected role-mapping evidence, got {fn.auth_score}"
+    assert fn.auth_state == "AUTHENTICATED"
+    print("test_access_control_role_mapping_detected: PASS —", fn.auth_score, fn.auth_state)
+
+
+def test_custom_named_reentrancy_guard_detected():
+    nodes, *_ = _build("CustomReentrancyGuard.sol")
+    guard_mod = nodes["CustomReentrancyGuard.xyzzy()"]
+    fake_mod = nodes["CustomReentrancyGuard.fakeGuard()"]
+    assert guard_mod.is_reentrancy_guard is True, "xyzzy() has the real guard shape — should be detected"
+    assert fake_mod.is_reentrancy_guard is False, "fakeGuard() is NOT a real guard — must not false-positive"
+    print("test_custom_named_reentrancy_guard_detected: PASS — xyzzy=True, fakeGuard=False")
+
+
+def test_reentrancy_cei_suppressed_by_custom_guard():
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("CustomReentrancyGuard.sol")
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    reentrancy_findings = [
+        r for r in (report.confirmed + report.likely + report.possible)
+        if r.constraint_type == "REENTRANCY_CEI" and r.path.entry == "CustomReentrancyGuard.withdraw()"
+    ]
+    assert not reentrancy_findings, (
+        f"withdraw() is protected by a custom-named real guard (xyzzy) — "
+        f"REENTRANCY_CEI should not fire, got {reentrancy_findings}"
+    )
+    print("test_reentrancy_cei_suppressed_by_custom_guard: PASS — 0 REENTRANCY_CEI findings on withdraw()")
+
+
+def test_ownable2step_accept_ownership_suppressed():
+    """
+    Reproduces the real false positive found live this session against
+    Fraxlend's FraxlendPair (inherits Ownable2Step): acceptOwnership()
+    was flagged ACCESS_CONTROL_GAP -> ASSET_DRAIN on _transferOwnership,
+    because its auth check (require(msg.sender == pendingOwner)) doesn't
+    match any AUTH_MODIFIER_PATTERNS-style name (it's an inline check,
+    not a modifier at all). Must now be suppressed.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("Ownable2Step.sol")
+    accept = nodes["Ownable2Step.acceptOwnership()"]
+    assert accept.auth_score >= 3, f"expected structural auth evidence, got {accept.auth_score}"
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    gap_findings = [
+        r for r in (report.confirmed + report.likely + report.possible)
+        if r.path.entry == "Ownable2Step.acceptOwnership()"
+    ]
+    assert not gap_findings, f"acceptOwnership() is auth-gated — expected suppression, got {gap_findings}"
+    print("test_ownable2step_accept_ownership_suppressed: PASS — 0 findings on acceptOwnership()")
+
+
+if __name__ == "__main__":
+    test_custom_named_auth_modifier_detected()
+    test_access_control_role_mapping_detected()
+    test_custom_named_reentrancy_guard_detected()
+    test_reentrancy_cei_suppressed_by_custom_guard()
+    test_ownable2step_accept_ownership_suppressed()
+    print("\nAll auth_detection tests passed.")

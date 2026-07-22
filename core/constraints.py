@@ -27,7 +27,6 @@ from core.paths import ExploitPath
 from core.sinks import (
     ASSET_DRAIN, STORAGE_CORRUPTION, DELEGATION_SINK,
     CALLBACK_SINK, SELFDESTRUCT_SINK,
-    PRIVILEGED_SLOTS
 )
 from core.edges import CallEdge
 
@@ -63,48 +62,10 @@ ECONOMIC_INTERFACES = {
     "supplycollateral", "withdrawcollateral", "flashloan",
 }
 
-# Known reentrancy guard patterns in function names / modifiers
-REENTRANCY_GUARDS = {
-    "nonreentrant", "lock", "noreentrancy",
-    "mutex", "reentrancyguard", "locked",
-    "_lock", "_mutex", "entrancyguard",
-    "noentry", "onlyonce",
-}
-
-REENTRANCY_GUARD_PREFIXES = (
-    "nonreentrant", "lock", "mutex", "guard", "noreentr",
-)
-
-def _has_reentrancy_guard(name: str) -> bool:
-    n = name.lower().replace("(", "").split("(")[0]
-    if n in REENTRANCY_GUARDS:
-        return True
-    return any(n.startswith(p) or n.endswith(p) for p in REENTRANCY_GUARD_PREFIXES)
-
-# Known health/solvency check function names
-HEALTH_CHECK_FUNCTIONS = {
-    "checkliquidity", "checkhealth", "checkaccounthealth",
-    "checksolvency", "requirehealthy", "healthfactor",
-    "isliquidatable", "getcollateralvalue", "getdebtvalue",
-    "checkaccountstatus", "verifyhealth",
-    "validateborrow", "validatewithdraw", "validatetransfer",
-    "validaterepay", "validateaction", "validateposition",
-    "requirevalid", "assertvalid", "beforewithdraw",
-    "accrue", "_accrue", "accrueinterest",
-}
-
-# Prefix/suffix patterns for health check detection
-# Covers protocols that use non-standard naming
-HEALTH_CHECK_PREFIXES = (
-    "validate", "_validate", "check", "_check",
-    "require", "assert", "verify", "before",
-)
-
-def _is_health_check(name: str) -> bool:
-    n = name.lower().replace("(", "").split("(")[0]
-    if n in HEALTH_CHECK_FUNCTIONS:
-        return True
-    return any(n.startswith(p) for p in HEALTH_CHECK_PREFIXES)
+# Reentrancy guards are detected structurally — see
+# core/auth_detection.py::is_reentrancy_guard, computed once per modifier
+# in core/graph.py and looked up via FunctionNode.is_reentrancy_guard /
+# modifier_ids. No name list needed.
 
 # Oracle/price read function patterns
 ORACLE_READ_PATTERNS = {
@@ -271,26 +232,29 @@ def _check_reentrancy_cei(path, nodes, graph_edges) -> ConstraintResult:
     if "STATE_BEFORE_CALL" not in flags or "EXTERNAL_CALL" not in flags:
         return _suppressed(path, "No CEI violation signal")
 
-    # Check for reentrancy guard on entry function
-    entry_modifiers = [
-        m.lower() for m in getattr(entry_node, 'modifiers', [])
-    ] if entry_node else []
+    # Check for a structurally-real reentrancy guard (core/auth_detection.py
+    # ::is_reentrancy_guard — a modifier that reads/checks a status
+    # variable, writes it before its own PLACEHOLDER node, and restores
+    # it after) on the entry function, looked up by modifier_ids, never
+    # by matching a modifier's name against a string.
+    def _guarded(node) -> bool:
+        if node is None:
+            return False
+        return any(
+            nodes[mid].is_reentrancy_guard
+            for mid in getattr(node, 'modifier_ids', [])
+            if mid in nodes
+        )
 
-    has_guard = any(_has_reentrancy_guard(m) for m in entry_modifiers)
+    has_guard = _guarded(entry_node)
 
     # Check if guard appears anywhere in call chain
     if not has_guard:
         for edge in path.edge_chain:
             callee = nodes.get(edge.dst)
-            if callee:
-                callee_mods = [m.lower() for m in getattr(callee, 'modifiers', [])]
-                if any(_has_reentrancy_guard(m) for m in callee_mods):
-                    has_guard = True
-                    break
-                callee_name = getattr(callee, 'name', '').lower()
-                if _has_reentrancy_guard(callee_name):
-                    has_guard = True
-                    break
+            if _guarded(callee):
+                has_guard = True
+                break
 
     if has_guard:
         return _suppressed(path, "Reentrancy guard detected on call chain")
@@ -324,7 +288,15 @@ def _check_reentrancy_cei(path, nodes, graph_edges) -> ConstraintResult:
 def _auth_check_in_subgraph(node_id: str, nodes: dict, graph_edges: dict, depth: int = 3, _visited: set = None) -> bool:
     """
     Recursively walk the call graph from node_id up to `depth` hops.
-    Returns True if any callee has auth signals: modifiers, msg.sender checks, role checks.
+    Returns True if any callee has real structural auth evidence.
+
+    callee.auth_score is the EFFECTIVE score computed in
+    core/graph.py's second pass — it already folds in the callee's own
+    body evidence (a real msg.sender/tx.origin comparison or role-mapping
+    lookup, core/auth_detection.py) AND its attached modifiers' own
+    evidence, by canonical_id lookup, never by matching a modifier's or
+    function's name against a string. A single threshold check here
+    covers both cases without re-deriving them.
     """
     if _visited is None:
         _visited = set()
@@ -334,18 +306,8 @@ def _auth_check_in_subgraph(node_id: str, nodes: dict, graph_edges: dict, depth:
 
     for edge in graph_edges.get(node_id, []):
         callee = nodes.get(edge.dst)
-        if callee:
-            # Check modifiers on callee
-            mods = [m.lower() for m in getattr(callee, 'modifiers', [])]
-            if any(m for m in mods if not _has_reentrancy_guard(m) and m not in ("payable",)):
-                return True
-            # Check auth score from enricher
-            if getattr(callee, 'auth_score', 0) >= 2:
-                return True
-            # Check name — validate*, onlyX, _checkX patterns
-            name = getattr(callee, 'name', '').lower()
-            if any(name.startswith(p) for p in ("validate", "_validate", "only", "_only", "_check", "_require")):
-                return True
+        if callee and getattr(callee, 'auth_score', 0) >= 2:
+            return True
         if _auth_check_in_subgraph(edge.dst, nodes, graph_edges, depth - 1, _visited):
             return True
     return False
@@ -354,28 +316,23 @@ def _auth_check_in_subgraph(node_id: str, nodes: dict, graph_edges: dict, depth:
 
 def _entry_has_direct_auth(node_id: str, nodes: dict) -> bool:
     """
-    Check whether the entry function ITSELF carries an auth signal -
-    modifier, auth_score, or validating name pattern - without walking
-    the call subgraph.
+    Check whether the entry function ITSELF carries real structural auth
+    evidence, without walking the call subgraph.
 
     _auth_check_in_subgraph only inspects callees reached FROM node_id;
-    it never looks at node_id's own modifiers/auth_score. This misses:
+    it never looks at node_id's own evidence. This misses:
       - inline checks, e.g. if (keepers[account] != msg.sender) revert ...
-      - modifiers applied directly to the entry function (e.g. claimSender)
-    Both are real auth enforcement that the callee-only walk can't see.
+      - modifiers applied directly to the entry function
+    Both are real auth enforcement the callee-only walk can't see.
+    entry_node.auth_score already folds in both (see core/graph.py's
+    second pass and core/auth_detection.py) — a custom-named modifier
+    enforcing require(msg.sender == pendingOwner) scores identically to
+    one named onlyOwner.
     """
     entry_node = nodes.get(node_id)
     if not entry_node:
         return False
-    mods = [m.lower() for m in getattr(entry_node, 'modifiers', [])]
-    if any(m for m in mods if not _has_reentrancy_guard(m) and m not in ("payable",)):
-        return True
-    if getattr(entry_node, 'auth_score', 0) >= 2:
-        return True
-    name = getattr(entry_node, 'name', '').lower()
-    if any(name.startswith(p) for p in ("validate", "_validate", "only", "_only", "_check", "_require")):
-        return True
-    return False
+    return getattr(entry_node, 'auth_score', 0) >= 2
 
 
 def _check_access_control_gap(path, nodes, graph_edges) -> ConstraintResult:
@@ -445,24 +402,6 @@ def _check_access_control_gap(path, nodes, graph_edges) -> ConstraintResult:
 
 # ── Constraint 3: Missing health check ───────────────────────────
 
-
-def _health_check_in_subgraph(node_id: str, graph_edges: dict, depth: int = 3, _visited: set = None) -> bool:
-    """
-    Recursively walk the call graph from node_id up to `depth` hops.
-    Returns True if any callee name matches a health check pattern.
-    """
-    if _visited is None:
-        _visited = set()
-    if depth == 0 or node_id in _visited:
-        return False
-    _visited.add(node_id)
-    for edge in graph_edges.get(node_id, []):
-        name = (edge.function_name or "").lower()
-        if _is_health_check(name):
-            return True
-        if _health_check_in_subgraph(edge.dst, graph_edges, depth - 1, _visited):
-            return True
-    return False
 
 def _node_touches_sink_state(node, sink) -> bool:
     """

@@ -35,25 +35,10 @@ def _save_printer_cache(key: str, printer: str, text: str):
     with open(path, "w") as f:
         f.write(text)
 
-AUTH_MODIFIER_PATTERNS = [
-    "onlyOwner", "onlyAdmin", "onlyRole", "onlyGov", "onlyGuardian", "auth",
-    "onlyFactoryOwner", "onlyFactory", "onlyPool", "onlyVault", "onlyMinter",
-    "onlyOperator", "onlyMinter", "onlyBurner", "onlyVault", "onlyKeeper",
-    "onlyExecutor", "onlyTimelock", "onlyDAO", "onlyWhitelisted",
-    "nonReentrant", "whenNotPaused", "whenPaused",
-]
-
-AUTH_REQUIRE_RE = re.compile(
-    r'require\s*\(\s*msg\.sender|msg\.sender\s*==|hasRole|isOwner|_onlyOwner|_checkRole',
-    re.I
-)
-
-ASSET_TRANSFER_RE = re.compile(
-    r'transfer\(|transferFrom\(|safeTransfer\(|safeTransferFrom\(|call\{value|send\(',
-    re.I
-)
-
-STATE_WRITE_RE = re.compile(r'\w+\s*=\s*(?!.*==)', re.I)
+# Auth scoring is structural (core/auth_detection.py, real Binary
+# comparison ops and role-mapping lookups on live Slither IR), not name
+# matching — see score_auth()'s docstring below for what this module's
+# own (informational-only) auth_score still comes from.
 
 # ─── Parser: function-summary printer output ──────────────────────────────────
 def parse_function_summary(text: str) -> dict:
@@ -148,85 +133,34 @@ def parse_vars_and_auth(text: str) -> dict:
 # ─── Auth scorer ──────────────────────────────────────────────────────────────
 def score_auth(func: dict, auth: dict) -> dict:
     """
-    Build auth_evidence list and auth_score for a function.
-    Score: 0=none, 1=weak, 2=medium, 3=strong
+    Build auth_evidence list and auth_score for a function, from
+    Slither's own vars-and-auth printer output ONLY — no modifier-name
+    matching, no variable-name allowlist, no regex over call/error-message
+    text. Score: 0=none, 3=strong (binary in practice: a real condition
+    exists or it doesn't).
+
+    NOTE: this is informational only (surfaced in the JSON report's
+    "enrichment" section) — it is NOT consumed by the detection pipeline.
+    Real auth detection for findings is core/auth_detection.py's
+    compute_own_auth(), which runs on live Slither IR (Binary comparison
+    ops, role/mapping lookups, recursive modifier/internal-call walking)
+    where analysis/enricher.py's subprocess+text-parsing architecture has
+    no equivalent access. See core/graph.py's FunctionNode.auth_score for
+    the value that actually drives findings.
     """
     evidence = []
     score = 0
 
-    # Strong: explicit auth modifiers
-    for mod in func.get("modifiers", []):
-        for pattern in AUTH_MODIFIER_PATTERNS:
-            if pattern.lower() in mod.lower():
-                if mod.lower() in ("nonreentrant", "whennotpaused", "whenpaused"):
-                    evidence.append({"type": "guard_modifier", "value": mod, "strength": 2})
-                    score = max(score, 2)
-                else:
-                    evidence.append({"type": "auth_modifier", "value": mod, "strength": 3})
-                    score = max(score, 3)
-                break
-
-    # Strong: msg.sender conditions from vars-and-auth
+    # msg.sender conditions from Slither's own vars-and-auth printer: a
+    # real if/require/assert node, reading msg.sender, that the printer
+    # already proved exists — the variable name on the other side is
+    # whatever Slither found, never filtered by a name list.
     for cond in auth.get("msg_sender_conditions", []):
         if cond:
             evidence.append({"type": "msg_sender_check", "value": cond, "strength": 3})
             score = max(score, 3)
 
-    # Medium: internal calls that look like auth gates
-    internal = func.get("internal_calls", "")
-    if re.search(r'onlyOwner|onlyAdmin|_checkRole|_onlyOwner|require.*owner', internal, re.I):
-        evidence.append({"type": "internal_auth_call", "value": "internal auth gate detected", "strength": 2})
-        score = max(score, 2)
-
-    # Strong: require with auth-indicating error string (catches TMP-collapsed comparisons)
-    if re.search(r'require.*only.*(admin|owner|gov|guardian|operator)', internal, re.I):
-        evidence.append({"type": "require_auth_string", "value": "require with auth error message", "strength": 3})
-        score = max(score, 3)
-
-    # Auth signal: layered heuristics
-    reads = func.get("reads", [])
-    internal = func.get("internal_calls", "")
-    PRIV_VARS = {"admin", "owner", "guardian", "operator", "governance",
-                 "pendingadmin", "pauseguardian", "timelock", "dao", "wards"}
-    priv_reads = [r for r in reads if r.lower().split('.')[-1] in PRIV_VARS]
-    has_sender = "msg.sender" in reads
-    has_fail_path = bool(re.search(
-        r'\bfail\(', internal, re.I
-    ))
-
-    if has_sender and priv_reads:
-        # Strong: explicit msg.sender + privileged var co-read
-        evidence.append({"type": "inline_sender_check",
-                         "value": f"reads msg.sender + {priv_reads}", "strength": 3})
-        score = max(score, 3)
-    elif priv_reads and has_fail_path:
-        # Medium: privileged var read + failure/revert path (Compound early-return style)
-        evidence.append({"type": "priv_var_fail_path",
-                         "value": f"reads {priv_reads} + failure path in internal calls",
-                         "strength": 3})
-        score = max(score, 3)
-    elif priv_reads:
-        # Weak: privileged var read only (may be for config, not auth)
-        evidence.append({"type": "priv_var_read",
-                         "value": f"reads privileged var {priv_reads}", "strength": 0})
-    elif has_sender and score == 0:
-        # Neutral: msg.sender read only — not auth evidence alone
-        evidence.append({"type": "sender_read",
-                         "value": "msg.sender read present", "strength": 0})
-        # score unchanged
-
-    NOISE = {"sender_read", "priv_var_read"}
-    filtered = [e for e in evidence if e["type"] not in NOISE]
-    has_auth_gate = score >= 3
-    has_partial_signal = score >= 2
-    conflict = len(filtered) > 1 and has_partial_signal and not has_auth_gate
-
-    if has_auth_gate:
-        auth_state = "AUTHENTICATED"
-    elif conflict:
-        auth_state = "UNKNOWN"
-    else:
-        auth_state = "UNAUTHENTICATED"
+    auth_state = "AUTHENTICATED" if score >= 3 else "UNAUTHENTICATED"
 
     return {
         "auth_evidence": evidence,
@@ -278,51 +212,6 @@ def detect_dangerous_ordering(func: dict) -> bool:
     return bool(real_ext) and has_write
 
 # ─── Main enricher ────────────────────────────────────────────────────────────
-
-def extract_source_auth(project_root: str, func_name: str) -> list:
-    """
-    Scan source files for require(msg.sender == X) patterns.
-    Fallback for when vars-and-auth printer loses comparisons to TMP variables.
-    Returns list of condition strings like ["msg.sender == owner"].
-    """
-    import glob
-    bare_name = func_name.split("(")[0].strip()
-    patterns = [
-        re.compile(r'require\s*\(\s*msg\.sender\s*==\s*(\w+)', re.I),
-        re.compile(r'require\s*\(\s*(\w+)\s*==\s*msg\.sender', re.I),
-    ]
-    conditions = []
-    in_func = False
-    brace_depth = 0
-
-    sol_files = glob.glob(os.path.join(project_root, "**", "*.sol"), recursive=True)
-    for filepath in sol_files:
-        try:
-            with open(filepath, "r", errors="ignore") as f:
-                lines = f.readlines()
-        except Exception:
-            continue
-
-        for i, line in enumerate(lines):
-            # Detect function start
-            if re.search(rf'\bfunction\s+{re.escape(bare_name)}\b', line):
-                in_func = True
-                brace_depth = 0
-
-            if in_func:
-                brace_depth += line.count("{") - line.count("}")
-                for pat in patterns:
-                    m = pat.search(line)
-                    if m:
-                        var = m.group(1)
-                        cond = f"msg.sender == {var}"
-                        if cond not in conditions:
-                            conditions.append(cond)
-                if brace_depth <= 0 and "{" in "".join(lines[max(0,i-5):i+1]):
-                    in_func = False
-
-    return conditions
-
 
 def _detect_framework(project_root):
     if os.path.exists(os.path.join(project_root, "foundry.toml")):
@@ -421,27 +310,18 @@ def run_enricher(resolved: dict, project_root: str, entry_file: str, solc_versio
         auth_data = {}
 
     # Merge into feature table
+    #
+    # NOTE: this module's printer sometimes loses a msg.sender comparison
+    # to an unstringifiable TMP variable (a real Slither limitation) —
+    # there used to be a raw-source-text regex fallback here for that
+    # case. It's gone: core/auth_detection.py's compute_own_auth() runs
+    # directly on live Slither IR in core/graph.py's session and does its
+    # own backward-slicing (no stringification involved), so it's immune
+    # to the TMP-collapse case in the first place and is what actually
+    # drives auth-related findings — see score_auth()'s docstring.
     features = {}
     for key, func in func_data.items():
         auth = auth_data.get(key, {})
-
-        # Source fallback: recover lost msg.sender comparisons
-        # Only triggers when printer saw msg.sender but lost the comparison to TMP
-        if (not auth.get("msg_sender_conditions") and
-                "msg.sender" in func.get("reads", [])):
-            recovered = extract_source_auth(project_root, func.get("name", ""))
-            if recovered:
-                # Filter: only accept if variable is a known priv var
-                PRIV_VARS = {"admin", "owner", "guardian", "operator",
-                             "governance", "pendingadmin", "pauseguardian",
-                             "timelock", "dao"}
-                filtered = [c for c in recovered
-                            if c.split("== ")[-1].lower() in PRIV_VARS]
-                if filtered:
-                    auth = dict(auth)
-                    auth["msg_sender_conditions"] = filtered
-                    auth["source_auth_fallback"] = True
-
         auth_result = score_auth(func, auth)
         asset_flows = detect_asset_flow(func)
         dangerous_order = detect_dangerous_ordering(func)

@@ -27,7 +27,7 @@ from typing import List, Set, Optional
 from core.edges import CallEdge
 from core.sinks import (
     Sink, ASSET_DRAIN, STORAGE_CORRUPTION, DELEGATION_SINK,
-    CALLBACK_SINK, SELFDESTRUCT_SINK, _is_asset_transfer,
+    CALLBACK_SINK, SELFDESTRUCT_SINK,
 )
 
 # ── Constants ─────────────────────────────────────────────────────
@@ -215,9 +215,7 @@ def _dfs(
         dst = edge.dst
         if dst.startswith("external.") or dst.startswith("lowlevel.") or dst.startswith("eth."):
             # Terminal external call — check if it's a sink pattern
-            if edge.is_value_transfer or _is_asset_transfer(
-                (edge.function_name or "").lower()
-            ):
+            if edge.is_value_transfer or edge.is_token_transfer:
                 # Synthesize a terminal asset drain path
                 # Inherit state_writes from the calling node so the
                 # structural health-check overlap test in constraints.py

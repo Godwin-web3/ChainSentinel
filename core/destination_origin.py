@@ -51,6 +51,26 @@ def resolve_destination_variable(call_ir, function):
     return var
 
 
+def resolve_variable_origin(var, function) -> Tuple[DestinationOrigin, object]:
+    """
+    Same resolution engine as resolve_destination(), but for any variable
+    (e.g. one side of a Binary comparison, an Index key) rather than a
+    call's destination specifically. Public entry point for callers that
+    already have a resolved variable in hand instead of a call IR.
+    """
+    return _resolve_variable(var, function, seen=set())
+
+
+def is_msg_sender_like(var) -> bool:
+    """
+    True if var IS (not merely resembles) msg.sender or tx.origin —
+    isinstance-gated on Slither's own SolidityVariableComposed type
+    first, so this can never match an arbitrary expression that happens
+    to stringify with "msg.sender" as a substring.
+    """
+    return isinstance(var, SolidityVariableComposed) and str(var) in ("msg.sender", "tx.origin")
+
+
 def resolve_destination(call_ir, function) -> Tuple[DestinationOrigin, object]:
     """
     Entry point. Returns (origin, resolved_variable_or_None).

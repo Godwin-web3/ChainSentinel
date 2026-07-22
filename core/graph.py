@@ -13,7 +13,9 @@ from dataclasses import dataclass, field
 from typing import List, Set, Dict, Optional
 
 from slither.slither import Slither
+from slither.core.declarations import Modifier
 from core.invariants import extract_field_precise_writes, extract_field_precise_reads, get_call_events, extract_invariants
+from core.auth_detection import compute_own_auth, is_reentrancy_guard
 from slither.slithir.operations import (
     InternalCall, HighLevelCall, LowLevelCall, SolidityCall, LibraryCall
 )
@@ -51,9 +53,19 @@ class FunctionNode:
     is_artifact: bool
     is_view: bool
 
-    # Auth (from enricher)
+    # Auth — structurally computed (core/auth_detection.py), zero name
+    # matching. auth_state/auth_score are the EFFECTIVE values (own body
+    # OR any attached modifier's own body); structural_auth_score/
+    # structural_auth_var are this function/modifier's OWN evidence only,
+    # before folding in its modifiers (needed because a function's
+    # modifiers may not have been visited yet when the function itself
+    # is constructed — see the second pass in build_graph).
     auth_state: str
     modifiers: List[str]
+    modifier_ids: List[str] = field(default_factory=list)
+    structural_auth_score: int = 0
+    structural_auth_var: Optional[str] = None
+    is_reentrancy_guard: bool = False
 
     # Layer 4 — graph edges (canonical IDs)
     internal_callees: List[str] = field(default_factory=list)
@@ -256,7 +268,11 @@ def build_graph(
         log.warning(f"Graph: Slither API failed: {e}")
         return {}, {}, {}, {}, {}, []
 
-    features = enrichment.get("features", {}) if enrichment else {}
+    # NOTE: `enrichment` is accepted for API compatibility with existing
+    # callers (main.py, core/protocol_graph.py) but is no longer consumed
+    # here — auth_state/auth_score are now computed structurally (see
+    # core/auth_detection.py) rather than from analysis/enricher.py's
+    # name-matching-based score_auth() output.
     nodes: Dict[str, FunctionNode] = {}
     all_invariants = []
     fn_by_cid = {}
@@ -275,7 +291,12 @@ def build_graph(
 
                 # Layer 3 — semantic tags from Slither IR
                 is_constructor = f.is_constructor
-                is_modifier = f.is_modifier if hasattr(f, 'is_modifier') else False
+                # Modifier objects carry no `is_modifier` attribute at all
+                # (confirmed against installed Slither) — hasattr(...)
+                # silently defaulted this to False for EVERY modifier
+                # since this field was introduced. isinstance is the real
+                # structural check.
+                is_modifier = isinstance(f, Modifier)
                 is_library = contract.is_library
                 is_artifact = "slitherConstructor" in f.full_name
                 is_view = f.view or f.pure
@@ -308,23 +329,32 @@ def build_graph(
                     log.debug(f"Cross-contract resolution failed for {cid}: {e}")
                     cross_contract_edges = []
 
-                # Layer 3 — auth from enricher
-                possible_keys = [
-                    f"vars.{f.full_name}",
-                    f"{f.contract_declarer.name}.{f.full_name}",
-                    f"vars.{f.name}",
-                ]
-                enricher_data = {}
-                for ek in possible_keys:
-                    if ek in features:
-                        enricher_data = features[ek]
-                        break
                 reads = extract_field_precise_reads(f)
                 call_events = get_call_events(f)
                 fn_invariants = extract_invariants(f, contract.name, cid)
                 all_invariants.extend(fn_invariants)
-                auth_state = enricher_data.get("auth_state", "UNKNOWN")
-                auth_score = enricher_data.get("auth_score", 0)
+
+                # Layer 3 — structural auth (core/auth_detection.py): real
+                # msg.sender/tx.origin comparisons or role-mapping lookups
+                # in this function/modifier's own body (or internal calls
+                # it makes) — zero name matching, a custom-named modifier
+                # is scored identically to one named onlyOwner. This is
+                # OWN-body evidence only; a function's attached modifiers
+                # may not have their own FunctionNode yet (modifiers for
+                # this contract are processed after its functions in
+                # all_fns), so the EFFECTIVE auth_state/auth_score that
+                # folds in modifier evidence is computed in a second pass
+                # below, once every node in this contract exists.
+                own_auth = compute_own_auth(f)
+                structural_auth_score = own_auth.score
+                structural_auth_var = own_auth.matched_state_var
+                modifier_ids = [canonical_id(contract.name, m.full_name) for m in f.modifiers]
+                guard = is_reentrancy_guard(f) if is_modifier else False
+                auth_state = (
+                    "AUTHENTICATED" if structural_auth_score >= 3 else
+                    "UNKNOWN" if structural_auth_score == 2 else
+                    "UNAUTHENTICATED"
+                )
 
                 # Structural check (real Slither return-type IR, never a
                 # name guess): does this function return an array whose
@@ -360,6 +390,10 @@ def build_graph(
                     is_view=is_view,
                     auth_state=auth_state,
                     modifiers=[m.name for m in f.modifiers],
+                    modifier_ids=modifier_ids,
+                    structural_auth_score=structural_auth_score,
+                    structural_auth_var=structural_auth_var,
+                    is_reentrancy_guard=guard,
                     internal_callees=int_callees,
                     external_callees=ext_callees,
                     state_writes=state_writes,
@@ -371,11 +405,28 @@ def build_graph(
                 )
 
                 nodes[cid].cross_contract_edges = cross_contract_edges
-                nodes[cid].auth_score = auth_score
+                nodes[cid].auth_score = structural_auth_score
 
             except Exception as e:
                 log.debug(f"Graph: skipping {f.name} in {contract.name}: {e}")
                 continue
+
+    # Layer 3b — effective auth score: fold each function's attached
+    # modifiers' OWN structural auth evidence into the function's
+    # effective auth_state/auth_score, via modifier_ids -> real
+    # FunctionNode lookup (never a name match). Must run after every
+    # node in every contract exists, since a function's modifiers are
+    # processed after it within the same contract's all_fns list.
+    for cid, node in nodes.items():
+        modifier_scores = [
+            nodes[mid].structural_auth_score for mid in node.modifier_ids if mid in nodes
+        ]
+        node.auth_score = max(node.structural_auth_score, max(modifier_scores, default=0))
+        node.auth_state = (
+            "AUTHENTICATED" if node.auth_score >= 3 else
+            "UNKNOWN" if node.auth_score == 2 else
+            "UNAUTHENTICATED"
+        )
 
     # Layer 4 — build caller edges (reverse of callees)
     for cid, node in nodes.items():
