@@ -25,6 +25,18 @@ def score_market_risk(market: MarketConfig, oracle_liquidity_usd: Optional[float
             "reason": f"{market.market_id} uses a spot price oracle with no TWAP",
         })
 
+    if market.oracle_type == "unguarded_mutable":
+        findings.append({
+            "severity": "CRITICAL",
+            "type": "UNGUARDED_ORACLE",
+            "reason": (
+                f"{market.market_id} oracle can write to its own price storage "
+                f"through a function with no caller-identity check (no CALLER/ORIGIN "
+                f"opcode anywhere in its bytecode) — price is effectively settable "
+                f"by anyone, no capital or flash loan required"
+            ),
+        })
+
     if oracle_liquidity_usd is not None and oracle_liquidity_usd < 500_000:
         findings.append({
             "severity": "HIGH",
