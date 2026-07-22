@@ -225,6 +225,10 @@ def analyze(address, chain_name, output_json=False):
                         # so the multi-version fallback knows which dependency file
                         # belongs to which unresolved variable.
                         dependency_map = {}
+                        # var_name -> minimal resolved dict (address, chain_id), so the
+                        # multi-version fallback can run REAL per-dependency enrichment
+                        # instead of enrichment={} — see the fallback loop below.
+                        dependency_resolved_info = {}
                         dependency_resolution_log = []
                         retry_count = 0
                         compile_entry = e_file
@@ -286,6 +290,9 @@ def analyze(address, chain_name, output_json=False):
                                         log.info(f"Auto-fetched dependency for {var_name}{via} -> {merge_result.address}")
                                         dependency_entry_files.append(merge_result.entry_file)
                                         dependency_map[var_name] = merge_result.entry_file
+                                        dependency_resolved_info[var_name] = {
+                                            "address": merge_result.address, "chain_id": chain.chain_id,
+                                        }
                                         any_merged = True
                                         dependency_resolution_log.append({
                                             "variable_name": var_name,
@@ -349,8 +356,24 @@ def analyze(address, chain_name, output_json=False):
                             merged = base_build
                             for var_name, dep_entry in dependency_map.items():
                                 dep_version = extract_pragma_version(dep_entry) or s_ver
+                                # Real enrichment for THIS dependency's own compilation —
+                                # see core/protocol_graph.py's identical fix for why
+                                # enrichment={} makes CallEdge.trusted meaningless for
+                                # every edge originating in a separately-compiled
+                                # dependency (auth_lookup empty -> _resolve_trust always
+                                # returns False, collapsing "protocol-fixed target" and
+                                # "genuinely attacker-arbitrary target" into one bucket).
                                 try:
-                                    dep_result = build_graph(p_root, dep_entry, dep_version, {}, remaps)
+                                    from analysis.enricher import run_enricher
+                                    dep_resolved_info = dependency_resolved_info.get(
+                                        var_name, {"address": dep_entry, "chain_id": chain.chain_id}
+                                    )
+                                    dep_enrichment = run_enricher(dep_resolved_info, p_root, dep_entry, dep_version)
+                                except Exception as ee:
+                                    log.warn(f"Enrichment failed for dependency of {var_name}: {ee}")
+                                    dep_enrichment = {}
+                                try:
+                                    dep_result = build_graph(p_root, dep_entry, dep_version, dep_enrichment, remaps)
                                 except Exception as de:
                                     log.warn(f"Separate compile failed for dependency of {var_name} at {dep_version}: {de}")
                                     dependency_resolution_log.append({

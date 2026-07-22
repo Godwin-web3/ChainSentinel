@@ -72,6 +72,16 @@ class CallEdge:
     #          controlled variable, or source is unresolvable (conservative).
     trusted: bool = False
 
+    # Stricter than `trusted`: True only when there is a REAL, ongoing,
+    # non-constructor auth-gated setter for the destination — evidence of
+    # an actively protocol-governed contract (e.g. Comptroller, changeable
+    # via the admin-only _setComptroller()), as opposed to a merely
+    # immutable/constructor-fixed destination (e.g. a market's underlying
+    # ERC20 token) which `trusted` also marks True but which is still the
+    # classic reentrancy vector real hacks exploit. See
+    # core/edges.py::_writers_are_governance_gated.
+    governance_gated: bool = False
+
 
 # ── Layer 1: IR normalization ─────────────────────────────────────
 
@@ -380,6 +390,48 @@ def _writers_are_trusted(state_var, contract, auth_lookup: Optional[dict]) -> bo
     return True
 
 
+def _writers_are_governance_gated(state_var, contract, auth_lookup: Optional[dict]) -> bool:
+    """
+    Stricter than _writers_are_trusted: True only if state_var has at
+    least one REAL, non-constructor writer, and every such writer is
+    auth-scored (auth_score >= AUTH_TRUST_THRESHOLD).
+
+    _writers_are_trusted intentionally treats "no writers" (immutable/
+    constant) and "constructor-only" as trusted — appropriate for its
+    purpose (core/sinks.py: is this destination redirectable BY THE
+    CALLER at call time?). But that same broad definition also marks an
+    immutable `underlying` ERC20 token — set once at market deployment,
+    never re-governed — as "trusted", which is wrong for a narrower
+    question core/cross_market.py needs answered: is this destination a
+    protocol-governed hub/registry contract (e.g. Compound's own
+    Comptroller, changeable only via the admin-gated _setComptroller),
+    as opposed to an arbitrary external asset contract that merely
+    happens to be fixed post-deployment (the classic ERC777/malicious-
+    token reentrancy vector — fixed at deploy time, still hands control
+    to an attacker). A real, ongoing, auth-gated SETTER is the evidence
+    that distinguishes the two; mere immutability is not.
+    """
+    writers = _state_var_writers(state_var, contract)
+    non_constructor = []
+    for w in writers:
+        try:
+            if w.is_constructor:
+                continue
+        except Exception:
+            pass
+        non_constructor.append(w)
+    if not non_constructor:
+        return False
+    for w in non_constructor:
+        wcid = _func_canonical_id(w)
+        if wcid is None:
+            return False
+        auth_score = auth_lookup.get(wcid, 0) if auth_lookup else 0
+        if auth_score < AUTH_TRUST_THRESHOLD:
+            return False
+    return True
+
+
 # ── Layer 2.5b: Registry-validated struct parameters ──────────────
 #
 # A calldata struct parameter may source an external-call destination
@@ -593,29 +645,44 @@ def _registry_validates_struct(f, struct_param, call_node=None) -> bool:
         return False
 
 
-def _resolve_trust(ir, raw_type: str, f, auth_lookup: Optional[dict], node=None) -> bool:
+def _resolve_trust(ir, raw_type: str, f, auth_lookup: Optional[dict], node=None) -> tuple:
     """
     Decide trust for a call edge destination. Only highlevel calls are
     considered (lowlevel / delegatecall destinations are always untrusted).
 
-    Trusted   -> destination is a storage variable written only by
-                 auth-scored functions or the constructor; OR a field of
-                 a calldata struct parameter validated by a registry
-                 check (storage mapping read keyed by an id/hash derived
-                 from the same struct) earlier in the function.
-    Untrusted -> destination derives from calldata / msg.sender /
-                 a caller-controlled variable.
-    Default   -> untrusted (conservative).
+    Returns (trusted, governance_gated):
+      trusted            -> destination is a storage variable written only
+                             by auth-scored functions or the constructor
+                             (including immutable/no-writer destinations);
+                             OR a field of a calldata struct parameter
+                             validated by a registry check (storage
+                             mapping read keyed by an id/hash derived from
+                             the same struct) earlier in the function.
+                             Untrusted -> destination derives from
+                             calldata / msg.sender / a caller-controlled
+                             variable, or is otherwise unresolvable.
+      governance_gated    -> stricter: True only when there is a REAL,
+                             ongoing, non-constructor auth-gated setter
+                             for the destination (see
+                             _writers_are_governance_gated) — evidence of
+                             an actively protocol-governed contract (e.g.
+                             Comptroller via _setComptroller), as opposed
+                             to a merely immutable/constructor-fixed one
+                             (e.g. a market's underlying ERC20 token,
+                             which is "trusted" in the caller-redirect
+                             sense but is still the classic reentrancy
+                             vector real hacks exploit).
+    Default -> (False, False), conservative.
     """
     if raw_type != "highlevel":
-        return False
+        return False, False
     if not auth_lookup:
-        return False
+        return False, False
 
     try:
         dest = ir.destination
     except Exception:
-        return False
+        return False, False
 
     contract = getattr(f, "contract_declarer", None)
 
@@ -624,14 +691,17 @@ def _resolve_trust(ir, raw_type: str, f, auth_lookup: Optional[dict], node=None)
 
     # Direct storage variable destination
     if _is_state_variable(dest):
-        return _writers_are_trusted(dest, contract, auth_lookup)
+        return (
+            _writers_are_trusted(dest, contract, auth_lookup),
+            _writers_are_governance_gated(dest, contract, auth_lookup),
+        )
 
     # Caller-controlled destination (calldata / msg.sender / parameter)
     if _is_caller_controlled(dest):
         # Struct field of a calldata parameter: may be registry-validated.
         if _is_struct_param(dest) and _registry_validates_struct(f, dest, node):
-            return True
-        return False
+            return True, False
+        return False, False
 
     # Temporary variable — backward-slice to its source via the function IR
     try:
@@ -641,17 +711,20 @@ def _resolve_trust(ir, raw_type: str, f, auth_lookup: Optional[dict], node=None)
             if source is not None:
                 source = _follow_reference(source)
                 if _is_state_variable(source):
-                    return _writers_are_trusted(source, contract, auth_lookup)
+                    return (
+                        _writers_are_trusted(source, contract, auth_lookup),
+                        _writers_are_governance_gated(source, contract, auth_lookup),
+                    )
                 if _is_caller_controlled(source):
                     # Struct field of a calldata parameter: may be registry-validated.
                     if _is_struct_param(source) and _registry_validates_struct(f, source, node):
-                        return True
-                    return False
+                        return True, False
+                    return False, False
     except Exception:
         pass
 
     # Unresolvable source — conservative: untrusted
-    return False
+    return False, False
 
 
 # ── Destination resolution ────────────────────────────────────────
@@ -659,36 +732,36 @@ def _resolve_trust(ir, raw_type: str, f, auth_lookup: Optional[dict], node=None)
 def _resolve_dst(ir, src_id: str, raw_type: str, f=None, auth_lookup: Optional[dict] = None, node=None, slither=None, unresolved_deps=None) -> tuple:
     """
     Attempt to resolve destination canonical ID and name.
-    Returns (dst_id, function_name, destination_str, trusted).
-    Unresolvable targets return a labeled unknown with trusted=False.
-    Only highlevel calls may resolve to trusted=True.
+    Returns (dst_id, function_name, destination_str, trusted, governance_gated).
+    Unresolvable targets return a labeled unknown with trusted=False,
+    governance_gated=False. Only highlevel calls may resolve either True.
     """
     if raw_type == "internal":
         try:
             fn = ir.function
             cid = f"{fn.contract_declarer.name}.{fn.full_name}"
-            return cid, fn.name, None, False
+            return cid, fn.name, None, False, False
         except Exception:
-            return f"{src_id}.__unresolved_internal__", None, None, False
+            return f"{src_id}.__unresolved_internal__", None, None, False, False
 
     if raw_type == "library":
         try:
             fn = ir.function
             cid = f"{fn.contract_declarer.name}.{fn.full_name}"
-            return cid, fn.name, None, False
+            return cid, fn.name, None, False, False
         except Exception:
-            return f"{src_id}.__unresolved_library__", None, None, False
+            return f"{src_id}.__unresolved_library__", None, None, False, False
 
     if raw_type == "dynamic":
         # Function pointer — target is unknown at static analysis time
-        return f"{src_id}.__dynamic_target__", None, None, False
+        return f"{src_id}.__dynamic_target__", None, None, False, False
 
     if raw_type == "highlevel":
         try:
             dest = str(ir.destination)
             fname = getattr(ir, "function_name", "") or ""
             fname = str(fname) if fname else ""
-            trusted = _resolve_trust(ir, raw_type, f, auth_lookup, node)
+            trusted, governance_gated = _resolve_trust(ir, raw_type, f, auth_lookup, node)
 
             # Attempt real cross-contract resolution. Only when a concrete
             # destination is PROVEN (RESOLVED) do we return a canonical ID
@@ -706,7 +779,7 @@ def _resolve_dst(ir, src_id: str, raw_type: str, f=None, auth_lookup: Optional[d
                         and resolution.resolved_function
                     ):
                         real_cid = f"{resolution.resolved_contract}.{resolution.resolved_function}"
-                        return real_cid, fname, dest, trusted
+                        return real_cid, fname, dest, trusted, governance_gated
                     elif (
                         resolution.resolved_variable_name
                         and unresolved_deps is not None
@@ -737,33 +810,33 @@ def _resolve_dst(ir, src_id: str, raw_type: str, f=None, auth_lookup: Optional[d
                 except Exception:
                     pass  # fall through to prior synthetic-label behavior
 
-            return f"external.{dest}.{fname}", fname, dest, trusted
+            return f"external.{dest}.{fname}", fname, dest, trusted, governance_gated
         except Exception:
-            return f"{src_id}.__unresolved_external__", None, None, False
+            return f"{src_id}.__unresolved_external__", None, None, False, False
 
     if raw_type in ("lowlevel_call", "delegatecall", "codecall"):
         try:
             dest = str(ir.destination)
             fname = getattr(ir, "function_name", "") or "call"
-            return f"lowlevel.{dest}.{fname}", fname, dest, False
+            return f"lowlevel.{dest}.{fname}", fname, dest, False, False
         except Exception:
-            return f"{src_id}.__unresolved_lowlevel__", None, None, False
+            return f"{src_id}.__unresolved_lowlevel__", None, None, False, False
 
     if raw_type in ("eth_send", "eth_transfer"):
         try:
             dest = str(ir.destination)
-            return f"eth.{dest}", None, dest, False
+            return f"eth.{dest}", None, dest, False, False
         except Exception:
-            return f"{src_id}.__unresolved_eth__", None, None, False
+            return f"{src_id}.__unresolved_eth__", None, None, False, False
 
     if raw_type == "new_contract":
         try:
             contract_name = ir.contract_name if hasattr(ir, "contract_name") else "unknown"
-            return f"new.{contract_name}", contract_name, None, False
+            return f"new.{contract_name}", contract_name, None, False, False
         except Exception:
-            return f"{src_id}.__unresolved_new__", None, None, False
+            return f"{src_id}.__unresolved_new__", None, None, False, False
 
-    return f"{src_id}.__unresolved__", None, None, False
+    return f"{src_id}.__unresolved__", None, None, False, False
 
 
 # ── Public API ────────────────────────────────────────────────────
@@ -792,7 +865,7 @@ def extract_edges(src_id: str, f, auth_lookup: Optional[dict] = None, slither=No
                 if raw_type == "unknown":
                     continue
 
-                dst_id, fname, dest_str, trusted = _resolve_dst(
+                dst_id, fname, dest_str, trusted, governance_gated = _resolve_dst(
                     ir, src_id, raw_type, f, auth_lookup, node, slither, unresolved_deps
                 )
                 props = _semantic_properties(raw_type)
@@ -804,6 +877,7 @@ def extract_edges(src_id: str, f, auth_lookup: Optional[dict] = None, slither=No
                     function_name=str(fname) if fname is not None else None,
                     destination=str(dest_str) if dest_str is not None else None,
                     trusted=trusted,
+                    governance_gated=governance_gated,
                     **props,
                 ))
 

@@ -78,6 +78,9 @@ def build_protocol_graph(
 
     seen_impls = set()
     dependency_entry_files = []
+    dep_resolved: dict = {}  # entry_file -> resolved dict, needed so the
+    # multi-version fallback can run REAL per-dependency enrichment
+    # (auth_lookup) instead of enrichment={} — see below.
     for addr in addresses:
         if len(seen_impls) >= max_distinct_implementations:
             break
@@ -95,6 +98,7 @@ def build_protocol_graph(
         merge_result = merge_dependency_source(impl_addr, chain, project_root)
         if merge_result.wrote and merge_result.entry_file:
             dependency_entry_files.append(merge_result.entry_file)
+            dep_resolved[merge_result.entry_file] = resolved
             notes.append({
                 "market": addr, "implementation": impl_addr,
                 "name": resolved.get("name"), "status": "fetched",
@@ -134,8 +138,25 @@ def build_protocol_graph(
     merged = base_build
     for dep_entry in dependency_entry_files:
         dep_version = extract_pragma_version(dep_entry) or solc_version
+        # Real enrichment (Slither's auth-score printer) run against THIS
+        # dependency's own compilation, not enrichment={}. Without this,
+        # core/edges.py's CallEdge.trusted collapses to unconditionally
+        # False for every cross-contract edge originating in a separately
+        # -compiled dependency (_resolve_trust's `if not auth_lookup:
+        # return False`), making it useless as a signal for distinguishing
+        # a genuinely attacker-arbitrary call target from a protocol-fixed
+        # one reached through an admin-gated setter (e.g. Compound's
+        # CToken.seize() -> comptroller.seizeAllowed(), where `comptroller`
+        # is only ever written by the admin-only _setComptroller()).
         try:
-            dep_result = build_graph(project_root, dep_entry, dep_version, {}, remaps or [])
+            from analysis.enricher import run_enricher
+            dep_resolved_info = dep_resolved.get(dep_entry, {"address": dep_entry, "chain_id": chain.chain_id})
+            dep_enrichment = run_enricher(dep_resolved_info, project_root, dep_entry, dep_version)
+        except Exception as ee:
+            log.warn(f"Protocol graph: enrichment failed for {dep_entry}: {ee}")
+            dep_enrichment = {}
+        try:
+            dep_result = build_graph(project_root, dep_entry, dep_version, dep_enrichment, remaps or [])
         except Exception as de:
             notes.append({"implementation_file": dep_entry, "status": "compile_failed", "pragma_version": dep_version, "reason": str(de)})
             log.warn(f"Protocol graph: separate compile failed for {dep_entry} at {dep_version}: {de}")
