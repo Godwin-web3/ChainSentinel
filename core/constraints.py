@@ -364,6 +364,31 @@ def _check_access_control_gap(path, nodes, graph_edges) -> ConstraintResult:
     if _auth_check_in_subgraph(path.entry, nodes, graph_edges, depth=3):
         return _suppressed(path, "Auth enforced in call subgraph — not a real gap")
 
+    # Self-scoped write: the sink's privileged write is PROVABLY keyed by
+    # the caller's own identity (core/auth_detection.py::
+    # find_self_scoped_writes, e.g. AccessControl.renounceRole's
+    # require(account == _msgSender()) before writing
+    # _roles[role].members[account]) — an attacker reaching this can only
+    # ever corrupt their OWN storage slot, never another user's. This is
+    # NOT "no auth gap" in general (there's no admin gate here by
+    # design — renouncing your own role is meant to be permissionless);
+    # it's a narrower, sink-specific claim that THIS particular privileged
+    # write is safe regardless. Only fires when EVERY privileged write key
+    # on the sink is self-scoped — a sink with even one write that isn't
+    # (e.g. a function that also corrupts an unrelated victim's storage)
+    # is deliberately excluded from self_scoped_write_keys entirely by
+    # find_self_scoped_writes, so this stays conservative.
+    if path.sink.category == STORAGE_CORRUPTION and path.sink.privileged_writes:
+        entry_node = nodes.get(path.entry)
+        self_scoped = getattr(entry_node, "self_scoped_write_keys", set()) if entry_node else set()
+        if self_scoped and path.sink.privileged_writes.issubset(self_scoped):
+            return _suppressed(
+                path,
+                f"All privileged writes on this path ({path.sink.evidence}) are provably "
+                f"keyed by the caller's own identity (msg.sender-bound) — an attacker can "
+                f"only ever affect their own storage, not another user's"
+            )
+
     # High confidence: unprotected path to privileged sink
     if path.sink.category in (STORAGE_CORRUPTION, DELEGATION_SINK, SELFDESTRUCT_SINK):
         return ConstraintResult(

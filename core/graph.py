@@ -15,7 +15,7 @@ from typing import List, Set, Dict, Optional
 from slither.slither import Slither
 from slither.core.declarations import Modifier
 from core.invariants import extract_field_precise_writes, extract_field_precise_reads, get_call_events, extract_invariants
-from core.auth_detection import compute_own_auth, is_reentrancy_guard
+from core.auth_detection import compute_own_auth, is_reentrancy_guard, find_self_scoped_writes
 from slither.slithir.operations import (
     InternalCall, HighLevelCall, LowLevelCall, SolidityCall, LibraryCall
 )
@@ -66,6 +66,16 @@ class FunctionNode:
     structural_auth_score: int = 0
     structural_auth_var: Optional[str] = None
     is_reentrancy_guard: bool = False
+    # Privileged writes reachable from THIS entry that are PROVABLY keyed
+    # by the caller's own identity (core/auth_detection.py::
+    # find_self_scoped_writes) — e.g. AccessControl.renounceRole's
+    # require(account == _msgSender()) before writing
+    # _roles[role].members[account]. Same key format as state_writes /
+    # Sink.privileged_writes, so directly comparable. An attacker
+    # reaching one of these can only ever corrupt their OWN storage slot,
+    # not another user's — real evidence a STORAGE_CORRUPTION path here
+    # isn't exploitable, distinct from (and narrower than) auth_score.
+    self_scoped_write_keys: Set[tuple] = field(default_factory=set)
 
     # Layer 4 — graph edges (canonical IDs)
     internal_callees: List[str] = field(default_factory=list)
@@ -350,6 +360,7 @@ def build_graph(
                 structural_auth_var = own_auth.matched_state_var
                 modifier_ids = [canonical_id(contract.name, m.full_name) for m in f.modifiers]
                 guard = is_reentrancy_guard(f) if is_modifier else False
+                self_scoped_writes = find_self_scoped_writes(f)
                 auth_state = (
                     "AUTHENTICATED" if structural_auth_score >= 3 else
                     "UNKNOWN" if structural_auth_score == 2 else
@@ -394,6 +405,7 @@ def build_graph(
                     structural_auth_score=structural_auth_score,
                     structural_auth_var=structural_auth_var,
                     is_reentrancy_guard=guard,
+                    self_scoped_write_keys=self_scoped_writes,
                     internal_callees=int_callees,
                     external_callees=ext_callees,
                     state_writes=state_writes,

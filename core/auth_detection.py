@@ -12,12 +12,32 @@ modifier — a custom-named modifier like `gatekept` enforcing
 `require(msg.sender == pendingOwner)` is exactly as valid an auth gate
 as one named `onlyOwner`, and this module treats them identically.
 
-Two detectors:
-  compute_own_auth()   — is this function/modifier itself (or something
-                          it calls) a real auth check?
-  is_reentrancy_guard() — is this modifier structurally a reentrancy
-                          guard (read-check-set-before/reset-after around
-                          its own PLACEHOLDER node)?
+Three detectors:
+  compute_own_auth()      — is this function/modifier itself (or
+                             something it calls) a real auth check?
+  is_reentrancy_guard()   — is this modifier structurally a reentrancy
+                             guard (read-check-set-before/reset-after
+                             around its own PLACEHOLDER node)?
+  find_self_scoped_writes() — for a given entry function, which
+                             privileged storage writes reachable from it
+                             are PROVABLY keyed by msg.sender itself (an
+                             attacker can only ever affect their OWN
+                             slot, e.g. AccessControl.renounceRole's
+                             require(account == _msgSender()) before
+                             writing _roles[role].members[account])? A
+                             narrower, sink-specific question than
+                             compute_own_auth: NOT "is this call gated
+                             at all" but "is the specific storage this
+                             call can corrupt limited to the caller's
+                             own identity." Deliberately does not treat
+                             ANY parameter-vs-msg.sender comparison
+                             anywhere in a function as blanket auth
+                             evidence (that would be a real weakening —
+                             e.g. checking caller==msg.sender proves
+                             nothing about a write keyed by an unrelated
+                             victim parameter); only the EXACT write
+                             whose own index key is proven msg.sender
+                             -bound is ever recorded.
 
 Both operate on live Slither Function/Modifier objects — they must run
 where those objects are already in scope (core/graph.py's live Slither
@@ -28,8 +48,9 @@ pipeline, which never has real IR to inspect.
 from dataclasses import dataclass
 from typing import Optional, Set
 
-from slither.slithir.operations import Binary, Index, Member, InternalCall, Return, SolidityCall
+from slither.slithir.operations import Assignment, Binary, Index, Member, InternalCall, Return, SolidityCall
 from slither.slithir.operations.binary import BinaryType
+from slither.slithir.variables.reference import ReferenceVariable
 from slither.core.cfg.node import NodeType
 
 from core.destination_origin import resolve_variable_origin, DestinationOrigin
@@ -332,6 +353,169 @@ def compute_own_auth(
                         matched_state_var=nested.matched_state_var,
                     )
     return _NONE
+
+
+def _params_proven_msg_sender(f) -> frozenset:
+    """
+    Scan f's own body (revert-gated nodes only — a real ENFORCED
+    constraint, not an incidental comparison) for a Binary EQUAL/
+    NOT_EQUAL between msg.sender/tx.origin and one of f's own
+    parameters. Returns the parameter objects f's own require/assert
+    has proven bound to msg.sender — e.g. `account` in
+    `require(account == _msgSender())`.
+
+    This is deliberately separate from _direct_comparison_ir (which
+    requires the OTHER side to be a STATE_VARIABLE/IMMUTABLE — proof of
+    a REAL admin-style gate). A parameter proven == msg.sender proves
+    nothing about general access control on its own (that's exactly why
+    _FIXED_ORIGINS excludes PARAMETER there) — it only tells
+    find_self_scoped_writes what to propagate when f calls something
+    else, passing that parameter along.
+    """
+    try:
+        nodes = list(getattr(f, "nodes", []) or [])
+    except Exception:
+        return frozenset()
+    out = set()
+    for node in nodes:
+        if not (node.type == NodeType.IF or _node_can_revert(node)):
+            continue
+        for ir in node.irs:
+            if not isinstance(ir, Binary) or ir.type not in (BinaryType.EQUAL, BinaryType.NOT_EQUAL):
+                continue
+            left_origin, left_var = _resolve_operand(ir.variable_left, f)
+            right_origin, right_var = _resolve_operand(ir.variable_right, f)
+            if _is_msg_sender_origin(left_origin) and right_origin == DestinationOrigin.PARAMETER:
+                out.add(right_var)
+            elif _is_msg_sender_origin(right_origin) and left_origin == DestinationOrigin.PARAMETER:
+                out.add(left_var)
+    return frozenset(out)
+
+
+def find_self_scoped_writes(
+    f, max_depth: int = 3, _visited: Optional[set] = None, known_msg_sender: frozenset = frozenset()
+) -> Set[tuple]:
+    """
+    Walk f's own body and (bounded, parameter-binding-aware) recursion
+    into internal calls, collecting state-write keys — SAME format as
+    core.invariants.extract_field_precise_writes / Sink.privileged_writes,
+    i.e. exactly what core.invariants.get_node_write(node) returns for
+    that node, so the result is directly, exactly comparable to a Sink's
+    own privileged_writes with no lossy re-normalization — for writes
+    whose STORAGE KEY (the final Index's key, e.g. `account` in
+    `_roles[role].members[account] = false`) is provably msg.sender
+    itself, or a parameter proven bound to msg.sender at the exact call
+    site that reached this function (known_msg_sender, propagated the
+    same way compute_own_auth's interprocedural binding works).
+
+    Deliberately narrow: only the write whose OWN index key resolves to
+    msg.sender is recorded. A function like
+    badWithdraw(address caller, address victim, uint amount) that checks
+    require(caller == msg.sender) but writes balances[victim] records
+    NOTHING here — the write's key is `victim`, never `caller`, so
+    `victim` is never in known_msg_sender and the write is never treated
+    as self-scoped. This is what keeps the check sink-specific instead
+    of degrading into "any msg.sender comparison anywhere counts."
+
+    Public entry point — does the conservative subtraction described in
+    _self_scoped_and_unsafe_writes below.
+    """
+    self_scoped, unsafe = _self_scoped_and_unsafe_writes(
+        f, max_depth, _visited if _visited is not None else set(), known_msg_sender
+    )
+    return self_scoped - unsafe
+
+
+def _self_scoped_and_unsafe_writes(f, max_depth: int, _visited: set, known_msg_sender: frozenset):
+    """
+    Returns (self_scoped_keys, unsafe_keys). Two Sink.privileged_writes-
+    format keys ((root_var, member_path) — root-and-field level, NOT
+    index-value level) collapse to the SAME key regardless of which
+    actual index/key was written, e.g. balances[victim] and
+    balances[caller] are BOTH just ('balances', ()) — the existing write-
+    key format has no way to distinguish them. That means a single
+    function writing the same root/field via both a self-scoped key
+    (caller, proven == msg.sender) and an unrelated one (victim, not
+    proven) must NOT have that key end up in the final self-scoped set —
+    doing so would suppress a real vulnerability (this exact shape was
+    caught live: a synthetic badWithdraw(caller, victim, amount) with
+    require(caller==msg.sender) but a write to balances[victim] initially
+    got wrongly marked fully self-scoped before this split was added).
+    Tracking self_scoped and unsafe separately, unioned across the WHOLE
+    recursive call tree from this entry, and subtracting only once at
+    the public entry point (find_self_scoped_writes) is what keeps this
+    conservative regardless of which function in the call chain contains
+    the unsafe write.
+    """
+    from core.invariants import get_node_write
+
+    fid = id(f)
+    if fid in _visited:
+        return set(), set()
+    _visited.add(fid)
+
+    try:
+        nodes = list(getattr(f, "nodes", []) or [])
+    except Exception:
+        return set(), set()
+
+    # Fold in any of f's OWN parameters that f's own require/assert has
+    # proven bound to msg.sender — this is what lets renounceRole's
+    # require(account == _msgSender()) propagate into the _revokeRole()
+    # call it makes right after, passing `account` along.
+    known_msg_sender = known_msg_sender | _params_proven_msg_sender(f)
+
+    self_scoped: Set[tuple] = set()
+    unsafe: Set[tuple] = set()
+    for node in nodes:
+        for ir in node.irs:
+            # Plain `x = y` is an Assignment; compound `x -= y`/`x += y`
+            # etc. lower to a Binary op whose lvalue is the SAME
+            # ReferenceVariable being read and written (confirmed against
+            # real IR: `balances[msg.sender] -= amount` produces
+            # `Binary REF_2(-> balances) = REF_2 (c)- amount`, not an
+            # Assignment) — a plain comparison's Binary lvalue is always
+            # a fresh boolean TemporaryVariable, never a ReferenceVariable,
+            # so this check doesn't accidentally match those.
+            if not isinstance(ir, (Assignment, Binary)):
+                continue
+            if not isinstance(getattr(ir, "lvalue", None), ReferenceVariable):
+                continue
+            write_key = get_node_write(node)
+            if write_key is None:
+                continue
+            # Find the Index op, in this SAME node, that produced this
+            # exact lvalue reference — the innermost/final index of the
+            # write's Index/Member chain (e.g. the `[account]` in
+            # `_roles[role].members[account] = false`).
+            defining_index = None
+            for cand in node.irs:
+                if isinstance(cand, Index) and cand.lvalue is ir.lvalue:
+                    defining_index = cand
+                    break
+            if defining_index is None:
+                # A write we can't identify the key material for at all
+                # (e.g. a plain struct field, no index) — conservatively
+                # not self-scopable, never suppress on its account.
+                unsafe.add(write_key)
+                continue
+            key_origin, _ = _resolve_operand(defining_index.variable_right, f, known_msg_sender)
+            if _is_msg_sender_origin(key_origin):
+                self_scoped.add(write_key)
+            else:
+                unsafe.add(write_key)
+
+    if max_depth > 0:
+        for node in nodes:
+            for ir in node.irs:
+                if isinstance(ir, InternalCall) and getattr(ir, "function", None) is not None:
+                    callee_known = _msg_sender_params_for_call(ir, f, known_msg_sender, ir.function)
+                    nested_scoped, nested_unsafe = _self_scoped_and_unsafe_writes(
+                        ir.function, max_depth - 1, _visited, callee_known
+                    )
+                    self_scoped |= nested_scoped
+                    unsafe |= nested_unsafe
+    return self_scoped, unsafe
 
 
 def is_reentrancy_guard(modifier_obj) -> bool:

@@ -93,6 +93,45 @@ def test_reentrancy_cei_suppressed_by_custom_guard():
     print("test_reentrancy_cei_suppressed_by_custom_guard: PASS — 0 REENTRANCY_CEI findings on withdraw()")
 
 
+def test_self_scoped_write_suppressed_without_weakening():
+    """
+    Reproduces the real renounceRole() false positive found live against
+    Aave's ACLManager: require(param == msg.sender) before a privileged
+    write keyed by that SAME param is self-only by construction and must
+    be suppressed. Critically, ALSO proves this does NOT weaken
+    detection: a structurally similar function that checks one param
+    against msg.sender but writes storage keyed by a DIFFERENT,
+    unconstrained param (the exact shape a naive "any param==msg.sender
+    counts" fix would wrongly suppress) must still fire ACCESS_CONTROL_GAP.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("PrivilegedBadWrite.sol")
+
+    safe = nodes["PrivilegedBadWrite.setOperatorForSelf(bool)"]
+    assert ("operators", ()) in safe.self_scoped_write_keys
+
+    dangerous = nodes["PrivilegedBadWrite.corruptOperator(address,address,bool)"]
+    assert dangerous.self_scoped_write_keys == set(), (
+        "corruptOperator writes operators[target], never proven == msg.sender — "
+        "must NOT be marked self-scoped just because a DIFFERENT param (caller) is"
+    )
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible + report.suppressed
+
+    safe_gap = [r for r in all_results if r.path.entry == safe.id and r.constraint_type == "ACCESS_CONTROL_GAP"]
+    assert not safe_gap, f"setOperatorForSelf is self-scoped — ACCESS_CONTROL_GAP should not fire, got {safe_gap}"
+
+    dangerous_gap = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == dangerous.id and "ACCESS_CONTROL_GAP" in r.constraint_type
+    ]
+    assert dangerous_gap, "corruptOperator is a genuine access-control gap — must still fire, self-scoping fix must not weaken this"
+    print("test_self_scoped_write_suppressed_without_weakening: PASS —",
+          "setOperatorForSelf suppressed, corruptOperator still", dangerous_gap[0].verdict)
+
+
 def test_ownable2step_accept_ownership_suppressed():
     """
     Reproduces the real false positive found live this session against
@@ -123,5 +162,6 @@ if __name__ == "__main__":
     test_access_control_role_mapping_detected()
     test_custom_named_reentrancy_guard_detected()
     test_reentrancy_cei_suppressed_by_custom_guard()
+    test_self_scoped_write_suppressed_without_weakening()
     test_ownable2step_accept_ownership_suppressed()
     print("\nAll auth_detection tests passed.")
