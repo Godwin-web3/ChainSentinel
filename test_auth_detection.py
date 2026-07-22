@@ -475,6 +475,44 @@ def test_numeric_equality_constant_role_flag_detected():
           "rely suppressed, corruptWards still", corrupt_gap[0].verdict)
 
 
+def test_ecrecover_signer_self_scoping_detected():
+    """
+    Reproduces the real Dai.permit() false positive found live this
+    session against MakerDAO's Dai.sol: `require(holder ==
+    ecrecover(digest, v, r, s))` before `allowance[holder][spender] =
+    wad` — a genuine EIP-2612 signature-based authorization that
+    find_self_scoped_writes previously couldn't recognize at all (it
+    only understood msg.sender/tx.origin comparisons).
+
+    Also proves this doesn't weaken detection:
+    corruptViaUnrelatedSignature() reproduces the shape a naive "any
+    ecrecover check anywhere counts" fix would wrongly suppress — a
+    real signature check, but over a completely different parameter
+    (signer) than the one used as the write's key (victim). An
+    attacker can supply their own valid signature while still
+    corrupting an arbitrary victim's allowance row. Must still fire.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("EcrecoverPermit.sol")
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible + report.suppressed
+
+    safe_id = "EcrecoverPermit.permit(address,address,uint256,uint256,uint8,bytes32,bytes32)"
+    safe_gap = [r for r in all_results if r.path.entry == safe_id and "ACCESS_CONTROL_GAP" in r.constraint_type]
+    assert not safe_gap, f"permit()'s write is provably keyed by the ecrecover-proven signer — ACCESS_CONTROL_GAP should not fire, got {safe_gap}"
+
+    dangerous_id = "EcrecoverPermit.corruptViaUnrelatedSignature(address,address,address,uint256,uint8,bytes32,bytes32)"
+    dangerous_gap = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == dangerous_id and "ACCESS_CONTROL_GAP" in r.constraint_type
+    ]
+    assert dangerous_gap, "corruptViaUnrelatedSignature()'s signature check is decoupled from the write's key — ACCESS_CONTROL_GAP must still fire"
+    print("test_ecrecover_signer_self_scoping_detected: PASS —",
+          "permit suppressed, corruptViaUnrelatedSignature still", dangerous_gap[0].verdict)
+
+
 if __name__ == "__main__":
     test_custom_named_auth_modifier_detected()
     test_real_access_control_struct_shape_detected()
@@ -490,4 +528,5 @@ if __name__ == "__main__":
     test_self_scoped_liability_reduction_replaces_missing_precision()
     test_ownable2step_accept_ownership_suppressed()
     test_numeric_equality_constant_role_flag_detected()
+    test_ecrecover_signer_self_scoping_detected()
     print("\nAll auth_detection tests passed.")

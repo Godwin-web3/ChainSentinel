@@ -586,8 +586,78 @@ def _params_proven_msg_sender(f) -> frozenset:
     return frozenset(out)
 
 
+def _params_proven_ecrecover_signer(f) -> frozenset:
+    """
+    Scan f's own body (revert-gated nodes only, same basis as
+    _params_proven_msg_sender) for a Binary EQUAL/NOT_EQUAL between one
+    of f's own parameters and the return value of a genuine ecrecover(
+    ...) SolidityCall — the real EIP-2612 permit() shape found live
+    against MakerDAO's Dai.sol:
+        require(holder == ecrecover(digest, v, r, s), "invalid-permit");
+        ...
+        allowance[holder][spender] = wad;
+
+    An attacker cannot forge a valid ECDSA signature recovering to an
+    arbitrary address: `holder` isn't caller-chosen the way an ordinary
+    parameter is — the signature determines it. A storage write keyed
+    by such a parameter is therefore exactly as safe as one keyed by
+    msg.sender itself, just authenticated by a signature instead of the
+    transaction sender. Same role as _params_proven_msg_sender: this
+    proves nothing about general access control on its own (permit() is
+    deliberately callable by anyone — that's the whole point of a
+    gasless meta-transaction) — it only tells find_self_scoped_writes
+    which parameter is safe to treat as a caller-equivalent identity for
+    the outer/inner-key self-scoping checks below.
+    """
+    try:
+        nodes = list(getattr(f, "nodes", []) or [])
+    except Exception:
+        return frozenset()
+    out = set()
+    for node in nodes:
+        if not (node.type == NodeType.IF or _node_can_revert(node)):
+            continue
+        for ir in node.irs:
+            if not isinstance(ir, Binary) or ir.type not in (BinaryType.EQUAL, BinaryType.NOT_EQUAL):
+                continue
+            for candidate, other in ((ir.variable_left, ir.variable_right), (ir.variable_right, ir.variable_left)):
+                defining_op = _find_defining_op(other, f)
+                if not isinstance(defining_op, SolidityCall):
+                    continue
+                callee = getattr(defining_op, "function", None)
+                name = (getattr(callee, "name", "") or "").split("(")[0]
+                if name != "ecrecover":
+                    continue
+                origin, resolved = resolve_variable_origin(candidate, f)
+                if origin == DestinationOrigin.PARAMETER:
+                    out.add(resolved)
+    return frozenset(out)
+
+
+def _signer_params_for_call(call_ir, caller_f, caller_known_signer: frozenset, callee) -> frozenset:
+    """
+    For an InternalCall, mirrors _msg_sender_params_for_call but for
+    ecrecover-proven signer parameters: if the caller passes one of its
+    own known_signer parameters straight through as an argument, the
+    corresponding callee parameter is equally signer-proven — the real
+    shape of a permit() that factors its actual write into a shared
+    internal _approve(holder, spender, wad) helper.
+    """
+    try:
+        args = list(getattr(call_ir, "arguments", None) or [])
+        params = list(getattr(callee, "parameters", None) or [])
+    except Exception:
+        return frozenset()
+    out = set()
+    for param, arg in zip(params, args):
+        if any(arg is p for p in caller_known_signer):
+            out.add(param)
+    return frozenset(out)
+
+
 def find_self_scoped_writes(
-    f, max_depth: int = 3, _visited: Optional[set] = None, known_msg_sender: frozenset = frozenset()
+    f, max_depth: int = 3, _visited: Optional[set] = None,
+    known_msg_sender: frozenset = frozenset(), known_signer: frozenset = frozenset(),
 ) -> Set[tuple]:
     """
     Walk f's own body and (bounded, parameter-binding-aware) recursion
@@ -600,7 +670,13 @@ def find_self_scoped_writes(
     `_roles[role].members[account] = false`) is provably msg.sender
     itself, or a parameter proven bound to msg.sender at the exact call
     site that reached this function (known_msg_sender, propagated the
-    same way compute_own_auth's interprocedural binding works).
+    same way compute_own_auth's interprocedural binding works) — or,
+    since this session, a parameter proven bound to a cryptographically
+    recovered ECDSA signer via ecrecover(...) (known_signer, the real
+    EIP-2612 permit() shape: `require(holder == ecrecover(digest, v, r,
+    s))` before `allowance[holder][spender] = wad`). Both are the same
+    underlying claim — this key isn't caller-chosen — just proven by a
+    different mechanism (the transaction sender vs. a valid signature).
 
     Deliberately narrow: only the write whose OWN index key resolves to
     msg.sender is recorded. A function like
@@ -615,12 +691,14 @@ def find_self_scoped_writes(
     _self_scoped_and_unsafe_writes below.
     """
     self_scoped, unsafe = _self_scoped_and_unsafe_writes(
-        f, max_depth, _visited if _visited is not None else set(), known_msg_sender
+        f, max_depth, _visited if _visited is not None else set(), known_msg_sender, known_signer
     )
     return self_scoped - unsafe
 
 
-def _self_scoped_and_unsafe_writes(f, max_depth: int, _visited: set, known_msg_sender: frozenset):
+def _self_scoped_and_unsafe_writes(
+    f, max_depth: int, _visited: set, known_msg_sender: frozenset, known_signer: frozenset = frozenset(),
+):
     """
     Returns (self_scoped_keys, unsafe_keys). Two Sink.privileged_writes-
     format keys ((root_var, member_path) — root-and-field level, NOT
@@ -658,6 +736,9 @@ def _self_scoped_and_unsafe_writes(f, max_depth: int, _visited: set, known_msg_s
     # require(account == _msgSender()) propagate into the _revokeRole()
     # call it makes right after, passing `account` along.
     known_msg_sender = known_msg_sender | _params_proven_msg_sender(f)
+    # Same idea for a parameter proven bound to an ecrecover(...)-
+    # recovered signer — the real Dai.permit() shape.
+    known_signer = known_signer | _params_proven_ecrecover_signer(f)
 
     self_scoped: Set[tuple] = set()
     unsafe: Set[tuple] = set()
@@ -693,8 +774,8 @@ def _self_scoped_and_unsafe_writes(f, max_depth: int, _visited: set, known_msg_s
                 # not self-scopable, never suppress on its account.
                 unsafe.add(write_key)
                 continue
-            key_origin, _ = _resolve_operand(defining_index.variable_right, f, known_msg_sender)
-            if _is_msg_sender_origin(key_origin):
+            key_origin, key_var = _resolve_operand(defining_index.variable_right, f, known_msg_sender)
+            if _is_msg_sender_origin(key_origin) or any(key_var is p for p in known_signer):
                 self_scoped.add(write_key)
                 continue
             # The innermost key isn't msg.sender, but for a NESTED
@@ -708,11 +789,15 @@ def _self_scoped_and_unsafe_writes(f, max_depth: int, _visited: set, known_msg_s
             # the innermost-key case above, which is the renounceRole
             # shape (`_roles[role].members[account]`, where the OUTER
             # key is attacker-irrelevant `role` and only the INNER key
-            # `account` matters).
+            # `account` matters). Also the real Dai.permit() shape:
+            # `allowance[holder][spender] = wad` — the outer key
+            # (holder) is proven bound to an ecrecover-recovered signer
+            # rather than msg.sender, but the same "attacker can't
+            # choose this key" guarantee holds either way.
             outer_key = _outermost_index_key(defining_index, f)
             if outer_key is not None:
-                outer_origin, _ = _resolve_operand(outer_key, f, known_msg_sender)
-                if _is_msg_sender_origin(outer_origin):
+                outer_origin, outer_var = _resolve_operand(outer_key, f, known_msg_sender)
+                if _is_msg_sender_origin(outer_origin) or any(outer_var is p for p in known_signer):
                     self_scoped.add(write_key)
                     continue
             unsafe.add(write_key)
@@ -722,8 +807,9 @@ def _self_scoped_and_unsafe_writes(f, max_depth: int, _visited: set, known_msg_s
             for ir in node.irs:
                 if isinstance(ir, InternalCall) and getattr(ir, "function", None) is not None:
                     callee_known = _msg_sender_params_for_call(ir, f, known_msg_sender, ir.function)
+                    callee_known_signer = _signer_params_for_call(ir, f, known_signer, ir.function)
                     nested_scoped, nested_unsafe = _self_scoped_and_unsafe_writes(
-                        ir.function, max_depth - 1, _visited, callee_known
+                        ir.function, max_depth - 1, _visited, callee_known, callee_known_signer
                     )
                     self_scoped |= nested_scoped
                     unsafe |= nested_unsafe
