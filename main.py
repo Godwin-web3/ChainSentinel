@@ -16,7 +16,19 @@ from analysis.pattern_engine import enrich_findings, summarize
 from exploits.generator import generate_poc
 from exploits.verifier import verify_exploit
 from output.reporter import generate_report
+from core.market_risk import score_market_risk
+from core.adapters.morpho import fetch_markets as fetch_morpho_markets, MORPHO_ADDRESS
 from utils.logger import log
+
+# Protocol-level economic risk scan is keyed by known singleton contract
+# addresses (a single deployed instance holds many markets — e.g. Morpho
+# Blue), never by category/name guessing. Adding another protocol is one
+# line here once it has an adapter under core/adapters/ producing
+# MarketConfig objects; core/market_risk.py scores every adapter's output
+# the same protocol-agnostic way.
+MARKET_ADAPTERS = {
+    MORPHO_ADDRESS.lower(): fetch_morpho_markets,
+}
 
 BANNER = """
 +===================================================+
@@ -94,6 +106,19 @@ def print_result(result):
                 lines.append(f"  [{r['verdict']}][{r['confidence']}%] {r['constraint_type']}")
                 lines.append(f"    {r['entry']}")
                 lines.append(f"    -> {r['sink']} | {r['immunefi_impact']}")
+
+        market_risk = analysis.get("market_risk")
+        if market_risk and market_risk.get("markets_scanned"):
+            lines.append(
+                f"  --- Market Risk: {market_risk['markets_scanned']} markets scanned | "
+                f"{len(market_risk.get('findings', []))} with findings ---"
+            )
+            for mf in market_risk.get("findings", [])[:5]:
+                for finding in mf.get("findings", []):
+                    lines.append(
+                        f"  [{finding['severity']}] {mf['market_id'][:10]}... "
+                        f"{finding['type']}: {finding['reason']}"
+                    )
 
     if result.get("poc_file"):
         lines.append("  PoC        : " + result["poc_file"])
@@ -410,9 +435,33 @@ def analyze(address, chain_name, output_json=False):
             if not analysis.get("language"):
                 analysis["language"] = language
 
+        # Economic risk scan — independent of the code-flow analysis above.
+        # Only runs when `address` is itself a registered protocol singleton
+        # (e.g. Morpho Blue's own contract), since that's what holds many
+        # markets; there's nothing to scan for an arbitrary contract.
+        market_risk = {"markets_scanned": 0, "findings": []}
+        adapter = MARKET_ADAPTERS.get(address.lower())
+        if adapter:
+            try:
+                markets = adapter(chain, from_block=0)
+                market_risk["markets_scanned"] = len(markets)
+                for m in markets:
+                    scored = score_market_risk(m)
+                    if scored["findings"]:
+                        market_risk["findings"].append(scored)
+                log.success(
+                    f"Market risk: {len(markets)} market(s) scanned, "
+                    f"{len(market_risk['findings'])} with findings"
+                )
+            except Exception as me:
+                log.warn(f"Market risk scan failed: {me}")
+        analysis["market_risk"] = market_risk
+
         poc_file = None
         report_file = None
-        if analysis.get("findings"):
+        has_code_findings = bool(analysis.get("findings"))
+        has_market_findings = bool(market_risk["findings"])
+        if has_code_findings or has_market_findings:
             report_file = generate_report({
                 "address": address,
                 "name": resolved["name"],
@@ -424,8 +473,10 @@ def analyze(address, chain_name, output_json=False):
                 "token": token_data,
                 "analysis": analysis,
                 "enrichment": enrichment,
-                "graph": analysis.get("graph", {})
+                "graph": analysis.get("graph", {}),
+                "market_risk": market_risk,
             })
+        if has_code_findings:
             poc_file = generate_poc(
                 address=address,
                 name=resolved["name"],

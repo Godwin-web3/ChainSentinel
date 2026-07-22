@@ -187,6 +187,20 @@ def generate_report(result: dict, output_dir: str = "output/reports") -> str:
                 ]
             lines += [""]
 
+    market_risk = result.get("market_risk", {})
+    if market_risk and market_risk.get("markets_scanned"):
+        lines += ["## \U0001F4B0 Market Risk (Economic)", ""]
+        lines += [
+            f"Scanned {market_risk['markets_scanned']} market(s), "
+            f"{len(market_risk.get('findings', []))} with findings.",
+            "",
+        ]
+        for mf in market_risk.get("findings", []):
+            lines += [f"### Market `{mf.get('market_id', '?')}` ({mf.get('protocol', '?')})", ""]
+            for f in mf.get("findings", []):
+                lines += [f"- **[{f.get('severity', '?')}] {f.get('type', '?')}** — {f.get('reason', '')}"]
+            lines += [""]
+
     safe_name = name.replace(" ", "_").replace("/", "_")
     filename = f"report_{safe_name}_{address[:8]}.md"
     filepath = os.path.join(output_dir, filename)
