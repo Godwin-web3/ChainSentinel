@@ -222,32 +222,43 @@ def analyze(address, chain_name, output_json=False):
                                 var_name = dep["variable_name"]
                                 declaring_contract = dep.get("declaring_contract")
                                 fetched_vars.add(var_name)
-                                # Only auto-fetch when the variable is declared on the
-                                # entry contract itself. Variables declared on an unrelated
-                                # sibling contract type (e.g. CToken's interestRateModel,
-                                # seen while compiling Comptroller) aren't reachable this way
-                                # — there's no single address to fetch, since the entry
-                                # contract doesn't hold that state itself. Real fix for that
-                                # case is enumeration (e.g. getAllMarkets()), not a direct
-                                # getter read, and isn't implemented yet.
+                                # Variables declared on the entry contract itself have a
+                                # single fixed address, fetchable via a direct getter read.
+                                # Variables declared on an unrelated sibling contract TYPE
+                                # (e.g. CToken's interestRateModel, seen while compiling
+                                # Comptroller) don't — there's no one "the" CToken, there
+                                # are many markets. For that case, look for a no-arg getter
+                                # on the entry contract that enumerates real instances of
+                                # that type (e.g. getAllMarkets() -> CToken[]) and use the
+                                # first real on-chain address as a representative instance.
+                                enumeration_getter = None
                                 if declaring_contract and declaring_contract != resolved["name"]:
-                                    log.info(
-                                        f"Skipping auto-fetch for {var_name} — declared on "
-                                        f"{declaring_contract}, not entry contract {resolved['name']} "
-                                        f"(cross-contract enumeration not yet supported)"
-                                    )
-                                    dependency_resolution_log.append({
-                                        "variable_name": var_name,
-                                        "declaring_contract": declaring_contract,
-                                        "status": "skipped",
-                                        "reason": "declared on unrelated sibling contract — enumeration not yet supported",
-                                    })
-                                    continue
+                                    from core.graph import find_enumeration_getter
+                                    enumeration_getter = find_enumeration_getter(nodes, resolved["name"], declaring_contract)
+                                    if not enumeration_getter:
+                                        log.info(
+                                            f"Skipping auto-fetch for {var_name} — declared on "
+                                            f"{declaring_contract}, not entry contract {resolved['name']}, "
+                                            f"and no enumeration getter found for {declaring_contract} "
+                                            f"on {resolved['name']}"
+                                        )
+                                        dependency_resolution_log.append({
+                                            "variable_name": var_name,
+                                            "declaring_contract": declaring_contract,
+                                            "status": "skipped",
+                                            "reason": "declared on unrelated sibling contract — no enumeration getter found",
+                                        })
+                                        continue
                                 try:
-                                    from core.dependency_fetcher import fetch_dependency_by_var
-                                    merge_result = fetch_dependency_by_var(address, var_name, chain, p_root)
+                                    if enumeration_getter:
+                                        from core.dependency_fetcher import fetch_dependency_by_enumeration
+                                        merge_result = fetch_dependency_by_enumeration(address, enumeration_getter, chain, p_root)
+                                    else:
+                                        from core.dependency_fetcher import fetch_dependency_by_var
+                                        merge_result = fetch_dependency_by_var(address, var_name, chain, p_root)
                                     if merge_result and merge_result.entry_file:
-                                        log.info(f"Auto-fetched dependency for {var_name} -> {merge_result.address}")
+                                        via = f" via {enumeration_getter}" if enumeration_getter else ""
+                                        log.info(f"Auto-fetched dependency for {var_name}{via} -> {merge_result.address}")
                                         dependency_entry_files.append(merge_result.entry_file)
                                         dependency_map[var_name] = merge_result.entry_file
                                         any_merged = True
@@ -256,6 +267,7 @@ def analyze(address, chain_name, output_json=False):
                                             "declaring_contract": declaring_contract,
                                             "status": "fetched",
                                             "resolved_address": merge_result.address,
+                                            "enumeration_getter": enumeration_getter,
                                         })
                                     else:
                                         dependency_resolution_log.append({
@@ -263,6 +275,7 @@ def analyze(address, chain_name, output_json=False):
                                             "declaring_contract": declaring_contract,
                                             "status": "failed",
                                             "reason": "no entry file returned",
+                                            "enumeration_getter": enumeration_getter,
                                         })
                                 except Exception as fe:
                                     log.warn(f"Auto-fetch failed for {var_name}: {fe}")
@@ -271,6 +284,7 @@ def analyze(address, chain_name, output_json=False):
                                         "declaring_contract": declaring_contract,
                                         "status": "failed",
                                         "reason": str(fe),
+                                        "enumeration_getter": enumeration_getter,
                                     })
                             retry_count += 1
                             if not any_merged:

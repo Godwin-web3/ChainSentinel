@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Optional, List
 from config.chains import Chain
 from core.resolver import resolve
-from utils.rpc import get_public_var_address
+from utils.rpc import get_public_var_address, get_address_array
 from utils.logger import log
 
 
@@ -129,6 +129,34 @@ def fetch_dependency_by_var(
         return None
 
     result = merge_dependency_source(dep_address, chain, project_root)
+    if not result.wrote:
+        return None
+    return result
+
+
+def fetch_dependency_by_enumeration(
+    contract_address: str, getter_signature: str, chain: Chain, project_root: str
+) -> Optional[MergeResult]:
+    """
+    For dependencies declared on a sibling contract TYPE rather than a
+    single fixed address (e.g. CToken's interestRateModel, reached while
+    walking Comptroller — there's no one "the" CToken, there are many
+    markets). Calls a real no-arg getter on the entry contract that
+    returns an array of that type (e.g. getAllMarkets() -> CToken[]),
+    takes the first real on-chain address as a representative instance,
+    and merges its source the same way fetch_dependency_by_var does.
+
+    One representative instance is enough: this resolves the *shape* of
+    calls into that contract type (so the graph can classify sinks reached
+    through it), not per-market runtime values — markets sharing the same
+    interface almost always share the same underlying implementation.
+    """
+    addresses = get_address_array(contract_address, getter_signature, chain, limit=1)
+    if not addresses:
+        log.warn(f"Could not read any addresses from {getter_signature} on {contract_address}")
+        return None
+
+    result = merge_dependency_source(addresses[0], chain, project_root)
     if not result.wrote:
         return None
     return result

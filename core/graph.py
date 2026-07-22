@@ -82,6 +82,12 @@ class FunctionNode:
     # one-to-many dependency getters (e.g. Comptroller.getAllMarkets()
     # returning CToken[]), never a name guess.
     returns_address_collection: bool = False
+    # The array element's Contract type name when it's a UserDefinedType
+    # (e.g. "CToken" for a CToken[] return) — None for plain address[].
+    # This is what lets an unresolved dependency's declaring_contract
+    # (e.g. "CToken") be matched back to the entry contract's own
+    # enumeration getter that can produce a real instance of it.
+    enumeration_element_type: Optional[str] = None
 
 
 # ── Layer 1: IR extraction ───────────────────────────────────────
@@ -131,6 +137,29 @@ def _extract_calls(f) -> tuple:
                 continue
 
     return int_callees, ext_callees, flows
+
+
+def find_enumeration_getter(nodes: Dict[str, "FunctionNode"], entry_contract: str, element_type: str) -> Optional[str]:
+    """
+    Looks for a no-arg function declared directly on entry_contract whose
+    return type is an array of element_type (e.g. entry_contract=
+    "Comptroller", element_type="CToken" -> "getAllMarkets()"). Used to
+    resolve dependencies whose declaring_contract is a sibling TYPE rather
+    than a single fixed address — there's no one "the" CToken, only real
+    instances discoverable by calling this getter on the entry contract's
+    own deployed address.
+
+    Returns the getter's full_name (e.g. "getAllMarkets()") or None if no
+    such function exists in this compilation.
+    """
+    for node in nodes.values():
+        if (
+            node.contract == entry_contract
+            and node.enumeration_element_type == element_type
+            and node.full_name.endswith("()")
+        ):
+            return node.full_name
+    return None
 
 
 # ── Layer 4: Graph builder ───────────────────────────────────────
@@ -267,6 +296,7 @@ def build_graph(
                 # CToken[], ApeToken[])? Used later to discover one-to-many
                 # enumeration dependencies (factory/comptroller patterns).
                 returns_address_collection = False
+                enumeration_element_type = None
                 if f.return_type:
                     from slither.core.solidity_types import ArrayType, ElementaryType, UserDefinedType
                     from slither.core.declarations.contract import Contract
@@ -278,6 +308,7 @@ def build_graph(
                                 break
                             if isinstance(elem, UserDefinedType) and isinstance(elem.type, Contract):
                                 returns_address_collection = True
+                                enumeration_element_type = elem.type.name
                                 break
 
                 nodes[cid] = FunctionNode(
@@ -300,6 +331,7 @@ def build_graph(
                     asset_flows=flows,
                     call_events=call_events,
                     returns_address_collection=returns_address_collection,
+                    enumeration_element_type=enumeration_element_type,
                 )
 
                 nodes[cid].cross_contract_edges = cross_contract_edges
