@@ -1105,6 +1105,29 @@ def has_state_write_after_external_call(f, max_depth: int = 30) -> bool:
     return False
 
 
+def has_revert_capable_body(f) -> bool:
+    """
+    True if ANY node in f's own body is revert-capable (core/edges.py::
+    _node_can_revert — a require()/assert() SolidityCall, or an
+    if(cond) revert pattern). Distinct from auth_score, which only
+    counts a require/revert as evidence when its condition compares
+    against msg.sender/tx.origin or a role mapping — this is broader,
+    general "does this function gate on something and revert if it
+    fails" evidence. Needed for health-check guards whose condition is
+    derived from an EXTERNAL dependency (e.g. an oracle/registry call)
+    rather than a caller-identity check — real shape: Liquity's
+    _requireNoUnderCollateralizedTroves(), which reverts based on
+    troveManager.getCurrentICR(...)/priceFeed.fetchPrice() and has
+    auth_score=0 (no msg.sender comparison anywhere in it) despite
+    being a genuine, real health check.
+    """
+    try:
+        nodes = list(getattr(f, "nodes", []) or [])
+    except Exception:
+        return False
+    return any(_node_can_revert(n) for n in nodes)
+
+
 def _expand_with_internal_calls(nodes, max_depth: int = 2, _visited: Optional[set] = None) -> list:
     """
     Returns `nodes` plus the CFG nodes of any function directly reached

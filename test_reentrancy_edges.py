@@ -268,6 +268,45 @@ def test_cei_check_is_order_aware_not_co_occurrence():
     print("test_cei_check_is_order_aware_not_co_occurrence: PASS — withdrawOrdered() correctly suppressed")
 
 
+def test_health_check_recognizes_trusted_external_dependency():
+    """
+    Reproduces the real Liquity StabilityPool false positive found live
+    this session: withdrawFromSP() calls _requireNoUnderCollateralizedTroves()
+    as a sibling guard — its entire condition comes from
+    priceFeed.fetchPrice()/sortedTroves.getLast()/troveManager.
+    getCurrentICR(...), all fixed, protocol-governed contracts, never
+    touching StabilityPool's OWN state — invisible to the old
+    local-storage-overlap-only check.
+
+    withdraw() (real, trusted oracle) must NOT fire MISSING_HEALTH_CHECK.
+    withdrawUnsafe() (attacker-supplied oracle, same shape) proves this
+    doesn't weaken detection — must still fire.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("ExternalHealthCheck.sol")
+
+    guard = nodes["ExternalHealthCheck._requireHealthySystem()"]
+    assert guard.has_revert_capable_body is True
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible
+
+    safe_findings = [
+        r for r in all_results
+        if r.path.entry == "ExternalHealthCheck.withdraw(uint256)" and "MISSING_HEALTH_CHECK" in r.constraint_type
+    ]
+    assert not safe_findings, f"withdraw() is guarded by a trusted external oracle check — must not fire, got {safe_findings}"
+
+    unsafe_findings = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == "ExternalHealthCheck.withdrawUnsafe(uint256,IPriceOracle)" and "MISSING_HEALTH_CHECK" in r.constraint_type
+    ]
+    assert unsafe_findings, "withdrawUnsafe()'s oracle is attacker-supplied, not trusted — MISSING_HEALTH_CHECK must still fire"
+    print("test_health_check_recognizes_trusted_external_dependency: PASS —",
+          "withdraw suppressed, withdrawUnsafe still", unsafe_findings[0].verdict)
+
+
 if __name__ == "__main__":
     test_entry_level_cei_violation_detected()
     test_staticcall_not_misclassified_as_asset_drain_or_callback()
@@ -275,4 +314,5 @@ if __name__ == "__main__":
     test_unchecked_return_requires_real_dataflow_evidence()
     test_trusted_interface_cast_destination_excludes_callback_sink()
     test_cei_check_is_order_aware_not_co_occurrence()
+    test_health_check_recognizes_trusted_external_dependency()
     print("\nAll reentrancy_edges tests passed.")

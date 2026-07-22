@@ -17,7 +17,7 @@ from slither.core.declarations import Modifier
 from core.invariants import extract_field_precise_writes, extract_field_precise_reads, get_call_events, extract_invariants
 from core.auth_detection import (
     compute_own_auth, is_reentrancy_guard, has_inline_reentrancy_guard,
-    has_state_write_after_external_call,
+    has_state_write_after_external_call, has_revert_capable_body,
     find_self_scoped_writes, find_self_scoped_asset_moves,
     find_self_scoped_liability_reductions,
 )
@@ -88,6 +88,14 @@ class FunctionNode:
     # CEI-compliant for that variable, which a co-occurrence-only
     # signal can't tell apart from a genuine violation.
     state_write_follows_external_call: bool = False
+    # True if this function's own body has a require()/assert()/
+    # if-revert node ANYWHERE — see core/auth_detection.py::
+    # has_revert_capable_body. Broader than auth_score (msg.sender-
+    # comparison specific): lets core/constraints.py::
+    # _guard_constrains_sink_state recognize a health-check guard whose
+    # condition is derived from a trusted EXTERNAL dependency (e.g. an
+    # oracle) rather than local storage or caller identity.
+    has_revert_capable_body: bool = False
     # Privileged writes reachable from THIS entry that are PROVABLY keyed
     # by the caller's own identity (core/auth_detection.py::
     # find_self_scoped_writes) — e.g. AccessControl.renounceRole's
@@ -407,6 +415,7 @@ def build_graph(
                 guard = is_reentrancy_guard(f) if is_modifier else False
                 inline_guard = has_inline_reentrancy_guard(f) if not is_modifier else False
                 write_follows_call = has_state_write_after_external_call(f)
+                revert_capable = has_revert_capable_body(f)
                 self_scoped_writes = find_self_scoped_writes(f)
                 self_scoped_asset_moves = find_self_scoped_asset_moves(f)
                 self_scoped_liability_reductions = find_self_scoped_liability_reductions(f)
@@ -456,6 +465,7 @@ def build_graph(
                     is_reentrancy_guard=guard,
                     has_inline_reentrancy_guard=inline_guard,
                     state_write_follows_external_call=write_follows_call,
+                    has_revert_capable_body=revert_capable,
                     self_scoped_write_keys=self_scoped_writes,
                     self_scoped_asset_move_functions=self_scoped_asset_moves,
                     self_scoped_liability_reduction_keys=self_scoped_liability_reductions,

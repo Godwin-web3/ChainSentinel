@@ -509,7 +509,7 @@ def _node_touches_sink_state(node, sink) -> bool:
     return bool(node_vars_lower & sink_vars_lower)
 
 
-def _guard_constrains_sink_state(node, sink) -> bool:
+def _guard_constrains_sink_state(node, sink, graph_edges=None) -> bool:
     """
     Structural health-check detection, no name matching.
     True if `node` reads at least one variable the sink writes -
@@ -526,20 +526,39 @@ def _guard_constrains_sink_state(node, sink) -> bool:
     function with no auth patterns — the require() is at the call
     site, not inside it), but it reads the same debt/collateral
     storage the sink writes.
+
+    ALSO true, independent of local storage overlap, if `node` has a
+    real revert-capable body (has_revert_capable_body) AND makes a
+    TRUSTED, non-delegation external call — a guard whose condition is
+    derived from a fixed, protocol-governed EXTERNAL dependency rather
+    than local storage. Real shape found live this session: Liquity's
+    _requireNoUnderCollateralizedTroves() reverts based on
+    troveManager.getCurrentICR(...)/priceFeed.fetchPrice() (both
+    immutable, protocol-set addresses — the same real, resolved
+    edge.trusted signal CALLBACK_SINK classification already relies on,
+    not a guess) despite never reading any of StabilityPool's OWN state
+    — invisible to the local-overlap check above, which requires
+    node.reads to intersect the sink's writes at all.
     """
     from core.invariants import root_names
     if not sink.state_writes:
         return False
+
     node_reads_lower = {v.lower() for v in root_names(getattr(node, 'reads', set()))}
     sink_vars_lower = {v.lower() for v in root_names(sink.state_writes)}
-    if not bool(node_reads_lower & sink_vars_lower):
-        return False
-    auth_score = getattr(node, 'auth_score', 0)
-    if auth_score >= 2:
-        return True
-    is_view = getattr(node, 'is_view', False)
-    if is_view:
-        return True
+    if node_reads_lower & sink_vars_lower:
+        auth_score = getattr(node, 'auth_score', 0)
+        if auth_score >= 2:
+            return True
+        if getattr(node, 'is_view', False):
+            return True
+
+    if graph_edges is not None and getattr(node, 'has_revert_capable_body', False):
+        node_id = getattr(node, 'id', None)
+        for e in graph_edges.get(node_id, []):
+            if e.is_external and e.trusted and not e.is_delegation:
+                return True
+
     return False
 
 
@@ -640,13 +659,13 @@ def _check_missing_health_check(path, nodes, graph_edges) -> ConstraintResult:
             continue
         if _node_touches_sink_state(callee, sink):
             path_has_debt_context = True
-        if _guard_constrains_sink_state(callee, sink):
+        if _guard_constrains_sink_state(callee, sink, graph_edges):
             health_check_found = True
         # One-hop lookahead: catches guard() -> _validate() -> IIngress.validate()
         if not health_check_found:
             for inner_edge in graph_edges.get(edge.dst, []):
                 inner_callee = nodes.get(inner_edge.dst)
-                if inner_callee and _guard_constrains_sink_state(inner_callee, sink):
+                if inner_callee and _guard_constrains_sink_state(inner_callee, sink, graph_edges):
                     health_check_found = True
                     break
 
@@ -676,7 +695,7 @@ def _check_missing_health_check(path, nodes, graph_edges) -> ConstraintResult:
     if not health_check_found:
         for e in graph_edges.get(path.entry, []):
             callee = nodes.get(e.dst)
-            if callee and _guard_constrains_sink_state(callee, sink):
+            if callee and _guard_constrains_sink_state(callee, sink, graph_edges):
                 health_check_found = True
                 break
 
