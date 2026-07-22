@@ -178,6 +178,51 @@ def test_self_scoped_asset_move_replaces_economic_interfaces_list():
           "stealApproved still", steal_gap[0].verdict, "| depositMine suppressed")
 
 
+def test_self_scoped_liability_reduction_replaces_missing_precision():
+    """
+    Reproduces the real repayAsset()/liquidate() ACCESS_CONTROL_GAP false
+    positive found live against Fraxlend's FraxlendPairCore this session,
+    after ECONOMIC_INTERFACES was removed: _repayAsset() reduces
+    userBorrowShares[_borrower] for an ARBITRARY _borrower (the standard
+    permissionless repayBehalf pattern), which find_self_scoped_writes
+    alone can't recognize since the beneficiary is never msg.sender.
+    Safety instead comes from the write's magnitude being the SAME root
+    value as a real payment pulled from msg.sender.
+
+    Also proves this doesn't weaken detection: badReduce() reproduces the
+    shape a naive "any self-scoped payment exists somewhere" fix would
+    wrongly suppress — a real payment from msg.sender, but for a
+    completely decoupled, caller-chosen amount (pay 1 wei, erase a real,
+    unrelated debt). Must still fire.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("LiabilityReduction.sol")
+
+    safe = nodes["LiabilityReduction.repayFor(address,uint256)"]
+    assert ("userBorrowShares", ()) in safe.self_scoped_liability_reduction_keys
+
+    dangerous = nodes["LiabilityReduction.badReduce(address,uint256,uint256)"]
+    assert dangerous.self_scoped_liability_reduction_keys == set(), (
+        "badReduce's payment amount is decoupled from the write amount — "
+        "must NOT be marked safe just because SOME payment from msg.sender exists"
+    )
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible + report.suppressed
+
+    safe_gap = [r for r in all_results if r.path.entry == safe.id and r.constraint_type == "ACCESS_CONTROL_GAP"]
+    assert not safe_gap, f"repayFor is a correlated repayBehalf pattern — ACCESS_CONTROL_GAP should not fire, got {safe_gap}"
+
+    dangerous_gap = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == dangerous.id and "ACCESS_CONTROL_GAP" in r.constraint_type
+    ]
+    assert dangerous_gap, "badReduce lets an attacker erase arbitrary debt for a decoupled amount — must still fire"
+    print("test_self_scoped_liability_reduction_replaces_missing_precision: PASS —",
+          "repayFor suppressed, badReduce still", dangerous_gap[0].verdict)
+
+
 def test_ownable2step_accept_ownership_suppressed():
     """
     Reproduces the real false positive found live this session against
@@ -210,5 +255,6 @@ if __name__ == "__main__":
     test_reentrancy_cei_suppressed_by_custom_guard()
     test_self_scoped_write_suppressed_without_weakening()
     test_self_scoped_asset_move_replaces_economic_interfaces_list()
+    test_self_scoped_liability_reduction_replaces_missing_precision()
     test_ownable2step_accept_ownership_suppressed()
     print("\nAll auth_detection tests passed.")

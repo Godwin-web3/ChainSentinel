@@ -17,6 +17,7 @@ from slither.core.declarations import Modifier
 from core.invariants import extract_field_precise_writes, extract_field_precise_reads, get_call_events, extract_invariants
 from core.auth_detection import (
     compute_own_auth, is_reentrancy_guard, find_self_scoped_writes, find_self_scoped_asset_moves,
+    find_self_scoped_liability_reductions,
 )
 from slither.slithir.operations import (
     InternalCall, HighLevelCall, LowLevelCall, SolidityCall, LibraryCall
@@ -86,6 +87,21 @@ class FunctionNode:
     # directly (found live this session). A path whose sink function id
     # is in THIS set is provably not an arbitrary-recipient asset drain.
     self_scoped_asset_move_functions: Set[str] = field(default_factory=set)
+    # Privileged writes reachable from THIS entry that are decrease-
+    # writes (x -= y) whose subtracted amount is PROVABLY the same root
+    # value as a real inbound payment from msg.sender — see
+    # core/auth_detection.py::find_self_scoped_liability_reductions.
+    # E.g. Fraxlend's repayAsset()/_repayAsset(): userBorrowShares
+    # [_borrower] -= _shares for an ARBITRARY _borrower (the standard
+    # permissionless repayBehalf pattern — repaying someone else's debt
+    # is a gift, not an attack) is safe because _shares is the same
+    # value the caller's own safeTransferFrom(msg.sender, ...) payment
+    # is computed from — decoupling them (paying 1 wei to erase a real
+    # debt) is what stays UNSAFE and must still fire. Distinct from
+    # self_scoped_write_keys, which requires the write to be keyed BY
+    # msg.sender itself; this instead requires the write's magnitude to
+    # be provably funded BY msg.sender, regardless of who benefits.
+    self_scoped_liability_reduction_keys: Set[tuple] = field(default_factory=set)
 
     # Layer 4 — graph edges (canonical IDs)
     internal_callees: List[str] = field(default_factory=list)
@@ -372,6 +388,7 @@ def build_graph(
                 guard = is_reentrancy_guard(f) if is_modifier else False
                 self_scoped_writes = find_self_scoped_writes(f)
                 self_scoped_asset_moves = find_self_scoped_asset_moves(f)
+                self_scoped_liability_reductions = find_self_scoped_liability_reductions(f)
                 auth_state = (
                     "AUTHENTICATED" if structural_auth_score >= 3 else
                     "UNKNOWN" if structural_auth_score == 2 else
@@ -418,6 +435,7 @@ def build_graph(
                     is_reentrancy_guard=guard,
                     self_scoped_write_keys=self_scoped_writes,
                     self_scoped_asset_move_functions=self_scoped_asset_moves,
+                    self_scoped_liability_reduction_keys=self_scoped_liability_reductions,
                     internal_callees=int_callees,
                     external_callees=ext_callees,
                     state_writes=state_writes,

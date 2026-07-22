@@ -360,15 +360,35 @@ def _check_access_control_gap(path, nodes, graph_edges) -> ConstraintResult:
     # (e.g. a function that also corrupts an unrelated victim's storage)
     # is deliberately excluded from self_scoped_write_keys entirely by
     # find_self_scoped_writes, so this stays conservative.
+    #
+    # Also folds in self-scoped LIABILITY REDUCTIONS (core/
+    # auth_detection.py::find_self_scoped_liability_reductions): a
+    # decrease-write (x -= y) whose subtracted amount is PROVABLY the
+    # same root value as a real inbound payment from msg.sender.
+    # Reproduces the real repayAsset()/liquidate() false positive found
+    # live against Fraxlend's FraxlendPairCore: _repayAsset() reduces
+    # userBorrowShares[_borrower] for an ARBITRARY _borrower (the
+    # standard permissionless repayBehalf pattern — repaying someone
+    # else's debt is a gift to the protocol, not an attack), which the
+    # write-keyed check above can't recognize because the beneficiary is
+    # never msg.sender. Safety instead comes from the write's magnitude
+    # being provably funded by msg.sender's own payment, computed from
+    # the same root value — a decoupled amount (e.g. paying 1 wei to
+    # erase a real, unrelated debt) is excluded from this set entirely
+    # by find_self_scoped_liability_reductions, so this stays just as
+    # conservative as the write-keyed check.
     if path.sink.category == STORAGE_CORRUPTION and path.sink.privileged_writes:
         entry_node = nodes.get(path.entry)
         self_scoped = getattr(entry_node, "self_scoped_write_keys", set()) if entry_node else set()
-        if self_scoped and path.sink.privileged_writes.issubset(self_scoped):
+        self_funded = getattr(entry_node, "self_scoped_liability_reduction_keys", set()) if entry_node else set()
+        combined = self_scoped | self_funded
+        if combined and path.sink.privileged_writes.issubset(combined):
             return _suppressed(
                 path,
                 f"All privileged writes on this path ({path.sink.evidence}) are provably "
-                f"keyed by the caller's own identity (msg.sender-bound) — an attacker can "
-                f"only ever affect their own storage, not another user's"
+                f"either keyed by the caller's own identity, or decrease-writes funded by "
+                f"a correlated payment from the caller (repayBehalf-style) — not an "
+                f"exploitable access-control gap"
             )
 
     # Self-scoped asset move: replaces name-matching against a list of
@@ -610,46 +630,35 @@ def _check_missing_health_check(path, nodes, graph_edges) -> ConstraintResult:
                     health_check_found = True
                     break
 
-    # Post-sink guard scan (Issue 5): the edge_chain walk above only
-    # inspects callees that lie ON the path to the sink. A guard that
-    # runs AFTER the sink call returns — e.g. Morpho's _isHealthy()
-    # following _accrueInterest() in liquidate() — is invisible to
-    # that walk because it is not on the path TO the sink, it is on
-    # the path AFTER the sink. Scan the entry function's IR (edges in
-    # graph_edges are extracted in source order) for callees that
-    # appear after the first edge of the path and treat a
-    # _guard_constrains_sink_state match there as a health check.
-    #
-    # We locate path.edge_chain[0] — the first call FROM path.entry,
-    # which DFS took directly from graph_edges[path.entry] — by object
-    # identity, then scan every edge after it. This is correct for
-    # both 1-hop paths (edge_chain[0] IS the sink call) and multi-hop
-    # paths (edge_chain[0] is the top-level call that transitively
-    # reaches the sink; anything after it in the entry's IR runs after
-    # the entire nested chain, including the sink, returns). Matching
-    # by identity avoids format mismatches between e.dst and
-    # sink.node_id (contract_declarer.name vs contract.name, etc.).
-    if not health_check_found and path.edge_chain:
-        first_edge = path.edge_chain[0]
-        entry_edges = graph_edges.get(path.entry, [])
-        sink_idx = next(
-            (i for i, e in enumerate(entry_edges) if e is first_edge),
-            None,
-        )
-        if sink_idx is None:
-            sink_idx = next(
-                (i for i, e in enumerate(entry_edges)
-                 if e.dst == first_edge.dst
-                 and (e.function_name or None) == (first_edge.function_name or None)
-                 and e.raw_type == first_edge.raw_type),
-                None,
-            )
-        if sink_idx is not None:
-            for e in entry_edges[sink_idx + 1:]:
-                callee = nodes.get(e.dst)
-                if callee and _guard_constrains_sink_state(callee, sink):
-                    health_check_found = True
-                    break
+    # Sibling guard scan (Issue 5, widened): the edge_chain walk above
+    # only inspects callees that lie ON the path to the sink. A guard
+    # call the entry makes as a SEPARATE, sibling statement — not part
+    # of the chain that happens to reach this particular sink — is
+    # invisible to that walk. Two real shapes, found live:
+    #   - Guard AFTER the sink call returns, e.g. Morpho's
+    #     _isHealthy() following _accrueInterest() in liquidate().
+    #   - Guard BEFORE the call that reaches the sink — the more
+    #     common checks-effects-interactions order, e.g. real Fraxlend:
+    #     `if (_isSolvent(_borrower, _exchangeRate)) revert
+    #     BorrowerSolvent();` runs BEFORE liquidate() calls
+    #     _repayAsset() — found live this session; the previous
+    #     after-only scan missed it entirely, producing a false
+    #     positive on a real, audited, currently-live protocol.
+    # A revert-capable guard ANYWHERE in the entry's own body protects
+    # the function's entire execution regardless of statement order —
+    # Solidity functions run linearly to completion or revert, there is
+    # no way for a later statement to execute if an earlier revert
+    # fired. So this scans the entry's COMPLETE own edge list, not a
+    # position-relative slice of it — still bounded by the same
+    # _guard_constrains_sink_state bar (real storage overlap with the
+    # sink's own writes, plus real view/auth evidence), just no longer
+    # missing half of where that guard could legitimately be.
+    if not health_check_found:
+        for e in graph_edges.get(path.entry, []):
+            callee = nodes.get(e.dst)
+            if callee and _guard_constrains_sink_state(callee, sink):
+                health_check_found = True
+                break
 
     if not path_has_debt_context:
         return _suppressed(path, "No storage overlap between path and sink — no debt/collateral context")

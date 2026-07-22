@@ -46,14 +46,15 @@ pipeline, which never has real IR to inspect.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from slither.slithir.operations import (
-    Assignment, Binary, HighLevelCall, Index, InternalCall, LowLevelCall,
+    Assignment, Binary, HighLevelCall, Index, InternalCall, LibraryCall, LowLevelCall,
     Member, Return, Send, SolidityCall, Transfer,
 )
 from slither.slithir.operations.binary import BinaryType
 from slither.slithir.variables.reference import ReferenceVariable
+from slither.slithir.variables.temporary import TemporaryVariable
 from slither.core.cfg.node import NodeType
 
 from core.destination_origin import resolve_variable_origin, DestinationOrigin
@@ -552,24 +553,57 @@ def _transfer_call_signature(ir) -> Optional[str]:
     from the call IR's own resolved argument types otherwise. Mirrors
     core/edges.py::_is_token_transfer_call's resolution, needed here as
     a string (not just a membership boolean) to look up argument roles.
+
+    LibraryCall is a HighLevelCall subclass (e.g. OpenZeppelin's
+    `using SafeERC20 for IERC20; ... token.safeTransferFrom(from, to,
+    amount)`) — real IR confirmed live against Fraxlend's
+    `_repayAsset`: Slither's own solidity_signature for that call is
+    `safeTransferFrom(address,address,address,uint256)`, one arg longer
+    than the literal ERC20 shape, because the library's own "self"
+    receiver (the token) is prepended as a real leading parameter. Strip
+    it so the signature matches the canonical keys in
+    _TRANSFER_FROM_ARG_INDEX/_TRANSFER_TO_ARG_INDEX the same way a
+    direct HighLevelCall would — callers must then use
+    _transfer_call_arg_offset(ir) to index into ir.arguments correctly,
+    since the arguments list itself still includes that leading token.
     """
     try:
         fn = getattr(ir, "function", None)
         if fn is not None and hasattr(fn, "solidity_signature"):
-            return fn.solidity_signature
-        fname = str(getattr(ir, "function_name", "") or "")
-        if not fname:
-            return None
-        from slither.utils.type import convert_type_for_solidity_signature_to_string
-        arg_types = []
-        for a in (getattr(ir, "arguments", None) or []):
-            t = getattr(a, "type", None)
-            if t is None:
+            sig = fn.solidity_signature
+        else:
+            fname = str(getattr(ir, "function_name", "") or "")
+            if not fname:
                 return None
-            arg_types.append(convert_type_for_solidity_signature_to_string(t))
-        return f"{fname}({','.join(arg_types)})"
+            from slither.utils.type import convert_type_for_solidity_signature_to_string
+            arg_types = []
+            for a in (getattr(ir, "arguments", None) or []):
+                t = getattr(a, "type", None)
+                if t is None:
+                    return None
+                arg_types.append(convert_type_for_solidity_signature_to_string(t))
+            sig = f"{fname}({','.join(arg_types)})"
+
+        if isinstance(ir, LibraryCall):
+            open_paren = sig.index("(")
+            fname, arg_str = sig[:open_paren], sig[open_paren + 1:-1]
+            arg_types = arg_str.split(",") if arg_str else []
+            if arg_types:
+                sig = f"{fname}({','.join(arg_types[1:])})"
+        return sig
     except Exception:
         return None
+
+
+def _transfer_call_arg_offset(ir) -> int:
+    """
+    Index offset into ir.arguments for _TRANSFER_FROM_ARG_INDEX/
+    _TRANSFER_TO_ARG_INDEX lookups. A LibraryCall's arguments list keeps
+    the leading "self" token receiver that _transfer_call_signature
+    strips from the matched signature, so an index resolved against
+    that stripped signature needs +1 to land on the real from/to arg.
+    """
+    return 1 if isinstance(ir, LibraryCall) else 0
 
 
 def find_self_scoped_asset_moves(
@@ -642,6 +676,7 @@ def _self_scoped_and_unsafe_asset_moves(f, max_depth: int, _visited: set, known_
                     idx = _TRANSFER_TO_ARG_INDEX[sig]
                 else:
                     continue
+                idx += _transfer_call_arg_offset(ir)
                 args = list(getattr(ir, "arguments", None) or [])
                 if idx >= len(args):
                     continue
@@ -665,6 +700,189 @@ def _self_scoped_and_unsafe_asset_moves(f, max_depth: int, _visited: set, known_
                     self_scoped |= nested_scoped
                     unsafe |= nested_unsafe
     return self_scoped, unsafe
+
+
+def _resolve_amount_roots(
+    var, f, known_amount_origin: Dict[int, Set[int]], max_depth: int = 5, _seen: Optional[set] = None
+) -> Set[int]:
+    """
+    Backward-slice `var` within f to the id()s of ALL its possible root
+    identities — unlike core/edges.py::_trace_temp_to_source's single
+    deterministic "last read" walk (which exists for a different,
+    single-answer purpose elsewhere), this explores EVERY read at each
+    defining-op step, bounded by max_depth, so a value derived through
+    a pure helper call with several arguments (e.g. real Fraxlend's
+    `_totalBorrow.toAmount(_shares, true)`) can still be correlated back
+    to `_shares` even though it isn't the only, or the last, argument.
+
+    known_amount_origin maps id(some variable) -> an ALREADY-RESOLVED
+    set of root ids, established at whatever internal-call site bound
+    it (see _amount_origins_for_call) — this is what gives a value a
+    stable identity comparable across function boundaries: real
+    Fraxlend's `_repayAsset(_totalBorrow, _amountToRepay.toUint128(),
+    _shares.toUint128(), msg.sender, _borrower)` passes two SEPARATE
+    parameters (`_amountToRepay`, `_shares`) that were computed TOGETHER
+    one call frame up (`_amountToRepay = _totalBorrow.toAmount(_shares,
+    true)`) — without crossing that call boundary, _repayAsset's own
+    body has no way to know they're related at all.
+    """
+    if _seen is None:
+        _seen = set()
+    vid = id(var)
+    if vid in _seen or max_depth <= 0:
+        return {vid}
+    _seen.add(vid)
+
+    resolved = _follow_reference(var)
+    rid = id(resolved)
+
+    if rid in known_amount_origin:
+        return known_amount_origin[rid]
+
+    # A named return variable (e.g. real Fraxlend's `returns (uint256
+    # _amountToRepay)`) is a LocalVariable, not a TemporaryVariable, but
+    # still has its own defining Assignment (`_amountToRepay :=
+    # <libraryCall result>`) that needs tracing through — only a
+    # PARAMETER is a genuine root with nothing further to trace (it's
+    # an input, not a computed value).
+    from slither.core.variables.local_variable import LocalVariable
+    is_traceable_local = isinstance(resolved, LocalVariable) and not getattr(resolved, "is_parameter", False)
+    if not (isinstance(resolved, TemporaryVariable) or is_traceable_local):
+        return {rid}
+
+    defining_op = _find_defining_op(resolved, f)
+    if defining_op is None:
+        return {rid}
+    reads = list(getattr(defining_op, "read", []) or [])
+    if not reads:
+        return {rid}
+
+    roots: Set[int] = set()
+    for r in reads:
+        roots |= _resolve_amount_roots(r, f, known_amount_origin, max_depth - 1, _seen)
+    return roots
+
+
+def _amount_origins_for_call(call_ir, caller_f, caller_known_amount_origin: Dict[int, Set[int]], callee) -> Dict[int, Set[int]]:
+    """
+    For an InternalCall, resolve each real argument's root ids in the
+    CALLER's own context (honoring the caller's own known_amount_origin
+    bindings), and return id(callee_param) -> that resolved root-id
+    set. Positional only — Solidity internal calls are positional.
+    """
+    try:
+        args = list(getattr(call_ir, "arguments", None) or [])
+        params = list(getattr(callee, "parameters", None) or [])
+    except Exception:
+        return {}
+    out: Dict[int, Set[int]] = {}
+    for param, arg in zip(params, args):
+        out[id(param)] = _resolve_amount_roots(arg, caller_f, caller_known_amount_origin)
+    return out
+
+
+def find_self_scoped_liability_reductions(
+    f,
+    max_depth: int = 3,
+    _visited: Optional[set] = None,
+    known_msg_sender: frozenset = frozenset(),
+    known_amount_origin: Optional[Dict[int, Set[int]]] = None,
+) -> Set[tuple]:
+    """
+    Walk f's own body and (bounded, parameter- AND amount-binding-aware)
+    recursion into internal calls, collecting state-write keys (same
+    format as find_self_scoped_writes / Sink.privileged_writes) for
+    writes that DECREASE a privileged value by an amount PROVABLY tied
+    to a real, self-scoped payment the caller is simultaneously making
+    into the protocol — the real shape behind Compound/Fraxlend-style
+    permissionless repayBehalf()/repayAsset(): anyone can pay down an
+    ARBITRARY borrower's debt, safely, because (a) the write only ever
+    DECREASES what that borrower owes — strictly better for them, never
+    worse — and (b) the decrease is bounded by a real payment out of the
+    caller's own pocket (found live: FraxlendPairCore._repayAsset writes
+    `userBorrowShares[_borrower] -= _shares` and, in the SAME call,
+    pulls `_amountToRepay` — derived from that SAME `_shares` value one
+    call frame up, in repayAsset() — via `assetContract.safeTransferFrom
+    (_payer, address(this), _amountToRepay)` with `_payer == msg.sender`).
+
+    Deliberately does NOT treat "any decrease" as safe on its own — an
+    unconditional decrease with no corresponding real payment (e.g.
+    `collateralBalance[victim] -= amount` with no transferFrom in
+    sight) is a genuine attack on an ASSET-shaped variable (draining a
+    claim the victim could otherwise withdraw), structurally
+    indistinguishable from a safe liability decrease by "subtraction"
+    alone. Requiring the decrease amount to trace back to the SAME root
+    as a real, self-scoped inbound payment is what rules that out: an
+    attacker can't fake having paid real value out of their own pocket.
+    """
+    if known_amount_origin is None:
+        known_amount_origin = {}
+    decreases, payment_roots = _collect_liability_reduction_evidence(
+        f, max_depth, _visited if _visited is not None else set(), known_msg_sender, known_amount_origin
+    )
+    return {write_key for write_key, roots in decreases if roots & payment_roots}
+
+
+def _collect_liability_reduction_evidence(
+    f, max_depth: int, _visited: set, known_msg_sender: frozenset, known_amount_origin: Dict[int, Set[int]],
+) -> Tuple[List[Tuple[tuple, Set[int]]], Set[int]]:
+    """Returns (decrease_writes_with_roots, payment_amount_roots) — see find_self_scoped_liability_reductions."""
+    from core.invariants import get_node_write
+
+    fid = id(f)
+    if fid in _visited:
+        return [], set()
+    _visited.add(fid)
+
+    try:
+        nodes = list(getattr(f, "nodes", []) or [])
+    except Exception:
+        return [], set()
+
+    known_msg_sender = known_msg_sender | _params_proven_msg_sender(f)
+
+    decreases: List[Tuple[tuple, Set[int]]] = []
+    payment_roots: Set[int] = set()
+
+    for node in nodes:
+        for ir in node.irs:
+            if (
+                isinstance(ir, Binary)
+                and ir.type == BinaryType.SUBTRACTION
+                and isinstance(getattr(ir, "lvalue", None), ReferenceVariable)
+            ):
+                write_key = get_node_write(node)
+                if write_key is not None:
+                    roots = _resolve_amount_roots(ir.variable_right, f, known_amount_origin)
+                    decreases.append((write_key, roots))
+            elif isinstance(ir, HighLevelCall):
+                sig = _transfer_call_signature(ir)
+                if sig not in _TRANSFER_FROM_ARG_INDEX:
+                    continue
+                args = list(getattr(ir, "arguments", None) or [])
+                from_idx = _TRANSFER_FROM_ARG_INDEX[sig] + _transfer_call_arg_offset(ir)
+                if from_idx >= len(args):
+                    continue
+                from_origin, _ = _resolve_operand(args[from_idx], f, known_msg_sender)
+                if not _is_msg_sender_origin(from_origin):
+                    continue
+                # amount is always the LAST argument across every
+                # signature in _TRANSFER_FROM_ARG_INDEX.
+                amount_arg = args[-1]
+                payment_roots |= _resolve_amount_roots(amount_arg, f, known_amount_origin)
+
+    if max_depth > 0:
+        for node in nodes:
+            for ir in node.irs:
+                if isinstance(ir, InternalCall) and getattr(ir, "function", None) is not None:
+                    callee_known_sender = _msg_sender_params_for_call(ir, f, known_msg_sender, ir.function)
+                    callee_known_amount = _amount_origins_for_call(ir, f, known_amount_origin, ir.function)
+                    nested_decreases, nested_payment_roots = _collect_liability_reduction_evidence(
+                        ir.function, max_depth - 1, _visited, callee_known_sender, callee_known_amount
+                    )
+                    decreases.extend(nested_decreases)
+                    payment_roots |= nested_payment_roots
+    return decreases, payment_roots
 
 
 def is_reentrancy_guard(modifier_obj) -> bool:
