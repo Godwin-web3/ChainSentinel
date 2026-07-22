@@ -36,6 +36,30 @@ def test_custom_named_auth_modifier_detected():
     print("test_custom_named_auth_modifier_detected: PASS —", fn.auth_score, fn.auth_state)
 
 
+def test_real_access_control_struct_shape_detected():
+    """
+    Reproduces the real OpenZeppelin AccessControl shape found live
+    against Aave's ACLManager this session — struct-wrapped role storage
+    (Index -> Member -> Index, not a flat nested mapping) plus
+    _msgSender() indirection where the checked value is a PARAMETER only
+    provably bound to msg.sender by tracing the call site
+    (onlyRole -> _checkRole(role, _msgSender()) -> hasRole(role, account)).
+    Before the fix: auth_score was 0 everywhere in this exact shape.
+    """
+    nodes, *_ = _build("RealAccessControlShape.sol")
+    grant = nodes["RealAccessControlShape.grantRole(bytes32,address)"]
+    assert grant.auth_score >= 3, f"expected structural auth evidence via onlyRole, got {grant.auth_score}"
+    assert grant.auth_state == "AUTHENTICATED"
+
+    only_role = nodes["RealAccessControlShape.onlyRole(bytes32)"]
+    assert only_role.auth_score >= 3
+    assert only_role.structural_auth_var and "_roles" in only_role.structural_auth_var
+
+    set_param = nodes["RealAccessControlShape.setCriticalParam(uint256)"]
+    assert set_param.auth_score >= 3, "same onlyRole modifier should gate any function it's attached to"
+    print("test_real_access_control_struct_shape_detected: PASS —", grant.auth_score, only_role.structural_auth_var)
+
+
 def test_access_control_role_mapping_detected():
     nodes, *_ = _build("AccessControlRoles.sol")
     fn = nodes["AccessControlRoles.setCriticalParam(uint256)"]
@@ -95,6 +119,7 @@ def test_ownable2step_accept_ownership_suppressed():
 
 if __name__ == "__main__":
     test_custom_named_auth_modifier_detected()
+    test_real_access_control_struct_shape_detected()
     test_access_control_role_mapping_detected()
     test_custom_named_reentrancy_guard_detected()
     test_reentrancy_cei_suppressed_by_custom_guard()
