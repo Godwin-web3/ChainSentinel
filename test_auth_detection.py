@@ -132,6 +132,52 @@ def test_self_scoped_write_suppressed_without_weakening():
           "setOperatorForSelf suppressed, corruptOperator still", dangerous_gap[0].verdict)
 
 
+def test_self_scoped_asset_move_replaces_economic_interfaces_list():
+    """
+    Reproduces the real Liquity StabilityPool.withdrawFromSP() false
+    positive found live this session (ECONOMIC_INTERFACES' exact-match
+    name list didn't include "withdrawfromsp", only "withdraw") and
+    proves the structural replacement (find_self_scoped_asset_moves)
+    doesn't weaken detection: stealApproved (pulls an arbitrary victim's
+    approved tokens to an attacker, despite also checking an unrelated
+    caller==msg.sender-shaped condition in drainTo's sibling) must still
+    fire, while depositMine (caller only ever moves their own approved
+    funds in) is suppressed.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("BadAssetMove.sol")
+
+    # Unit-level: direct ETH .call{value} cases (single-hop, no
+    # intermediate function — enumerate_paths doesn't synthesize a path
+    # for these, a pre-existing, unrelated limitation) still get the
+    # right structural answer directly from the detector.
+    drain_to = nodes["BadAssetMove.drainTo(address,address)"]
+    claim_gain = nodes["BadAssetMove.claimGain()"]
+    assert drain_to.self_scoped_asset_move_functions == set(), (
+        "drainTo sends ETH to an arbitrary recipient parameter — must NOT be self-scoped"
+    )
+    assert "BadAssetMove.claimGain()" in claim_gain.self_scoped_asset_move_functions
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible + report.suppressed
+
+    steal_gap = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == "BadAssetMove.stealApproved(address,address,uint256)"
+        and "ACCESS_CONTROL_GAP" in r.constraint_type
+    ]
+    assert steal_gap, "stealApproved pulls an arbitrary victim's approved funds — must still fire"
+
+    deposit_gap = [
+        r for r in all_results
+        if r.path.entry == "BadAssetMove.depositMine(uint256)" and r.constraint_type == "ACCESS_CONTROL_GAP"
+    ]
+    assert not deposit_gap, f"depositMine only ever moves the caller's own approved funds — must be suppressed, got {deposit_gap}"
+    print("test_self_scoped_asset_move_replaces_economic_interfaces_list: PASS —",
+          "stealApproved still", steal_gap[0].verdict, "| depositMine suppressed")
+
+
 def test_ownable2step_accept_ownership_suppressed():
     """
     Reproduces the real false positive found live this session against
@@ -163,5 +209,6 @@ if __name__ == "__main__":
     test_custom_named_reentrancy_guard_detected()
     test_reentrancy_cei_suppressed_by_custom_guard()
     test_self_scoped_write_suppressed_without_weakening()
+    test_self_scoped_asset_move_replaces_economic_interfaces_list()
     test_ownable2step_accept_ownership_suppressed()
     print("\nAll auth_detection tests passed.")

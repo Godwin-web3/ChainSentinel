@@ -48,7 +48,10 @@ pipeline, which never has real IR to inspect.
 from dataclasses import dataclass
 from typing import Optional, Set
 
-from slither.slithir.operations import Assignment, Binary, Index, Member, InternalCall, Return, SolidityCall
+from slither.slithir.operations import (
+    Assignment, Binary, HighLevelCall, Index, InternalCall, LowLevelCall,
+    Member, Return, Send, SolidityCall, Transfer,
+)
 from slither.slithir.operations.binary import BinaryType
 from slither.slithir.variables.reference import ReferenceVariable
 from slither.core.cfg.node import NodeType
@@ -59,6 +62,7 @@ from core.edges import (
     _is_state_variable,
     _is_storage_mapping,
     _find_defining_op,
+    _func_canonical_id,
     _node_can_revert,
 )
 
@@ -511,6 +515,151 @@ def _self_scoped_and_unsafe_writes(f, max_depth: int, _visited: set, known_msg_s
                 if isinstance(ir, InternalCall) and getattr(ir, "function", None) is not None:
                     callee_known = _msg_sender_params_for_call(ir, f, known_msg_sender, ir.function)
                     nested_scoped, nested_unsafe = _self_scoped_and_unsafe_writes(
+                        ir.function, max_depth - 1, _visited, callee_known
+                    )
+                    self_scoped |= nested_scoped
+                    unsafe |= nested_unsafe
+    return self_scoped, unsafe
+
+
+# Real ERC20/721/1155 transfer-shaped signatures, split by which
+# argument position is the fund SOURCE ("from" — safe when it's
+# msg.sender: the caller is only ever moving funds they've already
+# approved, exactly the guarantee ERC20's own allowance mechanism
+# already enforces) vs the fund DESTINATION ("to" — safe when it's
+# msg.sender: the caller can only ever redirect funds back to
+# themselves, never to an arbitrary address). Same canonical signature
+# set as core/edges.py::TOKEN_TRANSFER_SIGNATURES, split with role
+# information that module doesn't need for its own (sink-classification)
+# purpose.
+_TRANSFER_FROM_ARG_INDEX = {
+    "transferFrom(address,address,uint256)": 0,
+    "safeTransferFrom(address,address,uint256)": 0,
+    "safeTransferFrom(address,address,uint256,bytes)": 0,
+    "safeTransferFrom(address,address,uint256,uint256,bytes)": 0,
+    "safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)": 0,
+}
+_TRANSFER_TO_ARG_INDEX = {
+    "transfer(address,uint256)": 0,
+    "safeTransfer(address,uint256)": 0,
+}
+
+
+def _transfer_call_signature(ir) -> Optional[str]:
+    """
+    Real canonical signature for a HighLevelCall — the resolved callee's
+    own solidity_signature when statically known, or one reconstructed
+    from the call IR's own resolved argument types otherwise. Mirrors
+    core/edges.py::_is_token_transfer_call's resolution, needed here as
+    a string (not just a membership boolean) to look up argument roles.
+    """
+    try:
+        fn = getattr(ir, "function", None)
+        if fn is not None and hasattr(fn, "solidity_signature"):
+            return fn.solidity_signature
+        fname = str(getattr(ir, "function_name", "") or "")
+        if not fname:
+            return None
+        from slither.utils.type import convert_type_for_solidity_signature_to_string
+        arg_types = []
+        for a in (getattr(ir, "arguments", None) or []):
+            t = getattr(a, "type", None)
+            if t is None:
+                return None
+            arg_types.append(convert_type_for_solidity_signature_to_string(t))
+        return f"{fname}({','.join(arg_types)})"
+    except Exception:
+        return None
+
+
+def find_self_scoped_asset_moves(
+    f, max_depth: int = 3, _visited: Optional[set] = None, known_msg_sender: frozenset = frozenset()
+) -> Set[str]:
+    """
+    Walk f's own body and (bounded, parameter-binding-aware) recursion
+    into internal calls, collecting the canonical_ids of REACHABLE
+    functions whose asset-moving operations (real ERC20/721/1155
+    transfer-shaped calls, or ETH Send/Transfer/lowlevel .call{value})
+    are ALL provably safe without any auth gate:
+      - transferFrom(from, ...)-shaped: `from` resolves to msg.sender.
+        The caller can only ever move funds they've already approved —
+        that guarantee is ERC20's own, the protocol needs no additional
+        gate (this is the real shape behind Morpho-style permissionless
+        supply()/deposit() functions).
+      - transfer(to, ...)-shaped / ETH send: `to` resolves to
+        msg.sender. The caller can only ever receive funds back to
+        themselves, never redirect them to an arbitrary address (the
+        real shape behind Liquity's withdrawFromSP() ->
+        _sendETHGainToDepositor(), found live this session — the ETH
+        destination is msg.sender directly, no auth gate needed or
+        present in the real, audited contract).
+
+    Same conservative principle as find_self_scoped_writes: a function
+    that ALSO makes a single unsafe move (e.g. transferFrom(victim, ...)
+    or transfer(arbitraryRecipient, ...)) is excluded entirely, even if
+    it makes other safe moves — self_scoped - unsafe, subtracted once at
+    the public entry point. A function with NO asset-moving operations
+    at all reachable from it is never included (nothing to prove safe).
+    """
+    self_scoped, unsafe = _self_scoped_and_unsafe_asset_moves(
+        f, max_depth, _visited if _visited is not None else set(), known_msg_sender
+    )
+    return self_scoped - unsafe
+
+
+def _self_scoped_and_unsafe_asset_moves(f, max_depth: int, _visited: set, known_msg_sender: frozenset):
+    """Returns (self_scoped_function_ids, unsafe_function_ids) — see find_self_scoped_asset_moves."""
+    fid = id(f)
+    if fid in _visited:
+        return set(), set()
+    _visited.add(fid)
+
+    try:
+        nodes = list(getattr(f, "nodes", []) or [])
+    except Exception:
+        return set(), set()
+
+    known_msg_sender = known_msg_sender | _params_proven_msg_sender(f)
+    own_cid = _func_canonical_id(f)
+
+    self_scoped: Set[str] = set()
+    unsafe: Set[str] = set()
+
+    def _record(is_safe: bool) -> None:
+        if own_cid is None:
+            return
+        (self_scoped if is_safe else unsafe).add(own_cid)
+
+    for node in nodes:
+        for ir in node.irs:
+            if isinstance(ir, HighLevelCall):
+                sig = _transfer_call_signature(ir)
+                if sig is None:
+                    continue
+                if sig in _TRANSFER_FROM_ARG_INDEX:
+                    idx = _TRANSFER_FROM_ARG_INDEX[sig]
+                elif sig in _TRANSFER_TO_ARG_INDEX:
+                    idx = _TRANSFER_TO_ARG_INDEX[sig]
+                else:
+                    continue
+                args = list(getattr(ir, "arguments", None) or [])
+                if idx >= len(args):
+                    continue
+                origin, _ = _resolve_operand(args[idx], f, known_msg_sender)
+                _record(_is_msg_sender_origin(origin))
+            elif isinstance(ir, (LowLevelCall, Send, Transfer)):
+                dest = getattr(ir, "destination", None)
+                if dest is None:
+                    continue
+                origin, _ = _resolve_operand(dest, f, known_msg_sender)
+                _record(_is_msg_sender_origin(origin))
+
+    if max_depth > 0:
+        for node in nodes:
+            for ir in node.irs:
+                if isinstance(ir, InternalCall) and getattr(ir, "function", None) is not None:
+                    callee_known = _msg_sender_params_for_call(ir, f, known_msg_sender, ir.function)
+                    nested_scoped, nested_unsafe = _self_scoped_and_unsafe_asset_moves(
                         ir.function, max_depth - 1, _visited, callee_known
                     )
                     self_scoped |= nested_scoped

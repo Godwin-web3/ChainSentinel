@@ -45,22 +45,14 @@ VERDICT_SCORE = {
     SUPPRESSED: 0,
 }
 
-# ── Known safe patterns (suppress these) ─────────────────────────
-# Functions that are intentionally open and move assets by design.
-# An AUTH_GAP on these is expected, not exploitable.
-
-ECONOMIC_INTERFACES = {
-    "swap", "flash", "collect", "mint", "burn",
-    "transfer", "transferfrom", "approve",
-    "deposit", "withdraw", "redeem",
-    "addliquidity", "removeliquidity",
-    "execute", "multicall",
-    # Morpho / Blue-style permissionless economic interfaces.
-    # Additive only — existing entries preserved for Altitude.fi
-    # and Exactly Protocol which depend on them.
-    "supply", "borrow", "repay", "liquidate",
-    "supplycollateral", "withdrawcollateral", "flashloan",
-}
+# Whether an unauthenticated path to an asset-moving sink is "expected,
+# not exploitable" is decided structurally — see core/auth_detection.py
+# ::find_self_scoped_asset_moves — never by matching the entry
+# function's name against a list of common DeFi verb names. A function
+# named `swap`/`deposit`/`supply`/etc. gets no special treatment; a
+# custom-named function with the same real proof (moves only funds the
+# caller already approved, or sends value only back to the caller) is
+# treated identically.
 
 # Reentrancy guards are detected structurally — see
 # core/auth_detection.py::is_reentrancy_guard, computed once per modifier
@@ -346,16 +338,6 @@ def _check_access_control_gap(path, nodes, graph_edges) -> ConstraintResult:
     if "AUTH_GAP" not in flags:
         return _suppressed(path, "No auth gap on path")
 
-    entry_name = path.entry.split(".")[-1].split("(")[0].lower()
-
-    # Suppress if entrypoint is a known economic interface
-    if entry_name in ECONOMIC_INTERFACES:
-        if path.sink.category not in (STORAGE_CORRUPTION, DELEGATION_SINK, SELFDESTRUCT_SINK):
-            return _suppressed(
-                path,
-                f"{entry_name} is an economic interface — AUTH_GAP expected"
-            )
-
     # Deep auth check: walk call graph up to 3 hops before issuing verdict
     # Catches borrow() -> _validateBorrow() -> IIngress.validateBorrow()
     if _entry_has_direct_auth(path.entry, nodes):
@@ -387,6 +369,46 @@ def _check_access_control_gap(path, nodes, graph_edges) -> ConstraintResult:
                 f"All privileged writes on this path ({path.sink.evidence}) are provably "
                 f"keyed by the caller's own identity (msg.sender-bound) — an attacker can "
                 f"only ever affect their own storage, not another user's"
+            )
+
+    # Self-scoped asset move: replaces name-matching against a list of
+    # common DeFi verbs (swap/deposit/withdraw/supply/...) — see
+    # core/auth_detection.py::find_self_scoped_asset_moves. The SINK
+    # function's own asset-moving operations (reached from this entry,
+    # with real parameter-binding carried across the call) are ALL
+    # provably safe: either every transferFrom's `from` is msg.sender
+    # (the caller only ever spends funds they've already approved — the
+    # real shape behind permissionless supply()/deposit()), or every
+    # transfer()/ETH send's `to` is msg.sender (the caller only ever
+    # receives value back to themselves — the real shape behind
+    # Liquity's withdrawFromSP() -> _sendETHGainToDepositor(), found
+    # live this session). A sink function with even one unsafe move
+    # (an arbitrary-recipient transfer, or pulling an unrelated victim's
+    # approved funds) is excluded from self_scoped_asset_move_functions
+    # entirely by find_self_scoped_asset_moves, so this stays
+    # conservative — it does NOT cover AMM-invariant-based safety
+    # (swap/addLiquidity/flashloan), which is a genuinely different,
+    # harder question this check makes no claim about.
+    if path.sink.category == ASSET_DRAIN:
+        entry_node = nodes.get(path.entry)
+        safe_functions = getattr(entry_node, "self_scoped_asset_move_functions", set()) if entry_node else set()
+        # Two id shapes can carry the proof: path.sink.node_id when the
+        # sink IS a real, reachable function (e.g. Liquity's
+        # _sendETHGainToDepositor, which itself makes the low-level ETH
+        # call), or path.entry when the sink is a SYNTHETIC terminal
+        # label for an unresolved external interface call
+        # (core/paths.py's "external.<dest>.<fname>" — e.g. an
+        # interface-typed `token.transferFrom(...)` with no concrete
+        # implementation compiled in this unit, which can never match a
+        # real function id) — there, the proof lives on whichever real
+        # function's own body directly made that call, aggregated onto
+        # its own canonical_id by find_self_scoped_asset_moves.
+        if path.sink.node_id in safe_functions or path.entry in safe_functions:
+            return _suppressed(
+                path,
+                f"The asset movement at {path.sink.node_id} is provably self-scoped to the "
+                f"caller's own identity (msg.sender-bound source or destination) — an attacker "
+                f"can only ever move their own funds, not another user's"
             )
 
     # High confidence: unprotected path to privileged sink
