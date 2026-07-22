@@ -171,14 +171,25 @@ def run_slither(resolved: dict) -> dict:
 
     # --via-ir --optimize only supported in solc >= 0.8.13
     try:
-        major, minor, patch = (int(x) for x in solc_version.split(".")[:3])
-        use_ir = (major, minor) >= (0, 8) and patch >= 13
+        version_parts = tuple(int(x) for x in solc_version.split(".")[:3])
+        major, minor, patch = version_parts
     except Exception:
-        use_ir = False
+        version_parts = None
+        major = minor = patch = 0
+    use_ir = version_parts is not None and (major, minor) >= (0, 8) and patch >= 13
     solc_extra = " --via-ir --optimize" if use_ir else ""
-    cmd = ["slither", filepath, "--solc", "solc-wrapper",
-           "--solc-args", f"--allow-paths {project_root}{solc_extra}",
-           "--json", "-"]
+
+    # --allow-paths itself doesn't exist before solc 0.5.0 — passing it to
+    # older compilers doesn't get ignored, it's a hard "unrecognised option"
+    # compile error, which fails the ENTIRE run (no findings, no graph —
+    # graph analysis is gated on this call succeeding). Found live: solc
+    # 0.4.10 (Parity's 2017 WalletLibrary) crashed with exactly this,
+    # silently, for every historically-old contract.
+    supports_allow_paths = version_parts is not None and (major, minor) >= (0, 5)
+    solc_args = f"--allow-paths {project_root}{solc_extra}" if supports_allow_paths else solc_extra.strip()
+    cmd = ["slither", filepath, "--solc", "solc-wrapper", "--json", "-"]
+    if solc_args:
+        cmd += ["--solc-args", solc_args]
     if not _has_local_foundry:
         cmd.append("--foundry-ignore")
     if remappings:

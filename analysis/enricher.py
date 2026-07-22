@@ -12,7 +12,14 @@ _CACHE_DIR = os.path.expanduser("~/.chainsentinel-cache/printers")
 def _cache_key(resolved: dict) -> str:
     addr = resolved.get("address", "unknown").lower()
     chain = str(resolved.get("chain_id", "1"))
-    bytecode = resolved.get("bytecode", "")
+    # .get(..., "") only falls back for a MISSING key — a self-destructed
+    # but still-verified contract has bytecode explicitly set to None
+    # (not absent), which .get()'s default doesn't catch, and None.encode()
+    # crashes. Found live on Parity's WalletLibrary (self-destructed 2017,
+    # source still verified) — the crash here propagated all the way up
+    # through run_enricher() into run_slither()'s exception handler,
+    # discarding an already-successful 91-finding Slither run entirely.
+    bytecode = resolved.get("bytecode") or ""
     bhash = hashlib.md5(bytecode.encode()).hexdigest()[:8]
     return f"{chain}_{addr}_{bhash}"
 
@@ -343,18 +350,25 @@ def run_enricher(resolved: dict, project_root: str, entry_file: str, solc_versio
 
     # Match solc args exactly with slither_runner.py
     try:
-        major, minor, patch = (int(x) for x in solc_version.split(".")[:3])
-        use_ir = (major, minor) >= (0, 8) and patch >= 13
+        version_parts = tuple(int(x) for x in solc_version.split(".")[:3])
+        major, minor, patch = version_parts
     except Exception:
-        use_ir = False
+        version_parts = None
+        major = minor = patch = 0
+    use_ir = version_parts is not None and (major, minor) >= (0, 8) and patch >= 13
     solc_extra = " --via-ir --optimize" if use_ir else ""
+
+    # --allow-paths doesn't exist before solc 0.5.0 — see slither_runner.py
+    supports_allow_paths = version_parts is not None and (major, minor) >= (0, 5)
+    solc_args = f"--allow-paths {project_root}{solc_extra}" if supports_allow_paths else solc_extra.strip()
 
     remappings = resolved.get("remappings", [])
     base_cmd = [
         "slither", entry_rel,
         "--solc", "solc-wrapper",
-        "--solc-args", f"--allow-paths {project_root}{solc_extra}",
     ]
+    if solc_args:
+        base_cmd += ["--solc-args", solc_args]
     base_cmd += ["--compile-force-framework", _detect_framework(project_root)]
     if remappings:
         base_cmd += ["--solc-remaps", " ".join(remappings[:50])]
