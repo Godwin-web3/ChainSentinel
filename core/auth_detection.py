@@ -192,6 +192,61 @@ def _direct_comparison_in_node(node, f, known_msg_sender: frozenset = frozenset(
     return _direct_comparison_ir(node, f, known_msg_sender)
 
 
+def _external_view_comparison_ir(node, f, known_msg_sender: frozenset = frozenset()) -> Optional[AuthFinding]:
+    """
+    A Binary EQUAL/NOT_EQUAL comparing msg.sender/tx.origin against the
+    return value of an EXTERNAL, read-only (view/pure) call whose own
+    destination resolves to a fixed origin (state variable/immutable,
+    never caller-controlled) — the real Uniswap V3 onlyFactoryOwner
+    shape, found live this session:
+        require(msg.sender == IUniswapV3Factory(factory).owner());
+    _direct_comparison_ir alone can't see this: resolve_variable_origin
+    correctly stops at RETURN_VALUE for any call in general (a random
+    function's return could be attacker-influenced through calldata it
+    reads), but here the CALL DESTINATION itself is fixed and the call
+    is view-only (cannot have side effects) — the same trust basis
+    _FIXED_ORIGINS already grants a plain state-variable read, just one
+    real external hop further. Distinct from _resolve_operand's
+    _msgSender()-unwrap (which verifies an INTERNAL callee's own body,
+    something we can actually inspect) — this is for an EXTERNAL
+    interface call whose implementation can never be inspected at all;
+    trust comes from the destination being fixed and the call being
+    provably side-effect-free, not from reasoning about the callee's
+    own logic.
+    """
+    for ir in node.irs:
+        if not isinstance(ir, Binary) or ir.type not in (BinaryType.EQUAL, BinaryType.NOT_EQUAL):
+            continue
+        left_origin, _ = _resolve_operand(ir.variable_left, f, known_msg_sender)
+        right_origin, _ = _resolve_operand(ir.variable_right, f, known_msg_sender)
+        if _is_msg_sender_origin(left_origin):
+            call_var = ir.variable_right
+        elif _is_msg_sender_origin(right_origin):
+            call_var = ir.variable_left
+        else:
+            continue
+
+        call_ir = _find_defining_op(call_var, f)
+        if not isinstance(call_ir, HighLevelCall):
+            continue
+        callee = getattr(call_ir, "function", None)
+        if not (getattr(callee, "view", False) or getattr(callee, "pure", False)):
+            continue
+        dest = getattr(call_ir, "destination", None)
+        if dest is None:
+            continue
+        dest_origin, dest_var = resolve_variable_origin(dest, f)
+        if dest_origin in _FIXED_ORIGINS:
+            return AuthFinding(score=3, evidence_type="external_view_comparison", matched_state_var=str(dest_var))
+    return None
+
+
+def _external_view_comparison_in_node(node, f, known_msg_sender: frozenset = frozenset()) -> Optional[AuthFinding]:
+    if not (node.type == NodeType.IF or _node_can_revert(node)):
+        return None
+    return _external_view_comparison_ir(node, f, known_msg_sender)
+
+
 def _resolve_mapping_base(var, f, max_depth: int = 6):
     """
     Backward-slice a mapping-lookup base (possibly through nested
@@ -278,6 +333,9 @@ def _evidence_anywhere_in_body(f, max_depth: int, _visited: set, known_msg_sende
         finding = _role_mapping_ir(node, f, known_msg_sender)
         if finding is not None:
             return finding
+        finding = _external_view_comparison_ir(node, f, known_msg_sender)
+        if finding is not None:
+            return finding
 
     if max_depth <= 0:
         return None
@@ -320,6 +378,9 @@ def compute_own_auth(
         if finding is not None:
             return finding
         finding = _role_mapping_in_node(node, f, known_msg_sender)
+        if finding is not None:
+            return finding
+        finding = _external_view_comparison_in_node(node, f, known_msg_sender)
         if finding is not None:
             return finding
 

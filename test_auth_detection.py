@@ -68,6 +68,42 @@ def test_access_control_role_mapping_detected():
     print("test_access_control_role_mapping_detected: PASS —", fn.auth_score, fn.auth_state)
 
 
+def test_external_view_comparison_auth_detected():
+    """
+    Reproduces the real Uniswap V3 onlyFactoryOwner() false positive
+    found live this session: require(msg.sender ==
+    IUniswapV3Factory(factory).owner()) compares msg.sender against the
+    RETURN VALUE of an external view call, not a plain state variable —
+    invisible to the direct-comparison detector before this fix.
+
+    badAuthCallerSuppliedFactory and badAuthStateChangingCall prove this
+    doesn't weaken detection: an attacker-supplied call destination, and
+    a call that isn't provably view/pure, must NOT be treated as auth
+    evidence even though both superficially resemble the real shape.
+    """
+    nodes, *_ = _build("ExternalViewAuth.sol")
+
+    only_factory_owner = nodes["ExternalViewAuth.onlyFactoryOwner()"]
+    assert only_factory_owner.auth_score >= 3, f"expected external-view-comparison evidence, got {only_factory_owner.auth_score}"
+    assert only_factory_owner.structural_auth_var == "factory"
+
+    set_param = nodes["ExternalViewAuth.setCriticalParam(uint256)"]
+    assert set_param.auth_score >= 3
+    assert set_param.auth_state == "AUTHENTICATED"
+
+    bad_caller_supplied = nodes["ExternalViewAuth.badAuthCallerSuppliedFactory(IFactory,uint256)"]
+    assert bad_caller_supplied.auth_score < 3, (
+        "the call destination is an attacker-supplied parameter, not a fixed factory — must not score as auth"
+    )
+
+    bad_state_changing = nodes["ExternalViewAuth.badAuthStateChangingCall(uint256)"]
+    assert bad_state_changing.auth_score < 3, (
+        "reportCaller() is not view/pure — must not be trusted as a side-effect-free auth check"
+    )
+    print("test_external_view_comparison_auth_detected: PASS —",
+          "onlyFactoryOwner", only_factory_owner.auth_score, "| bad variants correctly unscored")
+
+
 def test_custom_named_reentrancy_guard_detected():
     nodes, *_ = _build("CustomReentrancyGuard.sol")
     guard_mod = nodes["CustomReentrancyGuard.xyzzy()"]
@@ -341,6 +377,7 @@ if __name__ == "__main__":
     test_custom_named_auth_modifier_detected()
     test_real_access_control_struct_shape_detected()
     test_access_control_role_mapping_detected()
+    test_external_view_comparison_auth_detected()
     test_custom_named_reentrancy_guard_detected()
     test_reentrancy_cei_suppressed_by_custom_guard()
     test_delegated_reentrancy_guard_detected()
