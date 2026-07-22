@@ -44,4 +44,29 @@ contract BadAssetMove {
     function depositMine(uint256 amount) external {
         token.transferFrom(msg.sender, address(this), amount);
     }
+
+    // Safe, via an INTERMEDIATE helper — reproduces the real Compound
+    // III (Comet) buyCollateral() -> doTransferIn() -> transferFrom
+    // shape found live this session: the proof that `from` == msg.sender
+    // is aggregated onto _pullIn's own canonical id by
+    // find_self_scoped_asset_moves (since _pullIn's own body makes the
+    // call), not onto depositViaHelper (the entry) or the synthetic
+    // "external.token.transferFrom" terminal (the sink) — a suppression
+    // check that only compares path.entry/path.sink.node_id against
+    // that set misses it entirely. Must be suppressed.
+    function depositViaHelper(uint256 amount) external {
+        _pullIn(msg.sender, amount);
+    }
+
+    function _pullIn(address from, uint256 amount) internal {
+        token.transferFrom(from, address(this), amount);
+    }
+
+    // DANGEROUS: same intermediate-helper shape, but the caller can
+    // name an arbitrary victim as `from` — the widened suppression
+    // check must NOT suppress this just because _pullIn's shape looks
+    // like depositViaHelper's from a distance. Must still fire.
+    function stealViaHelper(address victim, uint256 amount) external {
+        _pullIn(victim, amount);
+    }
 }

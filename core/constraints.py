@@ -412,23 +412,36 @@ def _check_access_control_gap(path, nodes, graph_edges) -> ConstraintResult:
     if path.sink.category == ASSET_DRAIN:
         entry_node = nodes.get(path.entry)
         safe_functions = getattr(entry_node, "self_scoped_asset_move_functions", set()) if entry_node else set()
-        # Two id shapes can carry the proof: path.sink.node_id when the
-        # sink IS a real, reachable function (e.g. Liquity's
-        # _sendETHGainToDepositor, which itself makes the low-level ETH
-        # call), or path.entry when the sink is a SYNTHETIC terminal
-        # label for an unresolved external interface call
-        # (core/paths.py's "external.<dest>.<fname>" — e.g. an
-        # interface-typed `token.transferFrom(...)` with no concrete
-        # implementation compiled in this unit, which can never match a
-        # real function id) — there, the proof lives on whichever real
-        # function's own body directly made that call, aggregated onto
-        # its own canonical_id by find_self_scoped_asset_moves.
-        if path.sink.node_id in safe_functions or path.entry in safe_functions:
+        # Three id shapes can carry the proof, because
+        # find_self_scoped_asset_moves aggregates by the CANONICAL ID of
+        # whichever function's own body directly makes the transfer —
+        # not by path position:
+        #   - path.sink.node_id, when the sink IS that real function
+        #     (e.g. Liquity's _sendETHGainToDepositor, which itself
+        #     makes the low-level ETH call).
+        #   - path.entry, when the entry itself makes the call directly
+        #     (e.g. depositMine() calling token.transferFrom inline).
+        #   - any INTERMEDIATE hop's own id in path.edge_chain — e.g.
+        #     real Compound III's buyCollateral() -> doTransferIn() ->
+        #     external.<token>.transferFrom: the proof lives on
+        #     doTransferIn (the real function whose body makes the
+        #     unresolved interface call), which is neither the entry
+        #     nor the sink's own (synthetic terminal) node_id. Found
+        #     live this session — doTransferIn's own from==msg.sender
+        #     leg was correctly proven safe by find_self_scoped_asset_
+        #     moves but never reached by a check that only looked at
+        #     the two endpoints.
+        path_ids = {path.entry, path.sink.node_id}
+        for e in path.edge_chain:
+            path_ids.add(e.src)
+            path_ids.add(e.dst)
+        proof_id = next(iter(safe_functions & path_ids), None)
+        if proof_id is not None:
             return _suppressed(
                 path,
                 f"The asset movement at {path.sink.node_id} is provably self-scoped to the "
-                f"caller's own identity (msg.sender-bound source or destination) — an attacker "
-                f"can only ever move their own funds, not another user's"
+                f"caller's own identity (msg.sender-bound source or destination, proven on "
+                f"{proof_id}) — an attacker can only ever move their own funds, not another user's"
             )
 
     # High confidence: unprotected path to privileged sink

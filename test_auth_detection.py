@@ -178,6 +178,55 @@ def test_self_scoped_asset_move_replaces_economic_interfaces_list():
           "stealApproved still", steal_gap[0].verdict, "| depositMine suppressed")
 
 
+def test_self_scoped_asset_move_suppression_reaches_intermediate_hops():
+    """
+    Reproduces the real Compound III (Comet) buyCollateral() ->
+    doTransferIn() -> transferFrom false positive found live this
+    session: find_self_scoped_asset_moves correctly aggregated the proof
+    onto doTransferIn's own canonical id (the real function whose body
+    makes the transferFrom call), but constraints.py's suppression check
+    only compared path.entry and path.sink.node_id against that set —
+    neither matches when the proof lives on an INTERMEDIATE hop. Widened
+    to scan every node id in path.edge_chain.
+
+    stealViaHelper reproduces the exact shape a naive "any node on this
+    path counts" fix without per-entry recomputation would get wrong:
+    the SAME helper (_pullIn) is called safely from depositViaHelper
+    (from=msg.sender) and unsafely from stealViaHelper (from=victim) —
+    each entry's own self_scoped_asset_move_functions is recomputed
+    fresh from that entry's own call-site bindings, so the two must not
+    cross-contaminate.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("BadAssetMove.sol")
+
+    deposit_via_helper = nodes["BadAssetMove.depositViaHelper(uint256)"]
+    steal_via_helper = nodes["BadAssetMove.stealViaHelper(address,uint256)"]
+    assert "BadAssetMove._pullIn(address,uint256)" in deposit_via_helper.self_scoped_asset_move_functions
+    assert steal_via_helper.self_scoped_asset_move_functions == set(), (
+        "_pullIn(victim, amount) is never proven msg.sender-bound from stealViaHelper's own call site — "
+        "must NOT be marked safe just because the same helper is safe when called from elsewhere"
+    )
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible + report.suppressed
+
+    deposit_gap = [
+        r for r in all_results
+        if r.path.entry == deposit_via_helper.id and r.constraint_type == "ACCESS_CONTROL_GAP"
+    ]
+    assert not deposit_gap, f"depositViaHelper only ever pulls the caller's own approved funds — must be suppressed, got {deposit_gap}"
+
+    steal_gap = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == steal_via_helper.id and "ACCESS_CONTROL_GAP" in r.constraint_type
+    ]
+    assert steal_gap, "stealViaHelper pulls an arbitrary victim's approved funds via the same helper shape — must still fire"
+    print("test_self_scoped_asset_move_suppression_reaches_intermediate_hops: PASS —",
+          "depositViaHelper suppressed, stealViaHelper still", steal_gap[0].verdict)
+
+
 def test_self_scoped_liability_reduction_replaces_missing_precision():
     """
     Reproduces the real repayAsset()/liquidate() ACCESS_CONTROL_GAP false
@@ -255,6 +304,7 @@ if __name__ == "__main__":
     test_reentrancy_cei_suppressed_by_custom_guard()
     test_self_scoped_write_suppressed_without_weakening()
     test_self_scoped_asset_move_replaces_economic_interfaces_list()
+    test_self_scoped_asset_move_suppression_reaches_intermediate_hops()
     test_self_scoped_liability_reduction_replaces_missing_precision()
     test_ownable2step_accept_ownership_suppressed()
     print("\nAll auth_detection tests passed.")
