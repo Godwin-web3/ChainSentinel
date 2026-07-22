@@ -1057,6 +1057,54 @@ def has_inline_reentrancy_guard(func_obj) -> bool:
     return False
 
 
+def has_state_write_after_external_call(f, max_depth: int = 30) -> bool:
+    """
+    True if function f's own body contains an external call (HighLevelCall
+    or LowLevelCall, not a LibraryCall — libraries are stateless and
+    can't reenter) from which a node writing a state variable is CFG-
+    reachable (via node.sons, bounded, cycle-safe) — the real execution-
+    order CEI violation, as opposed to merely having both a state write
+    and an external call SOMEWHERE in the function regardless of order.
+
+    Replaces the coarser "does this function have any state write AND
+    any external call" co-occurrence signal (core/paths.py's
+    node_has_state/node_has_external), which can't distinguish a real
+    violation from CEI-compliant code. Found live this session: real
+    Liquity's _sendETHGainToDepositor writes `ETH = newETH` BEFORE its
+    `msg.sender.call{value: _amount}("")` (confirmed via real node
+    order: the Assignment is node 5, the LowLevelCall is node 9) —
+    CEI-compliant for that variable, correctly protected by ordering
+    rather than a guard — but the co-occurrence check flagged it
+    regardless, since it never looked at which came first.
+    """
+    try:
+        nodes = list(getattr(f, "nodes", []) or [])
+    except Exception:
+        return False
+
+    def _reaches_state_write(node, depth: int, visited: set) -> bool:
+        if id(node) in visited or depth <= 0:
+            return False
+        visited.add(id(node))
+        if getattr(node, "state_variables_written", None):
+            return True
+        for son in getattr(node, "sons", []) or []:
+            if _reaches_state_write(son, depth - 1, visited):
+                return True
+        return False
+
+    for node in nodes:
+        has_external = any(
+            isinstance(ir, (HighLevelCall, LowLevelCall)) and not isinstance(ir, LibraryCall)
+            for ir in getattr(node, "irs", []) or []
+        )
+        if not has_external:
+            continue
+        if _reaches_state_write(node, max_depth, set()):
+            return True
+    return False
+
+
 def _expand_with_internal_calls(nodes, max_depth: int = 2, _visited: Optional[set] = None) -> list:
     """
     Returns `nodes` plus the CFG nodes of any function directly reached

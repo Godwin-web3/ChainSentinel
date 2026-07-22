@@ -17,6 +17,7 @@ from slither.core.declarations import Modifier
 from core.invariants import extract_field_precise_writes, extract_field_precise_reads, get_call_events, extract_invariants
 from core.auth_detection import (
     compute_own_auth, is_reentrancy_guard, has_inline_reentrancy_guard,
+    has_state_write_after_external_call,
     find_self_scoped_writes, find_self_scoped_asset_moves,
     find_self_scoped_liability_reductions,
 )
@@ -78,6 +79,15 @@ class FunctionNode:
     # hottest-path function) instead of attaching the modifier, which
     # is_reentrancy_guard alone (modifier-only) can't see.
     has_inline_reentrancy_guard: bool = False
+    # True if THIS function's own body has a state write CFG-reachable
+    # from an external call it makes — the real execution-order CEI
+    # violation — see core/auth_detection.py::
+    # has_state_write_after_external_call. Distinct from state_writes/
+    # external edges alone (which say nothing about order): real
+    # Liquity's _sendETHGainToDepositor writes ETH BEFORE its ETH send,
+    # CEI-compliant for that variable, which a co-occurrence-only
+    # signal can't tell apart from a genuine violation.
+    state_write_follows_external_call: bool = False
     # Privileged writes reachable from THIS entry that are PROVABLY keyed
     # by the caller's own identity (core/auth_detection.py::
     # find_self_scoped_writes) — e.g. AccessControl.renounceRole's
@@ -396,6 +406,7 @@ def build_graph(
                 modifier_ids = [canonical_id(contract.name, m.full_name) for m in f.modifiers]
                 guard = is_reentrancy_guard(f) if is_modifier else False
                 inline_guard = has_inline_reentrancy_guard(f) if not is_modifier else False
+                write_follows_call = has_state_write_after_external_call(f)
                 self_scoped_writes = find_self_scoped_writes(f)
                 self_scoped_asset_moves = find_self_scoped_asset_moves(f)
                 self_scoped_liability_reductions = find_self_scoped_liability_reductions(f)
@@ -444,6 +455,7 @@ def build_graph(
                     structural_auth_var=structural_auth_var,
                     is_reentrancy_guard=guard,
                     has_inline_reentrancy_guard=inline_guard,
+                    state_write_follows_external_call=write_follows_call,
                     self_scoped_write_keys=self_scoped_writes,
                     self_scoped_asset_move_functions=self_scoped_asset_moves,
                     self_scoped_liability_reduction_keys=self_scoped_liability_reductions,

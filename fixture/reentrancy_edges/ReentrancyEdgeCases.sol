@@ -39,6 +39,16 @@ pragma solidity ^0.8.19;
 //    edges.py::_low_level_return_checked): does the call's own `bool
 //    success` unpack to a variable later read by a revert-capable node
 //    in the same function?
+//
+// 5. core/paths.py's STATE_BEFORE_CALL flag was pure co-occurrence —
+//    "does this function have both a state write and an external call
+//    ANYWHERE, regardless of order" — which can't distinguish a real
+//    violation from real Liquity's _sendETHGainToDepositor, which
+//    writes `ETH = newETH` BEFORE its ETH send (CEI-compliant for that
+//    variable, confirmed via real node order). Fixed with
+//    core/auth_detection.py::has_state_write_after_external_call: is a
+//    state-write node CFG-reachable FROM the external call, not merely
+//    present somewhere in the same function.
 contract ReentrancyEdgeCases {
     uint256 public balance;
     address public token0;
@@ -105,5 +115,15 @@ contract ReentrancyEdgeCases {
     function withdrawUnchecked() external {
         msg.sender.call{value: 0}("");
         balance = 0;
+    }
+
+    // Safe: the state write happens BEFORE the external call — the
+    // real Liquity _sendETHGainToDepositor shape. No guard needed;
+    // safety comes from ORDER, not a lock. Must NOT fire
+    // REENTRANCY_CEI.
+    function withdrawOrdered() external {
+        balance = 0;
+        (bool ok, ) = msg.sender.call{value: 0}("");
+        require(ok, "call failed");
     }
 }

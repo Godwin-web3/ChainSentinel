@@ -230,10 +230,49 @@ def test_trusted_interface_cast_destination_excludes_callback_sink():
           "adminOnlyAction 0 findings, attackerControlled still", dangerous_findings[0].verdict)
 
 
+def test_cei_check_is_order_aware_not_co_occurrence():
+    """
+    Reproduces the real Liquity StabilityPool false positive found live
+    this session: _sendETHGainToDepositor writes `ETH = newETH` BEFORE
+    its `msg.sender.call{value: _amount}("")` — CEI-compliant for that
+    variable, confirmed via real node order — but the old co-occurrence
+    check ("does this function have both a state write and an external
+    call ANYWHERE") flagged it regardless of order.
+
+    withdrawOrdered() (write before call) must NOT fire REENTRANCY_CEI;
+    withdraw() (write after call, from the earlier test) already proves
+    the genuine violation still fires — this test confirms the two are
+    correctly told apart at the FunctionNode field level too.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("ReentrancyEdgeCases.sol")
+
+    ordered = nodes["ReentrancyEdgeCases.withdrawOrdered()"]
+    unordered = nodes["ReentrancyEdgeCases.withdraw()"]
+    assert ordered.state_write_follows_external_call is False, (
+        "withdrawOrdered() writes balance BEFORE its external call — must not be flagged as order-violating"
+    )
+    assert unordered.state_write_follows_external_call is True, (
+        "withdraw() writes balance AFTER its external call — must be flagged as order-violating"
+    )
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible
+
+    ordered_findings = [
+        r for r in all_results
+        if r.path.entry == "ReentrancyEdgeCases.withdrawOrdered()" and "REENTRANCY_CEI" in r.constraint_type
+    ]
+    assert not ordered_findings, f"withdrawOrdered() is CEI-compliant by ordering — must not fire, got {ordered_findings}"
+    print("test_cei_check_is_order_aware_not_co_occurrence: PASS — withdrawOrdered() correctly suppressed")
+
+
 if __name__ == "__main__":
     test_entry_level_cei_violation_detected()
     test_staticcall_not_misclassified_as_asset_drain_or_callback()
     test_inline_reentrancy_guard_detected_without_weakening()
     test_unchecked_return_requires_real_dataflow_evidence()
     test_trusted_interface_cast_destination_excludes_callback_sink()
+    test_cei_check_is_order_aware_not_co_occurrence()
     print("\nAll reentrancy_edges tests passed.")

@@ -175,6 +175,15 @@ def _dfs(
     node_has_external = any(
         e.is_external for e in graph_edges.get(current_id, [])
     ) if node else False
+    # A genuine execution-order CEI violation — a state write CFG-
+    # reachable from an external call this node makes — not merely
+    # "this node has both a state write and an external call somewhere,
+    # regardless of order" (core/auth_detection.py::
+    # has_state_write_after_external_call). The old co-occurrence
+    # signal couldn't distinguish real Liquity's _sendETHGainToDepositor
+    # (writes ETH BEFORE its ETH send — CEI-compliant for that
+    # variable) from an actual violation.
+    node_write_follows_call = bool(node) and getattr(node, 'state_write_follows_external_call', False)
     node_unauthenticated = bool(node) and getattr(node, 'auth_state', 'UNKNOWN') == 'UNAUTHENTICATED'
 
     # Flags used ONLY to decide whether THIS node registers as a sink.
@@ -185,7 +194,7 @@ def _dfs(
     # node with an external edge to one child doesn't leak EXTERNAL_CALL
     # onto an unrelated sibling reached via a purely internal edge.
     sink_check_flags = set(accumulated_flags)
-    if node_has_state and node_has_external:
+    if node_write_follows_call:
         sink_check_flags.add(STATE_BEFORE_CALL)
     if node_has_external:
         sink_check_flags.add(EXTERNAL_CALL)
@@ -223,7 +232,7 @@ def _dfs(
     # this node's own evidence (matches the sink-check flags above);
     # EXTERNAL_CALL stays edge-specific, added per-edge in the loop
     # below rather than here.
-    if node_has_state and node_has_external:
+    if node_write_follows_call:
         accumulated_flags = accumulated_flags | {STATE_BEFORE_CALL}
     if node_unauthenticated:
         accumulated_flags = accumulated_flags | {AUTH_GAP}
