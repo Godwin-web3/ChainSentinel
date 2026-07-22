@@ -44,7 +44,13 @@ def test_vulnerable():
         "MarketB.borrow(uint256)", "Hub.totalBorrowed(address)", "MarketA.accountBorrowsOf(address)",
     ]
     assert ("MarketA", "accountBorrows", ()) in f.at_risk_keys
-    print("test_vulnerable: PASS —", f.vulnerable_entry, "->", f.reentry_entry, "via", " -> ".join(f.shared_read_path))
+    assert f.callback_target_known is False, (
+        "underlying.transfer's target isn't part of this compilation — "
+        "should be flagged as the classic unresolved/external shape, "
+        "not a known-internal one"
+    )
+    print("test_vulnerable: PASS —", f.vulnerable_entry, "->", f.reentry_entry, "via", " -> ".join(f.shared_read_path),
+          "| callback_target_known:", f.callback_target_known)
 
 
 def test_cei_safe():

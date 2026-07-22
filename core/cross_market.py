@@ -43,6 +43,21 @@ class CrossMarketFinding:
                                   #  "MarketA.accountBorrowsOf(address)"]
     at_risk_keys: Set[tuple]     # the (contract, root, member_path) keys read stale
     call_event: object           # the CallEvent (from invariants.py) that opens the window
+    callback_target_known: bool  # True if the callback-triggering call resolves to a
+                                  # contract already present in the unified graph (a
+                                  # protocol-owned contract, e.g. Compound's own
+                                  # Comptroller) rather than a genuinely external/
+                                  # unresolved target (an arbitrary token/contract the
+                                  # caller supplies, e.g. the AMP token in the real
+                                  # Cream hack). A known-internal target is materially
+                                  # LOWER confidence: reentrancy needs the attacker to
+                                  # receive control, and a fixed, protocol-deployed
+                                  # contract handing control to an attacker requires
+                                  # that contract to ITSELF call something external —
+                                  # a deeper chain this check does not verify. An
+                                  # unresolved/external target is the classic, high-
+                                  # confidence shape: the call target is exactly the
+                                  # kind of address a caller can supply arbitrarily.
 
 
 def _transitive_reads(entry_id: str, nodes: dict, graph_edges: dict, max_depth: int = 6):
@@ -91,6 +106,29 @@ def _transitive_reads(entry_id: str, nodes: dict, graph_edges: dict, max_depth: 
     return qualified_reads, read_paths
 
 
+def _callback_target_known(vuln_id: str, call_event, nodes: dict, graph_edges: dict) -> bool:
+    """
+    True if the specific call that opens the reentrancy window resolves
+    to a contract already present in this unified graph — a known,
+    protocol-owned contract (e.g. Compound's own Comptroller) — rather
+    than a genuinely unresolved/external target (an arbitrary token or
+    contract the caller supplies, e.g. the AMP token in the real Cream
+    hack). Matched by function name against call_event's expression text
+    since CallEdge doesn't carry a direct per-event back-reference;
+    falls back to "do ALL of this function's non-internal edges resolve"
+    when no confident single-edge match exists.
+    """
+    for edge in graph_edges.get(vuln_id, []):
+        if edge.raw_type == "internal":
+            continue
+        if edge.function_name and edge.function_name in call_event.node_expr_str:
+            return edge.dst in nodes
+    external_edges = [e for e in graph_edges.get(vuln_id, []) if e.raw_type != "internal"]
+    if not external_edges:
+        return False
+    return all(e.dst in nodes for e in external_edges)
+
+
 def check_cross_market_reentrancy(nodes: Dict[str, object], graph_edges: dict) -> List[CrossMarketFinding]:
     """
     For every function with a genuine post-callback write (i.e. a real
@@ -105,12 +143,25 @@ def check_cross_market_reentrancy(nodes: Dict[str, object], graph_edges: dict) -
     REENTRANCY_CEI's job, already covered. This only fires on genuine
     cross-contract reentry, the shape neither existing check can see.
     """
+    from core.constraints import _entry_has_direct_auth, _auth_check_in_subgraph
+
     findings: List[CrossMarketFinding] = []
 
     vulnerable = [
         (nid, n) for nid, n in nodes.items()
         if getattr(n, "state_writes_after_callback", None)
         and getattr(n, "visibility", None) in ("public", "external")
+        # Reuses the SAME auth-signal detection REENTRANCY_CEI's sibling
+        # checks already rely on (modifiers, auth_score, name patterns,
+        # or an auth check within 3 hops of the entry) — an entry that's
+        # already gated isn't a free attacker-reachable trigger. Known
+        # gap, not silently papered over: an auth check enforced via an
+        # UNRESOLVED cross-contract call (e.g. Compound's CToken.seize()
+        # gating through comptroller.seizeAllowed(), found live — see
+        # this module's git history) isn't visible to either check here,
+        # since neither can walk into an edge that didn't resolve.
+        and not _entry_has_direct_auth(nid, nodes)
+        and not _auth_check_in_subgraph(nid, nodes, graph_edges)
     ]
     if not vulnerable:
         return findings
@@ -145,6 +196,7 @@ def check_cross_market_reentrancy(nodes: Dict[str, object], graph_edges: dict) -
                         shared_read_path=read_paths.get(key, [reentry_id]),
                         at_risk_keys=overlap,
                         call_event=call_event,
+                        callback_target_known=_callback_target_known(vuln_id, call_event, nodes, graph_edges),
                     ))
 
     return findings

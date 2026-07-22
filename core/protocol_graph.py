@@ -16,11 +16,12 @@ resolution and market discovery elsewhere in this codebase). Never a
 name guess, never assumed.
 """
 
-from typing import Optional
+from typing import Optional, Tuple
 from config.chains import Chain
 from core.resolver import resolve
 from core.graph import build_graph, find_any_enumeration_getter
 from core.dependency_fetcher import merge_dependency_source, build_wrapper_entry
+from core.multi_compile import extract_pragma_version, merge_build_results
 from utils.rpc import get_address_array
 from utils.logger import log
 
@@ -33,7 +34,7 @@ def build_protocol_graph(
     entry_file: str,
     solc_version: str,
     enrichment: dict,
-    base_nodes: dict,
+    base_build: Tuple[dict, dict, dict, dict, dict, list],
     remaps: Optional[list] = None,
     max_markets_scanned: int = 60,
     max_distinct_implementations: int = 6,
@@ -58,6 +59,7 @@ def build_protocol_graph(
     hack was crAMP, a CErc20-shaped delegate, reentering crETH, a
     CEther-shaped delegate — genuinely different source).
     """
+    base_nodes = base_build[0]
     found = find_any_enumeration_getter(base_nodes, entry_name)
     if not found:
         return None
@@ -101,17 +103,49 @@ def build_protocol_graph(
 
     if not dependency_entry_files:
         notes.append({"status": "no_distinct_implementations_fetched"})
-        return base_nodes, {}, notes
+        nodes, graph_edges = base_build[0], base_build[1]
+        return nodes, graph_edges, notes
 
+    # Attempt 1: single wrapper compile. Cheap, correct whenever the
+    # entry and every distinct implementation's pragma ranges overlap.
     wrapper_entry = build_wrapper_entry(project_root, entry_file, dependency_entry_files)
     try:
-        nodes, graph_edges, state_writers, state_readers, invariant_index, unresolved_deps = build_graph(
+        wrapper_result = build_graph(
             project_root, wrapper_entry, solc_version, enrichment, remaps or [],
         )
     except Exception as e:
-        log.warn(f"Protocol graph: unified build failed: {e}")
-        notes.append({"status": "unified_build_failed", "reason": str(e)})
-        return None
+        wrapper_result = None
+        log.warn(f"Protocol graph: wrapper compile raised: {e}")
 
-    notes.append({"unified_nodes": len(nodes), "status": "ok"})
+    if wrapper_result and wrapper_result[0]:
+        nodes, graph_edges = wrapper_result[0], wrapper_result[1]
+        notes.append({"unified_nodes": len(nodes), "status": "ok_single_compile"})
+        return nodes, graph_edges, notes
+
+    # Attempt 2: wrapper failed — almost certainly a genuine pragma
+    # conflict across a protocol's history (proven live: Compound's
+    # Comptroller at 0.5.16 vs. a later CErc20Delegate pinned to
+    # 0.8.10). Compile the entry and every distinct implementation
+    # SEPARATELY, each at its own real pragma, and merge the results by
+    # canonical_id — core/multi_compile.py's merge_build_results already
+    # does this correctly for the single-dependency case; nothing here
+    # is dependency-count-specific, it folds in one contract at a time.
+    log.info("Protocol graph: wrapper compile failed (likely pragma conflict) — falling back to separate multi-version compilation")
+    merged = base_build
+    for dep_entry in dependency_entry_files:
+        dep_version = extract_pragma_version(dep_entry) or solc_version
+        try:
+            dep_result = build_graph(project_root, dep_entry, dep_version, {}, remaps or [])
+        except Exception as de:
+            notes.append({"implementation_file": dep_entry, "status": "compile_failed", "pragma_version": dep_version, "reason": str(de)})
+            log.warn(f"Protocol graph: separate compile failed for {dep_entry} at {dep_version}: {de}")
+            continue
+        if not dep_result[0]:
+            notes.append({"implementation_file": dep_entry, "status": "compile_empty", "pragma_version": dep_version})
+            continue
+        merged = merge_build_results(merged, dep_result)
+        notes.append({"implementation_file": dep_entry, "status": "compiled_separately", "pragma_version": dep_version, "nodes": len(dep_result[0])})
+
+    nodes, graph_edges = merged[0], merged[1]
+    notes.append({"unified_nodes": len(nodes), "status": "ok_multi_version_merge"})
     return nodes, graph_edges, notes

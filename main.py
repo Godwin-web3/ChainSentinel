@@ -444,7 +444,7 @@ def analyze(address, chain_name, output_json=False):
                                 entry_file=e_file,
                                 solc_version=s_ver,
                                 enrichment=enrichment,
-                                base_nodes=nodes,
+                                base_build=(nodes, graph_edges, state_writers, state_readers, invariant_index, unresolved_deps),
                                 remaps=remaps,
                             )
                             if protocol_result:
@@ -463,6 +463,7 @@ def analyze(address, chain_name, output_json=False):
                                                 for c, r, p in f.at_risk_keys
                                             ],
                                             "call_event": f.call_event.node_expr_str,
+                                            "callback_target_known": f.callback_target_known,
                                         }
                                         for f in cross_findings
                                     ],
