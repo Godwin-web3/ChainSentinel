@@ -12,13 +12,35 @@ comes back purely from its on-chain shape:
 
 Scope, honestly: this finds market config for single-market-per-contract
 shapes (e.g. a Compound-style CToken exposing its own underlying/oracle
-as 0-arg getters). It does NOT discover markets on singleton
-multi-market contracts that key by id/mapping (Morpho Blue, Aave's
-Pool) — those getters take a parameter, and there is no way to
-enumerate "all markets" from probing alone without either a known
-enumeration getter (see core/graph.find_enumeration_getter) or an
-externally supplied market id. That's a structural limit of probing,
-not a bug to paper over.
+as 0-arg getters).
+
+discover_multi_market() extends this to singleton contracts that hold
+many markets but expose a real 0-arg getter returning address[] (e.g.
+Compound's Comptroller.getAllMarkets() -> CToken[]) — it calls that
+getter for real and runs probe_market_config() on every address it
+returns. This still requires nothing protocol-specific: the getter is
+found by its ABI-declared return type ("address[]"), not by name.
+
+What neither function can do: discover markets on a singleton that has
+NO on-chain enumeration function at all and only emits them via
+historical event logs (Morpho Blue's CreateMarket pattern — no
+getAllMarkets() exists there by design, since an unbounded permissionless
+market list would be gas-prohibitive to maintain on-chain). Reaching
+those generically would mean classifying which of a contract's *events*
+is shaped like "market creation" from its ABI-declared parameter types,
+which is a substantially noisier problem than classifying functions —
+a Transfer or Deposit event has the same address+uint256 shape and
+would collide with it. That's a real, unsolved limitation here, not
+a bug to paper over.
+
+Known gap, confirmed on live Compound: oracle discovery on each
+per-market contract (e.g. a CToken) reliably comes back empty even on a
+real market, because Compound's oracle isn't on the CToken at all — it's
+one hop away, on the Comptroller (comptroller().oracle()). Extending
+probe_market_config to also follow "returns another contract" getters
+one hop and probe *that* address for an oracle would close this using
+the exact same detect_oracle_type/is_erc20_shaped primitives already
+here — not yet built, noted rather than silently missing.
 
 Collateral vs. debt role is inherently ambiguous from shape alone — two
 ERC20-shaped 0-arg results don't say which one a protocol treats as
@@ -30,12 +52,12 @@ is explicit in DiscoveryResult.confidence/notes when it can't tell.
 
 import json
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from web3 import Web3
 from core.market_schema import MarketConfig
 from core.oracle_detection import detect_oracle_type, is_erc20_shaped
-from core.fetcher import fetch_source
-from utils.rpc import get_web3
+from core.resolver import resolve
+from utils.rpc import get_web3, get_address_array
 from config.chains import Chain
 
 
@@ -47,6 +69,13 @@ class DiscoveryResult:
     oracle_candidates: List[str] = field(default_factory=list)
     asset_candidates: List[str] = field(default_factory=list)
     ratio_candidates: List[float] = field(default_factory=list)
+
+
+@dataclass
+class MultiMarketResult:
+    getter: Optional[str]
+    markets: List[Tuple[str, DiscoveryResult]] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
 
 
 _DEBT_HINTS = ("debt", "borrow", "loan")
@@ -81,6 +110,30 @@ def _zero_arg_view_functions(abi: list) -> list:
     return out
 
 
+def _resolve_abi(address: str, chain: Chain):
+    """
+    Returns (abi_list, error_note). Most real singletons (Comptrollers,
+    Pools, etc.) are upgradeable proxies whose own verified source is
+    just admin/delegate boilerplate — the real functions live on the
+    implementation. Calls core.resolver.resolve() (the same proxy-
+    following used by the rest of the pipeline: storage-slot detection
+    first, Etherscan's reported implementation as fallback) to get the
+    implementation's real ABI, while callers keep using the original
+    `address` for actual eth_call targets — that's the deployed instance
+    holding real state; the bare implementation address usually isn't.
+    """
+    resolved = resolve(address, chain)
+    if not resolved:
+        return None, "resolution failed"
+    source = resolved.get("source")
+    if not source or not source.get("verified") or not source.get("abi"):
+        return None, "contract not verified — no ABI to probe"
+    try:
+        return json.loads(source["abi"]), None
+    except Exception:
+        return None, "ABI did not parse"
+
+
 def _order_by_hint(name_a: str, addr_a: str, name_b: str, addr_b: str):
     """Best-effort collateral/debt ordering from the real declared
     function names — corroborating signal only, never required."""
@@ -94,14 +147,9 @@ def _order_by_hint(name_a: str, addr_a: str, name_b: str, addr_b: str):
 
 def probe_market_config(address: str, chain: Chain) -> DiscoveryResult:
     w3 = get_web3(chain)
-    source = fetch_source(address, chain)
-    if not source or not source.get("verified") or not source.get("abi"):
-        return DiscoveryResult(market=None, confidence="none", notes=["contract not verified — no ABI to probe"])
-
-    try:
-        abi = json.loads(source["abi"])
-    except Exception:
-        return DiscoveryResult(market=None, confidence="none", notes=["ABI did not parse"])
+    abi, err = _resolve_abi(address, chain)
+    if abi is None:
+        return DiscoveryResult(market=None, confidence="none", notes=[err])
 
     checksum_address = Web3.to_checksum_address(address)
     contract = w3.eth.contract(address=checksum_address, abi=abi)
@@ -244,3 +292,70 @@ def probe_market_config(address: str, chain: Chain) -> DiscoveryResult:
         asset_candidates=distinct_assets,
         ratio_candidates=[v for _, v in ratio_candidates],
     )
+
+
+_ENUMERATION_NAME_HINTS = ("allmarkets", "getallmarkets", "markets", "getmarkets", "allpools", "getallpools")
+
+
+def _array_returning_functions(abi: list) -> list:
+    """0-arg view/pure functions whose ABI-DECLARED output type is
+    literally 'address[]' — the real, verified declaration, not a name
+    guess. (The equivalent check in core/graph.py works from Slither's
+    parsed IR for the static-analysis pipeline; this is the ABI-JSON
+    version for this lightweight, adapter-free prober.)"""
+    out = []
+    for item in abi:
+        if item.get("type") != "function":
+            continue
+        if item.get("stateMutability") not in ("view", "pure"):
+            continue
+        if item.get("inputs"):
+            continue
+        outputs = item.get("outputs", [])
+        if len(outputs) == 1 and outputs[0].get("type") == "address[]":
+            out.append(item)
+    return out
+
+
+def _pick_enumeration_getter(candidates: list) -> dict:
+    """When more than one 0-arg getter returns address[], prefer one whose
+    real declared name reads like an enumeration ('getAllMarkets',
+    'allPairs', ...) — corroborating signal only; falls back to the
+    first candidate found either way."""
+    for c in candidates:
+        if any(h in c["name"].lower() for h in _ENUMERATION_NAME_HINTS):
+            return c
+    return candidates[0]
+
+
+def discover_multi_market(address: str, chain: Chain, market_limit: int = 50) -> MultiMarketResult:
+    """
+    For singleton contracts holding many markets, reachable via a real
+    0-arg getter returning address[] (e.g. Compound's Comptroller.
+    getAllMarkets() -> CToken[]). Calls that getter for real, then runs
+    probe_market_config() on every address it returns — this works
+    because each discovered market (a CToken) is itself single-contract-
+    shaped, which probe_market_config already knows how to read.
+
+    Does not cover markets only discoverable via historical event logs
+    with no on-chain enumeration function at all (Morpho Blue's
+    CreateMarket pattern) — see the module docstring.
+    """
+    abi, err = _resolve_abi(address, chain)
+    if abi is None:
+        return MultiMarketResult(getter=None, notes=[err])
+
+    candidates = _array_returning_functions(abi)
+    if not candidates:
+        return MultiMarketResult(getter=None, notes=["no 0-arg getter returning address[] found — not a multi-market-enumerable contract this way"])
+
+    getter_fn = _pick_enumeration_getter(candidates)
+    signature = f"{getter_fn['name']}()"
+    notes = [f"{len(candidates)} address[]-returning getter(s) found; using {signature!r}"]
+
+    addresses = get_address_array(address, signature, chain, limit=market_limit) or []
+    notes.append(f"{signature} returned {len(addresses)} address(es) (capped at {market_limit})")
+
+    markets = [(addr, probe_market_config(addr, chain)) for addr in addresses]
+
+    return MultiMarketResult(getter=signature, markets=markets, notes=notes)
