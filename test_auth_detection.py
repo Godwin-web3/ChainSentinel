@@ -230,7 +230,7 @@ def test_nested_mapping_outer_key_self_scoping():
     hope = nodes["NestedMappingSelfScope.hope(address)"]
     assert ("can", ()) in hope.self_scoped_write_keys
 
-    dangerous = nodes["NestedMappingSelfScope.corruptAllowance(address,address,uint256)"]
+    dangerous = nodes["NestedMappingSelfScope.corruptAllowance(address,address,bool)"]
     assert dangerous.self_scoped_write_keys == set(), (
         "corruptAllowance writes allowances[victim][spender] — neither key is msg.sender — "
         "must NOT be marked self-scoped"
@@ -381,16 +381,30 @@ def test_self_scoped_liability_reduction_replaces_missing_precision():
     report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
     all_results = report.confirmed + report.likely + report.possible + report.suppressed
 
-    safe_gap = [r for r in all_results if r.path.entry == safe.id and r.constraint_type == "ACCESS_CONTROL_GAP"]
+    safe_gap = [r for r in all_results if r.path.entry == safe.id and "ACCESS_CONTROL_GAP" in r.constraint_type]
     assert not safe_gap, f"repayFor is a correlated repayBehalf pattern — ACCESS_CONTROL_GAP should not fire, got {safe_gap}"
+
+    # MISSING_HEALTH_CHECK must be just as consistent as ACCESS_CONTROL_GAP
+    # on this same evidence (core/constraints.py::_check_missing_health_check's
+    # self-scoped-liability-reduction block, added to fix the real Dai.approve()
+    # inconsistency: a write ACCESS_CONTROL_GAP already proved safe via this
+    # exact evidence must not still trip MISSING_HEALTH_CHECK on its own).
+    safe_mhc = [r for r in all_results if r.path.entry == safe.id and "MISSING_HEALTH_CHECK" in r.constraint_type]
+    assert not safe_mhc, f"repayFor's write is provably safe (repayBehalf-correlated) — MISSING_HEALTH_CHECK should not fire, got {safe_mhc}"
 
     dangerous_gap = [
         r for r in (report.confirmed + report.likely)
         if r.path.entry == dangerous.id and "ACCESS_CONTROL_GAP" in r.constraint_type
     ]
     assert dangerous_gap, "badReduce lets an attacker erase arbitrary debt for a decoupled amount — must still fire"
+
+    dangerous_mhc = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == dangerous.id and "MISSING_HEALTH_CHECK" in r.constraint_type
+    ]
+    assert dangerous_mhc, "badReduce's decoupled amount is NOT self-scoped-liability-reduction evidence — MISSING_HEALTH_CHECK must still fire"
     print("test_self_scoped_liability_reduction_replaces_missing_precision: PASS —",
-          "repayFor suppressed, badReduce still", dangerous_gap[0].verdict)
+          "repayFor suppressed (ACL+MHC), badReduce still", dangerous_gap[0].verdict)
 
 
 def test_ownable2step_accept_ownership_suppressed():
@@ -417,6 +431,50 @@ def test_ownable2step_accept_ownership_suppressed():
     print("test_ownable2step_accept_ownership_suppressed: PASS — 0 findings on acceptOwnership()")
 
 
+def test_numeric_equality_constant_role_flag_detected():
+    """
+    Reproduces the real regression found live this session against
+    MakerDAO's Vat.sol: `wards[msg.sender] == 1` is a numeric (uint,
+    not bool) membership flag used by the `auth` modifier across every
+    DSS contract. It stopped scoring as auth evidence entirely once
+    _role_mapping_ir was gated to bool-typed Index results only (the
+    earlier fix for Dai's `allowance[...][msg.sender] >= wad` false-
+    AUTHENTICATED bug) — silently losing wards' STORAGE_CORRUPTION
+    "privileged" classification too (confirmed live: Vat.sol's sink
+    count dropped from 2 to 0, hiding rely()/deny() entirely instead of
+    correctly suppressing them as auth-gated).
+
+    Also proves this doesn't reopen the Dai false positive: corruptWards()
+    reproduces the exact shape that must stay excluded — an equality
+    check against a caller-supplied VARIABLE (not a constant), which is
+    a numeric exact-match check structurally identical to an economic
+    guard, not a permission flag. Must still fire.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("WardsStyleAuth.sol")
+
+    auth_modifier = nodes["WardsStyleAuth.auth()"]
+    assert auth_modifier.auth_score >= 3, f"expected structural auth evidence on the auth() modifier, got {auth_modifier.auth_score}"
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible + report.suppressed
+
+    rely_gap = [
+        r for r in all_results
+        if r.path.entry == "WardsStyleAuth.rely(address)" and "ACCESS_CONTROL_GAP" in r.constraint_type
+    ]
+    assert not rely_gap, f"rely() is gated by the auth modifier — ACCESS_CONTROL_GAP should not fire, got {rely_gap}"
+
+    corrupt_gap = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == "WardsStyleAuth.corruptWards(address,uint256)" and "ACCESS_CONTROL_GAP" in r.constraint_type
+    ]
+    assert corrupt_gap, "corruptWards()'s guard is a variable-equality check, not a real permission flag — ACCESS_CONTROL_GAP must still fire"
+    print("test_numeric_equality_constant_role_flag_detected: PASS —",
+          "rely suppressed, corruptWards still", corrupt_gap[0].verdict)
+
+
 if __name__ == "__main__":
     test_custom_named_auth_modifier_detected()
     test_real_access_control_struct_shape_detected()
@@ -431,4 +489,5 @@ if __name__ == "__main__":
     test_self_scoped_asset_move_suppression_reaches_intermediate_hops()
     test_self_scoped_liability_reduction_replaces_missing_precision()
     test_ownable2step_accept_ownership_suppressed()
+    test_numeric_equality_constant_role_flag_detected()
     print("\nAll auth_detection tests passed.")

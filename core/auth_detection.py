@@ -62,6 +62,7 @@ from core.edges import (
     _follow_reference,
     _is_state_variable,
     _is_storage_mapping,
+    _is_const_value,
     _find_defining_op,
     _func_canonical_id,
     _node_can_revert,
@@ -279,18 +280,61 @@ def _role_mapping_ir(node, f, known_msg_sender: frozenset = frozenset()) -> Opti
     """
     Core matcher (no node-level gating): an Index op whose key resolves
     to msg.sender/tx.origin (directly, or via a parameter proven bound
-    to it at the call site — see known_msg_sender) and whose base
-    resolves (possibly through nested mapping/struct hops) to a real
-    storage mapping — the structural shape of AccessControl.hasRole-style
-    role lookups (`_roles[role][msg.sender]` or real OZ's
-    `_roles[role].members[msg.sender]`), detected with zero name
-    matching.
+    to it at the call site — see known_msg_sender), whose base resolves
+    (possibly through nested mapping/struct hops) to a real storage
+    mapping, AND whose result is used as a boolean-shaped permission
+    flag — either (a) the Index's own VALUE TYPE is bool (real OZ
+    AccessControl's `_roles[role].members[msg.sender]`), or (b) the
+    Index result feeds a Binary EQUAL/NOT_EQUAL comparison against a
+    literal CONSTANT (real MakerDAO's `wards[msg.sender] == 1` — a
+    pre-0.8-style numeric membership flag, semantically identical to a
+    bool but stored as uint for historical/gas reasons across the
+    entire DSS ecosystem: Vat, Jug, Pot, Spot, Cat, Dog, Vow, Flap,
+    Flop, End, every Join). Both are the same structural claim: the
+    mapping holds a caller-independent, admin-set permission bit,
+    detected with zero name matching.
+
+    The type/comparison gate is load-bearing, not decorative: without
+    it, this matches ANY msg.sender-keyed mapping read inside a
+    revert-capable node — including a plain ECONOMIC allowance check
+    like real Dai's `require(allowance[src][msg.sender] >= wad)`, which
+    has the IDENTICAL Index shape (key=msg.sender, base=a real mapping)
+    but is a numeric spending-limit comparison, not an access-control
+    flag. Confirmed via real IR: allowance[src][msg.sender]'s Index
+    result type is uint256; real AccessControl's
+    _roles[role].members[account]'s Index result type is bool. Found
+    live this session — Dai's transferFrom() scored auth_score=3
+    (AUTHENTICATED) purely from its own allowance-underflow guard,
+    despite being a fully permissionless ERC20 function.
+
+    Branch (b) stays safely distinct from that same false positive
+    because it requires BOTH equality (not ordering — Dai's allowance
+    check is `>=`, never `==`) AND a literal constant on the other side
+    (not a variable — an amount like Dai's `wad` is caller-supplied,
+    never a constant). A real economic threshold check can't satisfy
+    both at once. Found live this session: MakerDAO's `wards` pattern
+    stopped scoring AUTHENTICATED at all after the bool-type gate
+    landed (its Index result type is uint256, not bool), silently
+    losing auth detection — and with it, `wards`' STORAGE_CORRUPTION
+    "privileged" classification — across every DSS contract.
     """
     for ir in node.irs:
         if not isinstance(ir, Index):
             continue
         key_origin, _ = _resolve_operand(ir.variable_right, f, known_msg_sender)
         if not _is_msg_sender_origin(key_origin):
+            continue
+        is_bool = str(getattr(ir.lvalue, "type", None)) == "bool"
+        is_const_equality_flag = is_bool or any(
+            isinstance(other, Binary)
+            and other.type in (BinaryType.EQUAL, BinaryType.NOT_EQUAL)
+            and (
+                (other.variable_left is ir.lvalue and _is_const_value(other.variable_right))
+                or (other.variable_right is ir.lvalue and _is_const_value(other.variable_left))
+            )
+            for other in node.irs
+        )
+        if not is_const_equality_flag:
             continue
         base = _resolve_mapping_base(ir.variable_left, f)
         if base is not None:
@@ -302,6 +346,90 @@ def _role_mapping_in_node(node, f, known_msg_sender: frozenset = frozenset()) ->
     if not _node_can_revert(node):
         return None
     return _role_mapping_ir(node, f, known_msg_sender)
+
+
+_ORDERING_COMPARISON_TYPES = (
+    BinaryType.LESS, BinaryType.GREATER, BinaryType.LESS_EQUAL, BinaryType.GREATER_EQUAL,
+)
+
+
+def find_economic_threshold_vars(f, max_depth: int = 2, _visited: Optional[set] = None) -> Set[str]:
+    """
+    Real variable names read via a msg.sender-keyed Index whose result
+    is NUMERIC (not bool) and feeds a numeric ordering comparison
+    (<, >, <=, >=) — the real Dai.transferFrom()/Fraxlend shape:
+        require(allowance[src][msg.sender] >= wad, "...");
+        if (userBorrowShares[msg.sender] > 0) { ... }
+    Deliberately the MIRROR IMAGE of _role_mapping_ir's bool-type gate
+    (same key/base shape, opposite value-type requirement) — NOT an
+    access-control signal (a numeric threshold/allowance check is not a
+    role/permission grant; Dai's transferFrom is correctly NOT
+    auth-scored just because it checks an allowance, and this function
+    is never consulted for auth_score/AUTHENTICATED evidence).
+
+    Gated on the comparison itself, NOT on the containing node being
+    revert-capable (_node_can_revert) — real Fraxlend's
+    `if (userBorrowShares[msg.sender] > 0) { ... conditional stuff ... }`
+    doesn't revert directly in either branch (the actual revert, if any,
+    is several statements deeper, conditional on unrelated state), so a
+    revert-capable gate misses it entirely. The comparison itself is
+    already real, structural evidence that the protocol treats this
+    value as an economic threshold — no revert requirement needed for
+    that narrower claim.
+
+    Used ONLY to feed core/sinks.py::_privileged_vars_by_contract's
+    OTHER purpose: identifying economically-sensitive (debt/balance/
+    allowance) variables whose writes deserve MISSING_HEALTH_CHECK
+    scrutiny — exactly the kind of numeric accounting Euler's
+    donateToReserves-shaped bugs corrupt. Splitting this out as its own
+    signal (rather than reusing structural_auth_var, which the bool-type
+    fix deliberately narrowed) is what lets Dai.transferFrom() stay
+    correctly UNAUTHENTICATED while real Fraxlend's repayAsset()/
+    liquidate() still register userBorrowShares as sink-worthy — found
+    live this session: without this split, fixing the real
+    transferFrom() false-AUTHENTICATED bug silently made
+    _privileged_vars_by_contract blind to userBorrowShares entirely,
+    losing a genuine, correct MISSING_HEALTH_CHECK finding.
+    """
+    if _visited is None:
+        _visited = set()
+    fid = id(f)
+    if fid in _visited:
+        return set()
+    _visited.add(fid)
+
+    try:
+        nodes = list(getattr(f, "nodes", []) or [])
+    except Exception:
+        return set()
+
+    found: Set[str] = set()
+    for node in nodes:
+        for ir in node.irs:
+            if not isinstance(ir, Index):
+                continue
+            if str(getattr(ir.lvalue, "type", None)) == "bool":
+                continue
+            key_origin, _ = _resolve_operand(ir.variable_right, f)
+            if not _is_msg_sender_origin(key_origin):
+                continue
+            if not any(
+                isinstance(other, Binary)
+                and other.type in _ORDERING_COMPARISON_TYPES
+                and (other.variable_left is ir.lvalue or other.variable_right is ir.lvalue)
+                for other in node.irs
+            ):
+                continue
+            base = _resolve_mapping_base(ir.variable_left, f)
+            if base is not None:
+                found.add(str(base))
+
+    if max_depth > 0:
+        for node in nodes:
+            for ir in node.irs:
+                if isinstance(ir, InternalCall) and getattr(ir, "function", None) is not None:
+                    found |= find_economic_threshold_vars(ir.function, max_depth - 1, _visited)
+    return found
 
 
 def _evidence_anywhere_in_body(f, max_depth: int, _visited: set, known_msg_sender: frozenset = frozenset()) -> Optional[AuthFinding]:

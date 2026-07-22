@@ -13,44 +13,54 @@ pragma solidity ^0.8.19;
 // common "delegation/approval" pattern (identical in shape to ERC20's
 // allowances[owner][spender]) was never recognized as self-scoped.
 contract NestedMappingSelfScope {
-    mapping(address => mapping(address => uint256)) public can;
-    mapping(address => mapping(address => uint256)) public allowances;
+    address public constant ADMIN = address(0xdead);
+    mapping(address => mapping(address => bool)) public can;
+    mapping(address => mapping(address => bool)) public allowances;
 
     // Makes both mappings structurally "privileged" for classify_sinks
-    // (core/sinks.py::_privileged_vars_by_contract) — a real
-    // msg.sender-keyed lookup gating a revert, the same real shape
-    // used elsewhere this session. Without this, writes to `can`/
-    // `allowances` never become STORAGE_CORRUPTION sinks at all and
-    // this fixture wouldn't exercise the check under test.
-    modifier onlyPermitted(address usr) {
-        require(can[msg.sender][usr] > 0, "not permitted");
+    // (core/sinks.py::_privileged_vars_by_contract): a real
+    // msg.sender-keyed BOOLEAN lookup gating a revert, with msg.sender
+    // as the INNERMOST (bool-valued) key — can[ADMIN][msg.sender] —
+    // matching the real AccessControl.hasRole shape
+    // (_role_mapping_ir requires msg.sender to be the key of the
+    // FINAL, bool-typed Index; can[msg.sender][usr]'s OUTER index
+    // result is an intermediate mapping reference, not bool, so that
+    // shape alone can't double as its own auth gate — a real,
+    // structural distinction, not a fixture quirk). Deliberately a
+    // DIFFERENT read shape on the SAME root variable than hope()/
+    // nope()'s write, mirroring a real bidirectional permission
+    // mapping (can[grantor][grantee]): ADMIN pre-approving specific
+    // callers here, separate from any caller granting/revoking their
+    // own delegates via hope()/nope().
+    modifier onlyAdminApproved() {
+        require(can[ADMIN][msg.sender], "not approved by admin");
         _;
     }
 
-    modifier onlyApproved(address spender) {
-        require(allowances[msg.sender][spender] > 0, "not approved");
+    modifier onlyPreApproved() {
+        require(allowances[ADMIN][msg.sender], "not pre-approved");
         _;
     }
 
-    function privilegedGrant(address usr) external onlyPermitted(usr) {}
-    function privilegedSpend(address spender) external onlyApproved(spender) {}
+    function privilegedGrant() external onlyAdminApproved() {}
+    function privilegedSpend() external onlyPreApproved() {}
 
     // Safe (real Vat.hope() shape): the OUTER key is msg.sender — the
     // write can only ever land inside the caller's own subtree,
     // regardless of what `usr` is chosen. Must be self-scoped.
     function hope(address usr) external {
-        can[msg.sender][usr] = 1;
+        can[msg.sender][usr] = true;
     }
 
     function nope(address usr) external {
-        can[msg.sender][usr] = 0;
+        can[msg.sender][usr] = false;
     }
 
     // DANGEROUS: neither the outer key (victim) nor the inner key
     // (spender) is msg.sender — an attacker can corrupt an arbitrary
     // victim's allowance row for an arbitrary spender. Must NOT be
     // self-scoped.
-    function corruptAllowance(address victim, address spender, uint256 amount) external {
-        allowances[victim][spender] = amount;
+    function corruptAllowance(address victim, address spender, bool approved) external {
+        allowances[victim][spender] = approved;
     }
 }

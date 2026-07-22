@@ -19,7 +19,7 @@ from core.auth_detection import (
     compute_own_auth, is_reentrancy_guard, has_inline_reentrancy_guard,
     has_state_write_after_external_call, has_revert_capable_body,
     find_self_scoped_writes, find_self_scoped_asset_moves,
-    find_self_scoped_liability_reductions,
+    find_self_scoped_liability_reductions, find_economic_threshold_vars,
 )
 from slither.slithir.operations import (
     InternalCall, HighLevelCall, LowLevelCall, SolidityCall, LibraryCall
@@ -70,6 +70,20 @@ class FunctionNode:
     modifier_ids: List[str] = field(default_factory=list)
     structural_auth_score: int = 0
     structural_auth_var: Optional[str] = None
+    # Real variable names this function reads via a msg.sender-keyed
+    # NUMERIC (non-bool) Index inside a revert-capable node — see
+    # core/auth_detection.py::find_economic_threshold_vars. Deliberately
+    # SEPARATE from structural_auth_var (which requires the mirror-image
+    # bool-typed shape and feeds auth_score/AUTHENTICATED): a numeric
+    # threshold check like Dai's `allowance[src][msg.sender] >= wad` is
+    # NOT access-control evidence, but it DOES mark `allowance` as an
+    # economically-sensitive variable core/sinks.py::
+    # _privileged_vars_by_contract needs for MISSING_HEALTH_CHECK
+    # purposes — real Fraxlend's userBorrowShares (checked via
+    # `userBorrowShares[msg.sender] > 0`) needed exactly this split to
+    # stay sink-worthy without also making Dai.transferFrom() wrongly
+    # AUTHENTICATED.
+    economic_threshold_vars: Set[str] = field(default_factory=set)
     is_reentrancy_guard: bool = False
     # True if this REGULAR function (not a modifier) contains an
     # inlined reentrancy-guard shape directly in its own body — see
@@ -411,6 +425,7 @@ def build_graph(
                 own_auth = compute_own_auth(f)
                 structural_auth_score = own_auth.score
                 structural_auth_var = own_auth.matched_state_var
+                economic_threshold_vars = find_economic_threshold_vars(f)
                 modifier_ids = [canonical_id(contract.name, m.full_name) for m in f.modifiers]
                 guard = is_reentrancy_guard(f) if is_modifier else False
                 inline_guard = has_inline_reentrancy_guard(f) if not is_modifier else False
@@ -462,6 +477,7 @@ def build_graph(
                     modifier_ids=modifier_ids,
                     structural_auth_score=structural_auth_score,
                     structural_auth_var=structural_auth_var,
+                    economic_threshold_vars=economic_threshold_vars,
                     is_reentrancy_guard=guard,
                     has_inline_reentrancy_guard=inline_guard,
                     state_write_follows_external_call=write_follows_call,

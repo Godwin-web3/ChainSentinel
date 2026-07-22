@@ -106,7 +106,22 @@ def _privileged_vars_by_contract(nodes: dict, graph_edges: dict) -> dict:
           compares against or looks up by (FunctionNode.structural_auth_var,
           core/auth_detection.py — direct comparison or role-mapping
           evidence) — i.e. a variable the contract itself already treats
-          as governing who's allowed to act, proven by usage.
+          as governing who's allowed to act, proven by usage, or
+      (c) the real variable a msg.sender-keyed NUMERIC threshold check
+          reads (FunctionNode.economic_threshold_vars — a real Dai/
+          Fraxlend shape: `allowance[src][msg.sender] >= wad`,
+          `userBorrowShares[msg.sender] > 0`). Deliberately separate
+          from (b): a numeric threshold check is NOT access-control
+          evidence (Dai's transferFrom() correctly stays
+          UNAUTHENTICATED — checking an allowance isn't a role grant),
+          but it DOES mark the variable as economically sensitive
+          (debt/balance/allowance) — exactly what MISSING_HEALTH_CHECK
+          needs to consider "privileged" (Euler's donateToReserves shape
+          corrupts precisely this kind of numeric accounting). A write
+          to such a variable can still be proven safe by
+          find_self_scoped_writes' own outer/inner-key self-scoping
+          (e.g. Dai.approve()'s allowance[msg.sender][usr] = wad) — this
+          only controls sink ELIGIBILITY, not the final verdict.
     """
     by_contract: dict = {}
     for cid, node in nodes.items():
@@ -117,6 +132,8 @@ def _privileged_vars_by_contract(nodes: dict, graph_edges: dict) -> dict:
         auth_var = getattr(node, "structural_auth_var", None)
         if auth_var:
             bucket.add(str(auth_var).lower())
+        for econ_var in getattr(node, "economic_threshold_vars", None) or ():
+            bucket.add(str(econ_var).lower())
         for edge in graph_edges.get(cid, []):
             if edge.raw_type in ("delegatecall", "codecall") and edge.destination:
                 dest_str = str(edge.destination)

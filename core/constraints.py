@@ -622,17 +622,33 @@ def _check_missing_health_check(path, nodes, graph_edges) -> ConstraintResult:
     # check is over actual storage read/write overlap.
     path_writes = _accumulate_path_state_writes(path, nodes)
     if path_writes:
+        # Mirrors _guard_constrains_sink_state's own acceptance criteria
+        # (auth_score >= 2, OR is_view, OR has_revert_capable_body) —
+        # this is only a coarse PRE-filter ("could ANY function in the
+        # contract possibly be a guard for this state"), so it must stay
+        # at least as permissive as the real, later check or it silently
+        # suppresses genuine findings before they're ever evaluated.
+        # Previously auth_score-only, which missed is_view guards
+        # (Morpho's _isHealthy()) and — found live this session — real
+        # Fraxlend's removeCollateral()'s own
+        # `if (userBorrowShares[msg.sender] > 0)` check: after fixing
+        # _role_mapping_ir's real transferFrom() false-AUTHENTICATED
+        # bug (a numeric threshold check misdetected as a role/
+        # permission grant), removeCollateral() correctly dropped below
+        # auth_score >= 2, which silently made this filter blind to
+        # userBorrowShares entirely, losing repayAsset()'s genuine,
+        # correct MISSING_HEALTH_CHECK finding as a side effect.
         guard_reads = {
             str(v).lower()
             for n in nodes.values()
-            if getattr(n, 'auth_score', 0) >= 2
+            if getattr(n, 'auth_score', 0) >= 2 or getattr(n, 'is_view', False) or getattr(n, 'has_revert_capable_body', False)
             for v in getattr(n, 'reads', set())
         }
         sink_writes = {str(v).lower() for v in getattr(sink, 'state_writes', set())}
         if not (sink_writes & guard_reads):
             return _suppressed(
                 path,
-                "No auth-scored guard in the contract reads any variable "
+                "No guard-capable function in the contract reads any variable "
                 "this path writes — health check structurally irrelevant",
             )
 
@@ -646,6 +662,32 @@ def _check_missing_health_check(path, nodes, graph_edges) -> ConstraintResult:
         auth_state = getattr(entry_node, 'auth_state', '')
         if auth_score >= 3 or auth_state == "AUTHENTICATED":
             return _suppressed(path, "owner-gated function — MHC not applicable")
+
+    # Self-scoped write: the sink's privileged write is PROVABLY
+    # confined to the caller's own storage slot (core/auth_detection.py
+    # ::find_self_scoped_writes / find_self_scoped_liability_reductions
+    # — the same evidence _check_access_control_gap already relies on).
+    # Deliberately narrower than the ASSET_DRAIN self-scoped-move check
+    # (which does NOT extend here — proven unsound live: a self-scoped
+    # RECIPIENT doesn't validate the AMOUNT/CONDITION, confirmed by this
+    # session's own adversarial withdrawUnsafe() fixture, an
+    # attacker-controlled oracle behind a self-scoped ETH refund).
+    # STORAGE writes are different: Euler's real donateToReserves shape
+    # requires corrupting GLOBAL or CROSS-USER accounting (reserves, a
+    # shared value) — a write structurally proven confined to
+    # data[msg.sender] can never touch shared state, by construction,
+    # so it cannot replicate that exploit shape regardless of amount.
+    # Found live this session: Dai.approve()'s
+    # `allowance[msg.sender][usr] = wad` (a pure permission grant, no
+    # value moves until a LATER, separately-checked transferFrom) was
+    # correctly proven self-scoped for ACCESS_CONTROL_GAP but MISSING_
+    # HEALTH_CHECK never consulted the same evidence.
+    if sink.category == STORAGE_CORRUPTION and sink.privileged_writes and entry_node is not None:
+        self_scoped = getattr(entry_node, "self_scoped_write_keys", set())
+        self_funded = getattr(entry_node, "self_scoped_liability_reduction_keys", set())
+        combined = self_scoped | self_funded
+        if combined and sink.privileged_writes.issubset(combined):
+            return _suppressed(path, "Privileged write is provably confined to the caller's own storage — MHC not applicable")
 
     path_has_debt_context = False
     health_check_found = False
@@ -668,6 +710,34 @@ def _check_missing_health_check(path, nodes, graph_edges) -> ConstraintResult:
                 if inner_callee and _guard_constrains_sink_state(inner_callee, sink, graph_edges):
                     health_check_found = True
                     break
+
+    # Modifier scan: a modifier ATTACHED to the entry (e.g. real
+    # Fraxlend's `isSolvent(msg.sender)` on borrowAsset()/
+    # leveragedPosition()/repayAssetWithCollateral()) is invisible to
+    # the edge_chain/sibling-edge walks above — modifier attachment
+    # isn't a call-graph edge, it's a separate relationship
+    # (FunctionNode.modifier_ids), the same field
+    # _check_reentrancy_cei's own guard scan already uses. Found live
+    # this session: without this, these three real, isSolvent-protected
+    # Fraxlend functions false-positived MISSING_HEALTH_CHECK once an
+    # unrelated fix (widening the early "no possible guard exists"
+    # pre-filter) stopped silently suppressing them for the WRONG
+    # reason before they ever reached this scan.
+    if not health_check_found and entry_node is not None:
+        for mid in getattr(entry_node, 'modifier_ids', []) or []:
+            modifier_node = nodes.get(mid)
+            if not modifier_node:
+                continue
+            if _guard_constrains_sink_state(modifier_node, sink, graph_edges):
+                health_check_found = True
+                break
+            for inner_edge in graph_edges.get(mid, []):
+                inner_callee = nodes.get(inner_edge.dst)
+                if inner_callee and _guard_constrains_sink_state(inner_callee, sink, graph_edges):
+                    health_check_found = True
+                    break
+            if health_check_found:
+                break
 
     # Sibling guard scan (Issue 5, widened): the edge_chain walk above
     # only inspects callees that lie ON the path to the sink. A guard
