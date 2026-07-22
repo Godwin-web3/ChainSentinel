@@ -341,7 +341,22 @@ def _trace_temp_to_source(temp, f, max_depth: int = 5):
     underlying source variable, or None if unresolvable.
     """
     try:
-        from slither.core.variables.temporary_variable import TemporaryVariable
+        # The real module is slither.slithir.variables.temporary —
+        # slither.core.variables.temporary_variable (the previous
+        # import here) doesn't exist at all, raising ModuleNotFoundError
+        # on every call, silently caught by this except and returning
+        # None unconditionally. That made this entire function a no-op
+        # for its whole life: every TypeConversion-wrapped call
+        # destination (IFoo(stateVar).bar() — the standard interface-
+        # cast pattern used by virtually every external call in
+        # Solidity) fell through _resolve_trust straight to "untrusted",
+        # since the TemporaryVariable branch below could never resolve
+        # a source to check. Found live re-verifying Convex Booster's
+        # admin-only functions (setFeeInfo/shutdownPool/shutdownSystem):
+        # their external calls target `registry`/`staker` — a constant
+        # and a constructor-set immutable, both genuinely trusted —  but
+        # scored trusted=False regardless.
+        from slither.slithir.variables.temporary import TemporaryVariable
     except Exception:
         return None
     seen = set()
@@ -417,16 +432,20 @@ def _state_var_writers(state_var, contract) -> list:
 def _writers_are_trusted(state_var, contract, auth_lookup: Optional[dict]) -> bool:
     """
     True if every function that writes to state_var is either the
-    constructor (inherently trusted — runs once at deploy) or an
-    auth-scored function (auth_score >= AUTH_TRUST_THRESHOLD).
-    No writers (immutable/constant) counts as trusted.
+    constructor (inherently trusted — runs once at deploy), Slither's
+    own synthetic constant/immutable-initializer function (real,
+    constant `= value` / immutable-set-in-declaration state variables —
+    is_constructor_variables — deploy-time only, exactly as trusted as
+    the real constructor, not a name guess but a genuine FunctionType
+    Slither itself assigns), or an auth-scored function (auth_score >=
+    AUTH_TRUST_THRESHOLD). No writers counts as trusted.
     """
     writers = _state_var_writers(state_var, contract)
     if not writers:
         return True
     for w in writers:
         try:
-            if w.is_constructor:
+            if w.is_constructor or w.is_constructor_variables:
                 continue
         except Exception:
             pass
@@ -464,7 +483,7 @@ def _writers_are_governance_gated(state_var, contract, auth_lookup: Optional[dic
     non_constructor = []
     for w in writers:
         try:
-            if w.is_constructor:
+            if w.is_constructor or w.is_constructor_variables:
                 continue
         except Exception:
             pass
@@ -896,7 +915,7 @@ def _resolve_trust(ir, raw_type: str, f, auth_lookup: Optional[dict], node=None)
 
     # Temporary variable — backward-slice to its source via the function IR
     try:
-        from slither.core.variables.temporary_variable import TemporaryVariable
+        from slither.slithir.variables.temporary import TemporaryVariable
         if isinstance(dest, TemporaryVariable):
             source = _trace_temp_to_source(dest, f)
             if source is not None:

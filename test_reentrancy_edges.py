@@ -179,9 +179,61 @@ def test_unchecked_return_requires_real_dataflow_evidence():
           "withdraw() suppressed, withdrawUnchecked() still", unchecked_findings[0].verdict)
 
 
+def test_trusted_interface_cast_destination_excludes_callback_sink():
+    """
+    Reproduces the real Convex Booster false positive found live this
+    session: admin-only functions (setFeeInfo/shutdownPool/
+    shutdownSystem) call out to `registry` (a constant) and `staker`
+    (a constructor-set immutable) via the standard interface-cast
+    pattern (IFoo(stateVar).bar()) — both genuinely trusted, fixed
+    destinations, but two compounding bugs in core/edges.py's trust
+    resolution (a broken TemporaryVariable import path, and Slither's
+    synthetic constant-variable initializer not being recognized as
+    constructor-equivalent) made them score trusted=False regardless.
+
+    adminOnlyAction() (registry/staker, both fixed) must not classify
+    as a sink at all. attackerControlled() (an arbitrary parameter)
+    proves this doesn't weaken detection — must still classify
+    CALLBACK_SINK and fire REENTRANCY_CEI.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("TrustedCalleeReentrancy.sol")
+
+    safe_edges = [e for e in graph_edges.get("TrustedCalleeReentrancy.adminOnlyAction()", []) if e.is_external]
+    assert safe_edges and all(e.trusted for e in safe_edges), (
+        f"registry (constant) and staker (constructor-set immutable) are both genuinely fixed — must score trusted=True, got {safe_edges}"
+    )
+
+    dangerous_edges = [e for e in graph_edges.get("TrustedCalleeReentrancy.attackerControlled(address)", []) if e.is_external]
+    assert dangerous_edges and not any(e.trusted for e in dangerous_edges), (
+        "an arbitrary caller-supplied parameter must not score trusted=True"
+    )
+
+    sinks = classify_sinks(nodes, graph_edges)
+    assert sinks.get("TrustedCalleeReentrancy.adminOnlyAction()") is None, (
+        "a call to a genuinely trusted, fixed destination is not a reentrancy surface — must not classify as any sink"
+    )
+    assert sinks.get("TrustedCalleeReentrancy.attackerControlled(address)") is not None
+
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible
+
+    safe_findings = [r for r in all_results if r.path.entry == "TrustedCalleeReentrancy.adminOnlyAction()"]
+    assert not safe_findings, f"adminOnlyAction() only calls trusted, fixed destinations — must have zero findings, got {safe_findings}"
+
+    dangerous_findings = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == "TrustedCalleeReentrancy.attackerControlled(address)" and "REENTRANCY_CEI" in r.constraint_type
+    ]
+    assert dangerous_findings, "attackerControlled() calls an arbitrary caller-supplied destination — REENTRANCY_CEI must still fire"
+    print("test_trusted_interface_cast_destination_excludes_callback_sink: PASS —",
+          "adminOnlyAction 0 findings, attackerControlled still", dangerous_findings[0].verdict)
+
+
 if __name__ == "__main__":
     test_entry_level_cei_violation_detected()
     test_staticcall_not_misclassified_as_asset_drain_or_callback()
     test_inline_reentrancy_guard_detected_without_weakening()
     test_unchecked_return_requires_real_dataflow_evidence()
+    test_trusted_interface_cast_destination_excludes_callback_sink()
     print("\nAll reentrancy_edges tests passed.")
