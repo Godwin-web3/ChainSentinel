@@ -422,6 +422,57 @@ def analyze(address, chain_name, output_json=False):
                             ]
                         }
                         log.success(f"Graph: {len(nodes)} nodes | {len(sinks)} sinks | CONFIRMED:{len(report.confirmed)} LIKELY:{len(report.likely)} POSSIBLE:{len(report.possible)}")
+
+                        # Cross-market reentrancy — a class of bug neither the
+                        # single-contract REENTRANCY_CEI nor CROSS_FUNCTION_STATE_RACE
+                        # checks can see even in principle: a CEI violation in one
+                        # market, exploited by reentering a DIFFERENT market that
+                        # reads the first market's stale state through a shared hub
+                        # (the real root cause behind Cream Finance $18.8M, dForce
+                        # $25M, Rari Fuse $80M). Only fires when the entry contract
+                        # has a real, IR-grounded enumeration getter — most
+                        # contracts don't, and this is a no-op for them.
+                        try:
+                            from core.protocol_graph import build_protocol_graph
+                            from core.cross_market import check_cross_market_reentrancy
+
+                            protocol_result = build_protocol_graph(
+                                entry_address=address,
+                                entry_name=resolved["name"],
+                                chain=chain,
+                                project_root=p_root,
+                                entry_file=e_file,
+                                solc_version=s_ver,
+                                enrichment=enrichment,
+                                base_nodes=nodes,
+                                remaps=remaps,
+                            )
+                            if protocol_result:
+                                proto_nodes, proto_edges, proto_notes = protocol_result
+                                cross_findings = check_cross_market_reentrancy(proto_nodes, proto_edges) if proto_edges else []
+                                analysis["graph"]["cross_market"] = {
+                                    "notes": proto_notes,
+                                    "unified_nodes": len(proto_nodes),
+                                    "findings": [
+                                        {
+                                            "vulnerable_entry": f.vulnerable_entry,
+                                            "reentry_entry": f.reentry_entry,
+                                            "shared_read_path": f.shared_read_path,
+                                            "at_risk_keys": [
+                                                f"{c}.{r}" + (f".{'.'.join(p)}" if p else "")
+                                                for c, r, p in f.at_risk_keys
+                                            ],
+                                            "call_event": f.call_event.node_expr_str,
+                                        }
+                                        for f in cross_findings
+                                    ],
+                                }
+                                if cross_findings:
+                                    log.success(f"Cross-market reentrancy: {len(cross_findings)} finding(s) across {len(proto_nodes)}-node unified graph")
+                                else:
+                                    log.info(f"Cross-market reentrancy: 0 findings across {len(proto_nodes)}-node unified graph ({len(proto_notes)} protocol notes)")
+                        except Exception as pe:
+                            log.warn(f"Cross-market protocol graph failed: {pe}")
                 except Exception as ge:
                     log.warn(f"Graph analysis failed: {ge}")
             # Always run Yul handler on Solidity — catches inline assembly

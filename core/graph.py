@@ -73,6 +73,22 @@ class FunctionNode:
                                                           # invariant_writes_between_calls, using
                                                           # real node-order (not approximated).
                                                           # Empty means CEI-safe per this check.
+    state_writes_after_callback: List = field(default_factory=list)
+                                                          # List[(CallEvent, at_risk_keys)], same
+                                                          # computation as race_findings but with
+                                                          # THIS function's own full write-set as
+                                                          # the "relevant" filter — i.e. every write
+                                                          # that happens after a callback-capable
+                                                          # call, full stop, not just ones a LOCAL
+                                                          # invariant/assertion elsewhere also
+                                                          # references. race_findings' narrower
+                                                          # local-invariant relevance is the right
+                                                          # bar for CROSS_FUNCTION_STATE_RACE; this
+                                                          # broader one is what core/cross_market.py
+                                                          # needs, since ITS relevance signal is a
+                                                          # real cross-contract read elsewhere in the
+                                                          # unified graph, not a same-contract
+                                                          # assertion.
 
     # Layer 5 — computed
     reachable_from_untrusted: bool = False
@@ -159,6 +175,26 @@ def find_enumeration_getter(nodes: Dict[str, "FunctionNode"], entry_contract: st
             and node.full_name.endswith("()")
         ):
             return node.full_name
+    return None
+
+
+def find_any_enumeration_getter(nodes: Dict[str, "FunctionNode"], entry_contract: str):
+    """
+    Same real, ABI/IR-grounded detection as find_enumeration_getter, but
+    without requiring the target element type in advance — used when
+    checking "does this contract enumerate a market/pool family at all",
+    where the type isn't known until we find the getter.
+
+    Returns (getter_full_name, element_type) or None.
+    """
+    for node in nodes.values():
+        if (
+            node.contract == entry_contract
+            and node.returns_address_collection
+            and node.enumeration_element_type
+            and node.full_name.endswith("()")
+        ):
+            return node.full_name, node.enumeration_element_type
     return None
 
 
@@ -394,9 +430,12 @@ def build_graph(
         relevant_bare = {
             (k[1], k[2]) for k in invariant_index.keys() if k[0] == node.contract
         }
-        if not relevant_bare:
-            continue
-        node.race_findings = invariant_writes_between_calls(f_obj, relevant_bare)
+        if relevant_bare:
+            node.race_findings = invariant_writes_between_calls(f_obj, relevant_bare)
+
+        own_writes = extract_field_precise_writes(f_obj)
+        if own_writes:
+            node.state_writes_after_callback = invariant_writes_between_calls(f_obj, own_writes)
 
     # Layer 4 — reachability (using real canonical edges)
     _compute_reachability(nodes)
