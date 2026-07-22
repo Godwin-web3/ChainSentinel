@@ -141,8 +141,47 @@ def test_inline_reentrancy_guard_detected_without_weakening():
           "withdrawLocked suppressed, withdrawFakeInline still", fake_findings[0].verdict)
 
 
+def test_unchecked_return_requires_real_dataflow_evidence():
+    """
+    Reproduces the real finding that core/constraints.py::
+    _check_unchecked_return fired on ANY low-level call regardless of
+    whether its return was validated. withdraw() (checked via
+    `require(ok, ...)`) must NOT fire UNCHECKED_RETURN; withdrawUnchecked()
+    (return value fully discarded) must.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("ReentrancyEdgeCases.sol")
+
+    checked_edges = [e for e in graph_edges.get("ReentrancyEdgeCases.withdraw()", []) if e.raw_type == "lowlevel_call"]
+    assert checked_edges and checked_edges[0].return_checked is True
+
+    unchecked_edges = [
+        e for e in graph_edges.get("ReentrancyEdgeCases.withdrawUnchecked()", []) if e.raw_type == "lowlevel_call"
+    ]
+    assert unchecked_edges and unchecked_edges[0].return_checked is False
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible
+
+    checked_findings = [
+        r for r in all_results
+        if r.path.entry == "ReentrancyEdgeCases.withdraw()" and "UNCHECKED_RETURN" in r.constraint_type
+    ]
+    assert not checked_findings, f"withdraw() checks its return via require(ok, ...) — must not fire, got {checked_findings}"
+
+    unchecked_findings = [
+        r for r in all_results
+        if r.path.entry == "ReentrancyEdgeCases.withdrawUnchecked()" and "UNCHECKED_RETURN" in r.constraint_type
+    ]
+    assert unchecked_findings, "withdrawUnchecked() discards its return value entirely — must fire"
+    print("test_unchecked_return_requires_real_dataflow_evidence: PASS —",
+          "withdraw() suppressed, withdrawUnchecked() still", unchecked_findings[0].verdict)
+
+
 if __name__ == "__main__":
     test_entry_level_cei_violation_detected()
     test_staticcall_not_misclassified_as_asset_drain_or_callback()
     test_inline_reentrancy_guard_detected_without_weakening()
+    test_unchecked_return_requires_real_dataflow_evidence()
     print("\nAll reentrancy_edges tests passed.")

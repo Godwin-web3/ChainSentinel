@@ -29,6 +29,16 @@ pragma solidity ^0.8.19;
 //    call reachable from a STATICCALL: nothing downstream, including a
 //    callback into the calling function, can ever write state or move
 //    value.
+//
+// 4. core/constraints.py::_check_unchecked_return fired on ANY
+//    low-level call on a path, never actually checking whether the
+//    return value was validated — a false positive on virtually any
+//    competently-written contract (TransferHelper.safeTransfer, OZ's
+//    Address.functionCall, Liquity's _sendETHGainToDepositor all check
+//    their own return). Fixed with real dataflow tracing (core/
+//    edges.py::_low_level_return_checked): does the call's own `bool
+//    success` unpack to a variable later read by a revert-capable node
+//    in the same function?
 contract ReentrancyEdgeCases {
     uint256 public balance;
     address public token0;
@@ -86,5 +96,14 @@ contract ReentrancyEdgeCases {
         require(ok, "call failed");
         balance = 0;
         counter += 1;
+    }
+
+    // DANGEROUS: the low-level call's return value is completely
+    // discarded — never captured, never checked. The real
+    // King-of-Ether-style unchecked-return bug. Must fire
+    // UNCHECKED_RETURN.
+    function withdrawUnchecked() external {
+        msg.sender.call{value: 0}("");
+        balance = 0;
     }
 }

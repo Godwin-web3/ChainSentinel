@@ -43,6 +43,7 @@ from slither.slithir.operations import (
     NewContract,
     SolidityCall,
 )
+from slither.slithir.operations.unpack import Unpack
 
 
 # ── Data model ────────────────────────────────────────────────────
@@ -93,6 +94,17 @@ class CallEdge:
     # transfer(address,uint256) does, regardless of what the surrounding
     # function is called.
     is_token_transfer: bool = False
+
+    # True if a low-level call's own `bool success` return (always
+    # index 0 of its (bool, bytes) tuple, for .call/.delegatecall/
+    # .codecall/.staticcall alike) is unpacked and then read by a
+    # revert-capable node SOMEWHERE in the same function — the real
+    # require(success, ...) pattern virtually every professionally-
+    # written low-level call uses. Only meaningful for raw_type in
+    # (lowlevel_call, delegatecall, codecall, staticcall); False
+    # (its default) for every other raw_type, where it carries no
+    # meaning at all.
+    return_checked: bool = False
 
 
 # ── Layer 1: IR normalization ─────────────────────────────────────
@@ -639,6 +651,140 @@ def _node_can_revert(node) -> bool:
         return False
 
 
+def _low_level_return_checked(ir, f) -> bool:
+    """
+    True if a low-level call's own `bool success` return — always index
+    0 of its (bool, bytes) tuple lvalue, for .call/.delegatecall/
+    .codecall/.staticcall alike — is unpacked and then read by a
+    revert-capable node somewhere in the same function, OR passed as an
+    argument to an internal call whose corresponding parameter is
+    itself checked the same way (bounded, cycle-safe recursion).
+
+    Real evidence, not a heuristic: virtually every professionally-
+    written low-level call checks its own return this way —
+    TransferHelper.safeTransfer's `require(success && ...)`, Liquity's
+    `require(success, "...")` in _sendETHGainToDepositor, and (the
+    reason the indirect/parameter-binding case exists at all) OZ's
+    Address.functionCallWithValue, used by Convex's
+    _callOptionalReturn:
+        (bool success, bytes memory returndata) = target.call{...}(data);
+        return _verifyCallResult(success, returndata, errorMessage);
+    where _verifyCallResult does `if (success) {...} else { revert(...); }`
+    one call-frame deeper — `success` is never itself read by a
+    revert-capable node in functionCallWithValue's OWN body, only
+    passed on. core/constraints.py::_check_unchecked_return previously
+    never inspected any of this — it fired whenever ANY low-level call
+    existed on a path, regardless of whether the return was actually
+    validated, a false positive on essentially any competently-written
+    contract. Found live re-verifying Convex Booster, Liquity
+    StabilityPool, and Uniswap V3 after the low-level-call
+    edge-extraction fix made these calls visible for the first time
+    this session.
+    """
+    lvalue = getattr(ir, "lvalue", None)
+    if lvalue is None:
+        return False  # return value discarded entirely — genuinely unchecked
+
+    try:
+        all_nodes = list(getattr(f, "nodes", []) or [])
+    except Exception:
+        return False
+
+    success_var = None
+    for node in all_nodes:
+        for other_ir in getattr(node, "irs", []) or []:
+            if (
+                isinstance(other_ir, Unpack)
+                and getattr(other_ir, "tuple", None) is lvalue
+                and getattr(other_ir, "index", None) == 0
+            ):
+                success_var = other_ir.lvalue
+                break
+        if success_var is not None:
+            break
+
+    # Some shapes check the call's own (undestructured) lvalue directly
+    # rather than an Unpack'd component — fall back to it too.
+    candidates = [v for v in (success_var, lvalue) if v is not None]
+
+    return _value_checked_or_propagated(candidates, all_nodes, max_depth=3)
+
+
+def _value_checked_or_propagated(candidates: list, nodes: list, max_depth: int, _visited: Optional[set] = None) -> bool:
+    """
+    True if any variable in `candidates` is read by a revert-capable
+    node among `nodes`, OR is passed as an argument to an InternalCall
+    whose corresponding parameter is itself checked the same way in the
+    callee's own body (recursively, bounded by max_depth, cycle-safe
+    via _visited on callee identity).
+    """
+    for node in nodes:
+        read_vars = list(getattr(node, "variables_read", []) or [])
+        if not any(rv is c for rv in read_vars for c in candidates):
+            continue
+        if _branch_reaches_revert(node):
+            return True
+
+    if max_depth <= 0:
+        return False
+
+    if _visited is None:
+        _visited = set()
+
+    for node in nodes:
+        for ir in getattr(node, "irs", []) or []:
+            if not (isinstance(ir, InternalCall) and getattr(ir, "function", None) is not None):
+                continue
+            callee = ir.function
+            cid = id(callee)
+            if cid in _visited:
+                continue
+            args = list(getattr(ir, "arguments", None) or [])
+            params = list(getattr(callee, "parameters", None) or [])
+            matched_params = [p for p, a in zip(params, args) if any(a is c for c in candidates)]
+            if not matched_params:
+                continue
+            _visited.add(cid)
+            try:
+                callee_nodes = list(getattr(callee, "nodes", []) or [])
+            except Exception:
+                continue
+            if _value_checked_or_propagated(matched_params, callee_nodes, max_depth - 1, _visited):
+                return True
+    return False
+
+
+def _branch_reaches_revert(node, max_depth: int = 4, _visited: Optional[set] = None) -> bool:
+    """
+    True if `node` itself is revert-capable (_node_can_revert), or any
+    node reachable from it via CFG sons within max_depth hops is.
+    _node_can_revert alone only looks one hop ahead (a THROW son, or a
+    revert SolidityCall directly on a son) — real code often nests
+    deeper, e.g. OZ's _verifyCallResult:
+        if (success) { return returndata; }
+        else {
+            if (returndata.length > 0) { assembly { revert(...) } }
+            else { revert(errorMessage); }
+        }
+    The node reading `success` (`CONDITION success`) has sons
+    [RETURN, IF] — no direct THROW son — with the actual revert two
+    more hops down the false branch. Scoped to this module's low-level-
+    return-check use only; does not change _node_can_revert's own
+    behavior or any of its other call sites.
+    """
+    if _visited is None:
+        _visited = set()
+    if id(node) in _visited or max_depth < 0:
+        return False
+    _visited.add(id(node))
+    if _node_can_revert(node):
+        return True
+    for son in getattr(node, "sons", []) or []:
+        if _branch_reaches_revert(son, max_depth - 1, _visited):
+            return True
+    return False
+
+
 def _registry_validates_struct(f, struct_param, call_node=None) -> bool:
     """
     True if function f contains a registry validation of struct_param
@@ -975,6 +1121,11 @@ def extract_edges(src_id: str, f, auth_lookup: Optional[dict] = None, slither=No
                     trusted=trusted,
                     governance_gated=governance_gated,
                     is_token_transfer=_is_token_transfer_call(ir) if raw_type == "highlevel" else False,
+                    return_checked=(
+                        _low_level_return_checked(ir, f)
+                        if raw_type in ("lowlevel_call", "delegatecall", "codecall", "staticcall")
+                        else False
+                    ),
                     **props,
                 ))
 

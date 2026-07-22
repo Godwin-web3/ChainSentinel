@@ -890,16 +890,27 @@ def _check_flashloan_window(path, nodes, graph_edges) -> ConstraintResult:
 def _check_unchecked_return(path, nodes, graph_edges) -> ConstraintResult:
     """
     Detect ignored return values from low-level calls.
-    Pattern: lowlevel_call edge where return value is not validated.
+    Pattern: lowlevel_call edge where the return value is not validated
+    — core/edges.py::_low_level_return_checked traces the call's own
+    `bool success` (index 0 of its (bool, bytes) tuple) forward through
+    any Unpack to a revert-capable read in the SAME function, real
+    dataflow evidence rather than "a low-level call exists on this
+    path" alone. That blanket version previously fired on every
+    low-level call regardless of whether it was checked — a false
+    positive on essentially any competently-written contract (found
+    live: TransferHelper.safeTransfer, OZ's Address.functionCall, and
+    Liquity's _sendETHGainToDepositor all check their own return, none
+    of which the old version could tell apart from a genuinely
+    unchecked call).
     Real exploits: King of Ether, multiple token transfer failures.
     """
     lowlevel_edges = [
         e for e in path.edge_chain
-        if e.raw_type == "lowlevel_call"
+        if e.raw_type == "lowlevel_call" and not e.return_checked
     ]
 
     if not lowlevel_edges:
-        return _suppressed(path, "No low-level calls on path")
+        return _suppressed(path, "No unchecked low-level calls on path")
 
     # Low-level calls to uncertain destinations are highest risk
     uncertain_low = [e for e in lowlevel_edges if e.uncertain]
@@ -912,9 +923,8 @@ def _check_unchecked_return(path, nodes, graph_edges) -> ConstraintResult:
         confidence=confidence,
         constraint_type="UNCHECKED_RETURN",
         reasoning=(
-            f"{len(lowlevel_edges)} low-level call(s) on path, "
+            f"{len(lowlevel_edges)} low-level call(s) on path with an unchecked return value, "
             f"{len(uncertain_low)} with uncertain destination. "
-            f"Return value check cannot be confirmed statically. "
             f"Entry: {path.entry} -> Sink: {path.sink.node_id}."
         ),
         immunefi_impact="Unexpected contract behavior / silent failure",
