@@ -97,7 +97,52 @@ def test_staticcall_not_misclassified_as_asset_drain_or_callback():
     print("test_staticcall_not_misclassified_as_asset_drain_or_callback: PASS — 0 findings on checkBalance()")
 
 
+def test_inline_reentrancy_guard_detected_without_weakening():
+    """
+    Reproduces the real Uniswap V3 swap() shape found live this
+    session: an inline reentrancy guard flattened directly into a
+    REGULAR function's own body (require(!locked); locked = true; ...;
+    locked = false;) instead of expressed as a modifier — the same
+    structural signature is_reentrancy_guard() detects around a
+    modifier's placeholder, just flattened. withdrawLocked() must be
+    suppressed.
+
+    withdrawFakeInline() proves this doesn't weaken detection: a state
+    variable written twice around the external call, but never read or
+    revert-checked before its first write (not a real guard, just an
+    unrelated counter bump) — must NOT be misdetected as guarded;
+    REENTRANCY_CEI must still fire.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("ReentrancyEdgeCases.sol")
+
+    locked = nodes["ReentrancyEdgeCases.withdrawLocked()"]
+    fake = nodes["ReentrancyEdgeCases.withdrawFakeInline()"]
+    assert locked.has_inline_reentrancy_guard is True, "withdrawLocked() has the real inline guard shape"
+    assert fake.has_inline_reentrancy_guard is False, (
+        "withdrawFakeInline()'s counter is never read/revert-checked before its first write — must not false-positive"
+    )
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+
+    locked_findings = [
+        r for r in (report.confirmed + report.likely + report.possible)
+        if r.path.entry == "ReentrancyEdgeCases.withdrawLocked()" and "REENTRANCY_CEI" in r.constraint_type
+    ]
+    assert not locked_findings, f"withdrawLocked() is protected by its own inline guard — must be suppressed, got {locked_findings}"
+
+    fake_findings = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == "ReentrancyEdgeCases.withdrawFakeInline()" and "REENTRANCY_CEI" in r.constraint_type
+    ]
+    assert fake_findings, "withdrawFakeInline() has no real guard — REENTRANCY_CEI must still fire"
+    print("test_inline_reentrancy_guard_detected_without_weakening: PASS —",
+          "withdrawLocked suppressed, withdrawFakeInline still", fake_findings[0].verdict)
+
+
 if __name__ == "__main__":
     test_entry_level_cei_violation_detected()
     test_staticcall_not_misclassified_as_asset_drain_or_callback()
+    test_inline_reentrancy_guard_detected_without_weakening()
     print("\nAll reentrancy_edges tests passed.")

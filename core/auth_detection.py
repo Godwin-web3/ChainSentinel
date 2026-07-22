@@ -897,6 +897,23 @@ def is_reentrancy_guard(modifier_obj) -> bool:
     Anchored on NodeType.PLACEHOLDER (Slither's real marker for a
     modifier's `_;`) rather than any name — a modifier called `xyzzy`
     with this shape is detected identically to one called `nonReentrant`.
+
+    Node lists on both sides of the placeholder are expanded (bounded,
+    one hop) through any InternalCall they make before checking
+    read/write/revert evidence — required because modern OpenZeppelin
+    (v4.8+, the current standard) refactored nonReentrant to delegate
+    its actual guard logic to two private helpers:
+        modifier nonReentrant() {
+            _nonReentrantBefore();
+            _;
+            _nonReentrantAfter();
+        }
+    The modifier's OWN body is just two InternalCalls straddling the
+    placeholder — none of the real require/write logic is directly in
+    it — confirmed live against real Fraxlend IR, where this caused
+    nonReentrant to score is_reentrancy_guard=False and every
+    nonReentrant-protected function (borrowAsset, liquidate, etc.) to
+    false-positive on REENTRANCY_CEI.
     """
     try:
         nodes = list(getattr(modifier_obj, "nodes", []) or [])
@@ -911,9 +928,21 @@ def is_reentrancy_guard(modifier_obj) -> bool:
     if placeholder_idx is None:
         return False
 
-    before = nodes[:placeholder_idx]
-    after = nodes[placeholder_idx + 1:]
+    before = _expand_with_internal_calls(nodes[:placeholder_idx])
+    after = _expand_with_internal_calls(nodes[placeholder_idx + 1:])
 
+    return _guard_shape_from_before_after(before, after)
+
+
+def _guard_shape_from_before_after(before: list, after: list) -> bool:
+    """
+    Shared core: True if `before`/`after` node lists match a
+    reentrancy-guard's structural signature — a state variable written
+    in both, read somewhere in `before`, with a revert-capable node
+    also in `before`. Used both by is_reentrancy_guard (split at a
+    modifier's PLACEHOLDER) and has_inline_reentrancy_guard (split
+    around a plain function's own candidate guard-variable writes).
+    """
     written_before = _state_vars_written(before)
     written_after = _state_vars_written(after)
     candidates = written_before & written_after
@@ -924,6 +953,77 @@ def is_reentrancy_guard(modifier_obj) -> bool:
     guarded_before = any(_node_can_revert(n) for n in before)
 
     return bool(candidates & read_before) and guarded_before
+
+
+def has_inline_reentrancy_guard(func_obj) -> bool:
+    """
+    True if func_obj — a REGULAR function, not a modifier — contains an
+    inlined reentrancy-guard shape directly in its own body: some state
+    variable is written at least twice, read somewhere before its FIRST
+    write, with a revert-capable node also before that first write, and
+    written again later. The same structural signature
+    is_reentrancy_guard() detects wrapped around a modifier's
+    placeholder, just flattened directly into the function instead.
+
+    Real shape found live this session: Uniswap V3's swap() inlines its
+    own `lock` modifier's exact logic directly in its body instead of
+    attaching the modifier (`require(slot0Start.unlocked, 'LOK');
+    ... slot0.unlocked = false; ... slot0.unlocked = true;`) — a gas
+    optimization on its single hottest-path function. mint()/collect()/
+    flash()/collectProtocol() use the real `lock` modifier and are
+    already covered by is_reentrancy_guard; swap() needed this.
+    """
+    try:
+        nodes = list(getattr(func_obj, "nodes", []) or [])
+    except Exception:
+        return False
+
+    write_positions: Dict[str, List[int]] = {}
+    for i, node in enumerate(nodes):
+        for var in getattr(node, "state_variables_written", []) or []:
+            write_positions.setdefault(str(var), []).append(i)
+
+    for positions in write_positions.values():
+        if len(positions) < 2:
+            continue
+        first_idx, last_idx = positions[0], positions[-1]
+        if last_idx <= first_idx:
+            continue
+        before = _expand_with_internal_calls(nodes[:first_idx + 1])
+        after = _expand_with_internal_calls(nodes[last_idx:])
+        if _guard_shape_from_before_after(before, after):
+            return True
+    return False
+
+
+def _expand_with_internal_calls(nodes, max_depth: int = 2, _visited: Optional[set] = None) -> list:
+    """
+    Returns `nodes` plus the CFG nodes of any function directly reached
+    from them via InternalCall, recursively up to max_depth hops
+    (cycle-safe via _visited). Lets structural checks over a node list
+    (state vars written/read, revert-capability) see evidence that
+    lives inside a helper function the caller delegates to, rather than
+    only what's inlined directly in the given nodes themselves.
+    """
+    if _visited is None:
+        _visited = set()
+    out = list(nodes)
+    if max_depth <= 0:
+        return out
+    for node in nodes:
+        for ir in getattr(node, "irs", []) or []:
+            if isinstance(ir, InternalCall) and getattr(ir, "function", None) is not None:
+                callee = ir.function
+                cid = id(callee)
+                if cid in _visited:
+                    continue
+                _visited.add(cid)
+                try:
+                    callee_nodes = list(getattr(callee, "nodes", []) or [])
+                except Exception:
+                    continue
+                out.extend(_expand_with_internal_calls(callee_nodes, max_depth - 1, _visited))
+    return out
 
 
 def _state_vars_written(nodes) -> Set[str]:

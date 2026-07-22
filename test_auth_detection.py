@@ -93,6 +93,47 @@ def test_reentrancy_cei_suppressed_by_custom_guard():
     print("test_reentrancy_cei_suppressed_by_custom_guard: PASS — 0 REENTRANCY_CEI findings on withdraw()")
 
 
+def test_delegated_reentrancy_guard_detected():
+    """
+    Reproduces the real modern OpenZeppelin nonReentrant shape (v4.8+,
+    the current standard) found live against Fraxlend this session: the
+    modifier itself is just two InternalCalls straddling the
+    placeholder (_nonReentrantBefore()/_nonReentrantAfter()-style), with
+    the actual require/write logic living in those private helpers, not
+    inlined in the modifier body. Before the fix, this scored
+    is_reentrancy_guard=False, producing false-positive REENTRANCY_CEI
+    on every real nonReentrant-protected Fraxlend function.
+
+    fakeDelegatedGuard proves this doesn't weaken detection: it ALSO
+    delegates to helper functions before/after the placeholder (same
+    shape at a glance), but the two helpers don't share a written+read
+    state variable — must NOT be misdetected as a guard just because
+    internal calls are now followed.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("CustomReentrancyGuard.sol")
+
+    real_guard = nodes["CustomReentrancyGuard.delegatedGuard()"]
+    fake_guard = nodes["CustomReentrancyGuard.fakeDelegatedGuard()"]
+    assert real_guard.is_reentrancy_guard is True, "delegatedGuard() has the real nonReentrant shape — should be detected"
+    assert fake_guard.is_reentrancy_guard is False, (
+        "fakeDelegatedGuard()'s helpers don't share a written+read state var — must not false-positive"
+    )
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+
+    guarded_findings = [
+        r for r in (report.confirmed + report.likely + report.possible)
+        if r.constraint_type == "REENTRANCY_CEI" and r.path.entry == "CustomReentrancyGuard.withdrawDelegated()"
+    ]
+    assert not guarded_findings, (
+        f"withdrawDelegated() is protected by delegatedGuard — REENTRANCY_CEI should not fire, got {guarded_findings}"
+    )
+    print("test_delegated_reentrancy_guard_detected: PASS — delegatedGuard=True, fakeDelegatedGuard=False, "
+          "0 REENTRANCY_CEI findings on withdrawDelegated()")
+
+
 def test_self_scoped_write_suppressed_without_weakening():
     """
     Reproduces the real renounceRole() false positive found live against
@@ -302,6 +343,7 @@ if __name__ == "__main__":
     test_access_control_role_mapping_detected()
     test_custom_named_reentrancy_guard_detected()
     test_reentrancy_cei_suppressed_by_custom_guard()
+    test_delegated_reentrancy_guard_detected()
     test_self_scoped_write_suppressed_without_weakening()
     test_self_scoped_asset_move_replaces_economic_interfaces_list()
     test_self_scoped_asset_move_suppression_reaches_intermediate_hops()

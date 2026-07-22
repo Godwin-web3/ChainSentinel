@@ -32,6 +32,8 @@ pragma solidity ^0.8.19;
 contract ReentrancyEdgeCases {
     uint256 public balance;
     address public token0;
+    bool public locked;
+    uint256 public counter;
 
     // DANGEROUS: entry IS its own sink — a direct, unguarded low-level
     // call with a state write in the SAME function, no intermediate
@@ -55,5 +57,34 @@ contract ReentrancyEdgeCases {
         require(ok, "staticcall failed");
         balance = abi.decode(data, (uint256));
         return balance;
+    }
+
+    // Safe: an inline reentrancy guard flattened directly into this
+    // function's own body instead of expressed as a modifier — the
+    // real Uniswap V3 swap() shape (require(!locked); locked = true;
+    // ...; locked = false;), a gas optimization on a hot path. Must
+    // NOT fire REENTRANCY_CEI — see
+    // core/auth_detection.py::has_inline_reentrancy_guard.
+    function withdrawLocked() external {
+        require(!locked, "locked");
+        locked = true;
+        (bool ok, ) = msg.sender.call{value: 0}("");
+        require(ok, "call failed");
+        balance = 0;
+        locked = false;
+    }
+
+    // DANGEROUS: a state variable written twice around the external
+    // call, structurally similar to withdrawLocked() at a glance, but
+    // `counter` is never READ or revert-checked before its first
+    // write — not a real guard, just an unrelated counter bump. Must
+    // NOT be misdetected as an inline guard; REENTRANCY_CEI must still
+    // fire.
+    function withdrawFakeInline() external {
+        counter += 1;
+        (bool ok, ) = msg.sender.call{value: 0}("");
+        require(ok, "call failed");
+        balance = 0;
+        counter += 1;
     }
 }

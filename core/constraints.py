@@ -228,10 +228,17 @@ def _check_reentrancy_cei(path, nodes, graph_edges) -> ConstraintResult:
     # ::is_reentrancy_guard — a modifier that reads/checks a status
     # variable, writes it before its own PLACEHOLDER node, and restores
     # it after) on the entry function, looked up by modifier_ids, never
-    # by matching a modifier's name against a string.
+    # by matching a modifier's name against a string. Also checks
+    # has_inline_reentrancy_guard — the same structural shape flattened
+    # directly into a REGULAR function's own body instead of a modifier
+    # (real shape: Uniswap V3's swap(), which inlines its own `lock`
+    # modifier's exact logic for gas on its single hottest-path
+    # function, found live this session).
     def _guarded(node) -> bool:
         if node is None:
             return False
+        if getattr(node, 'has_inline_reentrancy_guard', False):
+            return True
         return any(
             nodes[mid].is_reentrancy_guard
             for mid in getattr(node, 'modifier_ids', [])

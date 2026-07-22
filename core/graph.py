@@ -16,7 +16,8 @@ from slither.slither import Slither
 from slither.core.declarations import Modifier
 from core.invariants import extract_field_precise_writes, extract_field_precise_reads, get_call_events, extract_invariants
 from core.auth_detection import (
-    compute_own_auth, is_reentrancy_guard, find_self_scoped_writes, find_self_scoped_asset_moves,
+    compute_own_auth, is_reentrancy_guard, has_inline_reentrancy_guard,
+    find_self_scoped_writes, find_self_scoped_asset_moves,
     find_self_scoped_liability_reductions,
 )
 from slither.slithir.operations import (
@@ -69,6 +70,14 @@ class FunctionNode:
     structural_auth_score: int = 0
     structural_auth_var: Optional[str] = None
     is_reentrancy_guard: bool = False
+    # True if this REGULAR function (not a modifier) contains an
+    # inlined reentrancy-guard shape directly in its own body — see
+    # core/auth_detection.py::has_inline_reentrancy_guard. Real shape:
+    # Uniswap V3's swap() flattens its own `lock` modifier's exact
+    # logic directly into its body (a gas optimization on its single
+    # hottest-path function) instead of attaching the modifier, which
+    # is_reentrancy_guard alone (modifier-only) can't see.
+    has_inline_reentrancy_guard: bool = False
     # Privileged writes reachable from THIS entry that are PROVABLY keyed
     # by the caller's own identity (core/auth_detection.py::
     # find_self_scoped_writes) — e.g. AccessControl.renounceRole's
@@ -386,6 +395,7 @@ def build_graph(
                 structural_auth_var = own_auth.matched_state_var
                 modifier_ids = [canonical_id(contract.name, m.full_name) for m in f.modifiers]
                 guard = is_reentrancy_guard(f) if is_modifier else False
+                inline_guard = has_inline_reentrancy_guard(f) if not is_modifier else False
                 self_scoped_writes = find_self_scoped_writes(f)
                 self_scoped_asset_moves = find_self_scoped_asset_moves(f)
                 self_scoped_liability_reductions = find_self_scoped_liability_reductions(f)
@@ -433,6 +443,7 @@ def build_graph(
                     structural_auth_score=structural_auth_score,
                     structural_auth_var=structural_auth_var,
                     is_reentrancy_guard=guard,
+                    has_inline_reentrancy_guard=inline_guard,
                     self_scoped_write_keys=self_scoped_writes,
                     self_scoped_asset_move_functions=self_scoped_asset_moves,
                     self_scoped_liability_reduction_keys=self_scoped_liability_reductions,
