@@ -149,10 +149,55 @@ def _dfs(
 
     visited = visited | {current_id}  # immutable copy per path branch
 
-    # Check if current node is a sink
-    if current_id in sinks and depth > 0:
+    # Get current node
+    node = nodes.get(current_id)
+
+    # This node's OWN structural evidence — needed BEFORE the sink-check
+    # below, because a node can be its own vulnerability: the classic
+    # CEI-violation shape (state write + external call in the SAME
+    # function) IS what makes a node CALLBACK_SINK/ASSET_DRAIN in the
+    # first place, and an unauthenticated function that directly does
+    # the dangerous thing (no intermediate hop) is exactly Uniswap V3's
+    # swap()/flash() — an untrusted callback with open state writes, no
+    # helper function involved at all.
+    #
+    # Previously this evidence was computed AFTER the sink-check and
+    # only fed to CHILDREN via accumulated_flags — meaning a sink node's
+    # own external-call/state-write/auth evidence never appeared on its
+    # OWN recorded path. Combined with the sink-check being gated to
+    # depth > 0 (skipping the entry outright), this silently produced
+    # zero REENTRANCY_CEI findings for the textbook single-function CEI
+    # shape whenever the vulnerable function itself was the sink, at ANY
+    # depth — confirmed live with a synthetic withdraw() -> _doWithdraw()
+    # (state write after an unguarded external call) probe, which
+    # produced 0 findings despite being an unguarded, real violation.
+    node_has_state = bool(getattr(node, 'state_writes', set())) if node else False
+    node_has_external = any(
+        e.is_external for e in graph_edges.get(current_id, [])
+    ) if node else False
+    node_unauthenticated = bool(node) and getattr(node, 'auth_state', 'UNKNOWN') == 'UNAUTHENTICATED'
+
+    # Flags used ONLY to decide whether THIS node registers as a sink.
+    # EXTERNAL_CALL here means "this node itself makes an external
+    # call" — deliberately kept separate from the edge-specific
+    # EXTERNAL_CALL added per-child below (which means "the specific
+    # edge walked to reach that child crossed a trust boundary"), so a
+    # node with an external edge to one child doesn't leak EXTERNAL_CALL
+    # onto an unrelated sibling reached via a purely internal edge.
+    sink_check_flags = set(accumulated_flags)
+    if node_has_state and node_has_external:
+        sink_check_flags.add(STATE_BEFORE_CALL)
+    if node_has_external:
+        sink_check_flags.add(EXTERNAL_CALL)
+    if node_unauthenticated:
+        sink_check_flags.add(AUTH_GAP)
+
+    # Check if current node is a sink — including the entry itself
+    # (depth 0): a function can be its own sink, so this is no longer
+    # gated to depth > 0.
+    if current_id in sinks:
         sink = sinks[current_id]
-        flags = set(accumulated_flags)
+        flags = set(sink_check_flags)
 
         # Add sink-level flags
         if sink.category in (ASSET_DRAIN,):
@@ -171,26 +216,16 @@ def _dfs(
         if depth >= MAX_DEPTH - 2:
             return
 
-    # Get current node
-    node = nodes.get(current_id)
     if node is None:
         return
 
-    # Track state writes before external calls (reentrancy signal).
-    # Detect CEI violation: state written AND an external call exists
-    # on the SAME function. The previous condition (external_seen &&
-    # node_has_state && node_has_external) only fired on the second
-    # external call, missing single-hop withdraw() { state--; transfer(); }.
-    node_has_state = bool(getattr(node, 'state_writes', set()))
-    node_has_external = any(
-        e.is_external for e in graph_edges.get(current_id, [])
-    )
+    # Flags propagated to children: STATE_BEFORE_CALL/AUTH_GAP fold in
+    # this node's own evidence (matches the sink-check flags above);
+    # EXTERNAL_CALL stays edge-specific, added per-edge in the loop
+    # below rather than here.
     if node_has_state and node_has_external:
         accumulated_flags = accumulated_flags | {STATE_BEFORE_CALL}
-
-    # Auth gap on this node
-    auth = getattr(node, 'auth_state', 'UNKNOWN')
-    if auth == 'UNAUTHENTICATED':
+    if node_unauthenticated:
         accumulated_flags = accumulated_flags | {AUTH_GAP}
 
     # Walk edges

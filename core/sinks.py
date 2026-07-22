@@ -240,8 +240,14 @@ def _classify_node(node_id: str, node, edges: List[CallEdge], privileged_vars: O
     # storage variable written only by auth-scored functions (owner/admin-
     # gated) is trusted and not a reentrancy surface (e.g. Morpho's
     # IIrm.borrowRate() where irm is set by owner at market creation).
+    # A raw `.staticcall(...)` (e.g. Uniswap V3's balance0()/balance1()
+    # helpers) is excluded regardless of trust: the EVM propagates the
+    # static context transitively to every call reachable from a
+    # STATICCALL, so nothing downstream — including a callback into this
+    # very function — can ever write state. Not a reentrancy surface by
+    # construction, not by heuristic.
     for edge in edges:
-        if edge.is_external and not edge.is_delegation and not edge.trusted:
+        if edge.is_external and not edge.is_delegation and not edge.trusted and edge.raw_type != "staticcall":
             # Check if there are state writes in the same function
             has_state = hasattr(node, "state_writes") and bool(node.state_writes)
             if has_state:

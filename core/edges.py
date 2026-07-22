@@ -13,6 +13,9 @@ Edge types (raw):
   lowlevel_call     LowLevelCall where function_name == "call"
   delegatecall      LowLevelCall where function_name == "delegatecall"
   codecall          LowLevelCall where function_name == "codecall"
+  staticcall        LowLevelCall where function_name == "staticcall" —
+                     EVM-enforced read-only: can never transfer value or
+                     write state, unlike a plain .call(...)
   library           LibraryCall
   eth_send          Send
   eth_transfer      Transfer
@@ -105,12 +108,24 @@ def _raw_type_from_ir(ir) -> str:
     if isinstance(ir, HighLevelCall):
         return "highlevel"
     if isinstance(ir, LowLevelCall):
-        fname = getattr(ir, "function_name", "") or ""
-        fname = fname.lower()
+        # ir.function_name is a Slither Constant object, not a plain
+        # str — calling .lower() on it directly raises AttributeError.
+        # That exception was previously swallowed by extract_edges'
+        # broad try/except, silently dropping the edge entirely for
+        # EVERY raw low-level call in the codebase (.call(...),
+        # .call{value}(...), delegatecall, codecall) — found live
+        # probing a synthetic checks-effects-interactions violation
+        # that should have fired REENTRANCY_CEI but produced zero
+        # edges, let alone paths, because the call itself was invisible
+        # to the whole graph.
+        raw_fname = getattr(ir, "function_name", None)
+        fname = str(raw_fname).lower() if raw_fname is not None else ""
         if fname == "delegatecall":
             return "delegatecall"
         if fname == "codecall":
             return "codecall"
+        if fname == "staticcall":
+            return "staticcall"
         return "lowlevel_call"
     if isinstance(ir, Send):
         return "eth_send"
@@ -177,6 +192,14 @@ def _semantic_properties(raw_type: str) -> dict:
             is_value_transfer=False,
             is_state_crossing=True,
             uncertain=True,
+            exploration_required=True,
+        ),
+        "staticcall": dict(
+            is_delegation=False,
+            is_external=True,
+            is_value_transfer=False,       # EVM guarantees: cannot send value
+            is_state_crossing=False,       # EVM guarantees: cannot write state
+            uncertain=True,                # destination may be attacker-controlled
             exploration_required=True,
         ),
         "library": dict(
@@ -836,7 +859,7 @@ def _resolve_dst(ir, src_id: str, raw_type: str, f=None, auth_lookup: Optional[d
         except Exception:
             return f"{src_id}.__unresolved_external__", None, None, False, False
 
-    if raw_type in ("lowlevel_call", "delegatecall", "codecall"):
+    if raw_type in ("lowlevel_call", "delegatecall", "codecall", "staticcall"):
         try:
             dest = str(ir.destination)
             fname = getattr(ir, "function_name", "") or "call"
