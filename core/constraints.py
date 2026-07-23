@@ -152,6 +152,7 @@ def _validate_path(
     results.append(_check_unprotected_initializer(path, nodes, graph_edges))
     results.append(_check_fee_on_transfer_accounting(path, nodes, graph_edges))
     results.append(_check_flashloan_governance(path, nodes, graph_edges))
+    results.append(_check_divide_before_multiply(path, nodes, graph_edges))
     results.append(_check_flashloan_window(path, nodes, graph_edges))
     results.append(_check_unchecked_return(path, nodes, graph_edges))
     results.append(_check_share_inflation(path, nodes, graph_edges))
@@ -1244,6 +1245,73 @@ def _check_flashloan_governance(path, nodes, graph_edges) -> ConstraintResult:
         ),
         immunefi_impact="Complete protocol takeover via flash-loaned governance voting power",
         final_score=_final_score(path, 90),
+    )
+
+
+def _check_divide_before_multiply(path, nodes, graph_edges) -> ConstraintResult:
+    """
+    Detect a divide-before-multiply precision-loss pattern via core/
+    precision_loss_detection.py::find_unsafe_divide_before_multiply,
+    computed once from real Slither IR while building the graph (core/
+    graph.py).
+
+    Real precedent: Code4rena's real 2022-05-cally-findings#280 —
+    Cally.sol's real getDutchAuctionStrike(): each line individually
+    LOOKS like the safe "multiply, then divide" shape, but the first
+    line's division result (`progress`) gets squared in a SECOND
+    multiplication, compounding its truncation error into the option's
+    strike price:
+        uint256 progress = (1e18 * delta) / AUCTION_DURATION;
+        uint256 auctionStrike = (progress * progress * startingStrike) / (1e18 * 1e18);
+    A naive "does / appear before * in the same expression" heuristic
+    would MISS this real bug entirely — both individual lines are
+    locally mul-before-div. The real defect only shows up by tracing
+    the division's own result across statement boundaries into a
+    later multiplication.
+
+    Real, verified protected shapes (confirmed live via IR probe): the
+    real Cally fix (eliminate the intermediate division, multiply
+    everything first, divide once at the end) and Solmate's actual
+    FixedPointMathLib.mulDivDown (`div(mul(x, y), denominator)`, fully
+    fused in one assembly instruction — its internal division never
+    produces a visible Binary DIVISION op at the caller's level at
+    all).
+
+    Gated on path.sink.category == ASSET_DRAIN, matching the sibling
+    ORACLE_DEPENDENCY/FEE_ON_TRANSFER_ACCOUNTING checks' convention: an
+    entry whose own computation feeds a payment/transfer amount
+    naturally reaches its own asset-moving sink.
+    """
+    if path.sink.category != ASSET_DRAIN:
+        return _suppressed(path, "Not an asset drain path")
+
+    entry_node = nodes.get(path.entry)
+    evidence = getattr(entry_node, "unsafe_divide_before_multiply", None) if entry_node else None
+    if evidence is None:
+        return _suppressed(
+            path,
+            "No unsafe divide-before-multiply pattern found on this entry's reachable scope — "
+            "either no division's result reaches a later multiplication feeding accounting "
+            "state, or the computation is already reordered/fused to avoid the intermediate "
+            "division"
+        )
+
+    return ConstraintResult(
+        path=path,
+        verdict=CONFIRMED,
+        confidence=70,
+        constraint_type="DIVIDE_BEFORE_MULTIPLY",
+        reasoning=(
+            f"Entry {path.entry} computes a value via a raw division whose (already-truncated) "
+            f"result is later reused as an operand of a multiplication feeding accounting state "
+            f"({evidence}) — compounding the division's rounding error into the final value "
+            f"instead of multiplying first and dividing once at the end. Repeated calls can "
+            f"extract value from the truncation direction, or round another user's share/amount "
+            f"toward zero. Sink: {path.sink.node_id}. Real precedent: code-423n4/"
+            f"2022-05-cally-findings#280 (Cally.sol's real getDutchAuctionStrike())."
+        ),
+        immunefi_impact="Value extraction or griefing via compounded arithmetic precision loss",
+        final_score=_final_score(path, 70),
     )
 
 

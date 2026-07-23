@@ -28,6 +28,7 @@ from core.staleness_detection import find_unstaled_latest_round_data_dependency
 from core.initializer_detection import find_unprotected_initializer, has_one_time_latch_protection
 from core.fee_on_transfer_detection import find_unsafe_fee_on_transfer_credit
 from core.governance_snapshot_detection import find_unsafe_live_voting_power_execution
+from core.precision_loss_detection import find_unsafe_divide_before_multiply
 from slither.slithir.operations import (
     InternalCall, HighLevelCall, LowLevelCall, SolidityCall, LibraryCall
 )
@@ -253,6 +254,19 @@ class FunctionNode:
     # supermajority threshold and execute a malicious proposal, all
     # repaid within the same transaction.
     unsafe_live_voting_power_execution: Optional[str] = None
+    # Non-None (the written state var's own name) if this function, or
+    # anything it reaches via bounded internal calls, contains a raw
+    # Binary DIVISION whose (already-truncated) result later becomes
+    # an operand of a Binary MULTIPLICATION, feeding a write to real
+    # share/balance/price-shaped accounting state — see core/
+    # precision_loss_detection.py::find_unsafe_divide_before_multiply.
+    # Real precedent: Code4rena's real 2022-05-cally-findings#280 —
+    # Cally.sol's real getDutchAuctionStrike(), where each line
+    # individually looked like the safe "multiply, then divide" shape,
+    # but the first line's division result got reused (squared) in a
+    # second multiplication, compounding truncation error into the
+    # option's strike price.
+    unsafe_divide_before_multiply: Optional[str] = None
 
     # Layer 4 — graph edges (canonical IDs)
     internal_callees: List[str] = field(default_factory=list)
@@ -552,6 +566,7 @@ def build_graph(
                 init_guard = has_one_time_latch_protection(f) if not is_modifier else False
                 unsafe_fee_on_transfer_credit = find_unsafe_fee_on_transfer_credit(f) if not is_modifier else None
                 unsafe_live_voting_power_execution = find_unsafe_live_voting_power_execution(f) if not is_modifier else None
+                unsafe_divide_before_multiply = find_unsafe_divide_before_multiply(f) if not is_modifier else None
                 auth_state = (
                     "AUTHENTICATED" if structural_auth_score >= 3 else
                     "UNKNOWN" if structural_auth_score == 2 else
@@ -611,6 +626,7 @@ def build_graph(
                     has_initializer_guard=init_guard,
                     unsafe_fee_on_transfer_credit=unsafe_fee_on_transfer_credit,
                     unsafe_live_voting_power_execution=unsafe_live_voting_power_execution,
+                    unsafe_divide_before_multiply=unsafe_divide_before_multiply,
                     internal_callees=int_callees,
                     external_callees=ext_callees,
                     state_writes=state_writes,
