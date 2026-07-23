@@ -52,12 +52,11 @@ not one block) is diluted to economic irrelevance.
 
 from typing import Optional
 
-from slither.slithir.operations import Assignment, Binary, HighLevelCall, TypeConversion
+from slither.slithir.operations import Binary, HighLevelCall, TypeConversion
 from slither.slithir.operations.binary import BinaryType
 from slither.slithir.operations.unpack import Unpack
-from slither.core.declarations.solidity_variables import SolidityVariableComposed
 
-from core.edges import _follow_reference, _find_defining_op
+from core.edges import _follow_reference, _find_defining_op, _resolves_to_block_timestamp, _single_source_operand
 from core.auth_detection import _expand_with_internal_calls
 
 # Real Uniswap V2/V3 spot-price-shaped accessor names — both return a
@@ -67,51 +66,6 @@ from core.auth_detection import _expand_with_internal_calls
 _SPOT_PRICE_ACCESSOR_NAMES = {"getreserves", "slot0"}
 
 _CRITICAL_STATE_KEYWORDS = ("collateral", "debt", "borrow", "liquidat", "health", "price", "value")
-
-
-def _single_source_operand(defining_op):
-    """
-    Return the one meaningful source operand of a pass-through IR op —
-    TypeConversion's `.variable` (`uint32(x)`-style casts) or
-    Assignment's `.rvalue` (the plain `lhs = rhs` op Slither inserts
-    between a temp and a named local — confirmed live via IR probe:
-    `uint32 timeElapsed = uint32(block.timestamp) - lastUpdate;` lowers
-    to a Binary SUBTRACTION into a TEMP, then a SEPARATE Assignment op
-    `timeElapsed := TEMP`, so callers resolving through a named local
-    variable must unwrap this hop too, not just TypeConversion) — or
-    None if defining_op isn't one of these pass-through shapes.
-    """
-    if isinstance(defining_op, TypeConversion):
-        return getattr(defining_op, "variable", None)
-    if isinstance(defining_op, Assignment):
-        return getattr(defining_op, "rvalue", None)
-    return None
-
-
-def _resolves_to_block_timestamp(var, f, max_depth: int = 3) -> bool:
-    """
-    True if var is (or, via bounded TypeConversion/Assignment/reference
-    hops, resolves to) Solidity's own `block.timestamp` — confirmed live
-    via IR probe: `uint32(block.timestamp)` lowers to a TypeConversion
-    whose own `.variable` is a SolidityVariableComposed("block.timestamp"),
-    and a named local like `timeElapsed` resolves to its Binary
-    SUBTRACTION only through an intervening Assignment op — see
-    _single_source_operand.
-    """
-    if max_depth < 0:
-        return False
-    if isinstance(var, SolidityVariableComposed) and str(var) == "block.timestamp":
-        return True
-    resolved = _follow_reference(var)
-    if isinstance(resolved, SolidityVariableComposed) and str(resolved) == "block.timestamp":
-        return True
-    defining_op = _find_defining_op(resolved, f)
-    if defining_op is None:
-        return False
-    inner = _single_source_operand(defining_op)
-    if inner is not None and max_depth > 0:
-        return _resolves_to_block_timestamp(inner, f, max_depth - 1)
-    return False
 
 
 def _is_elapsed_time_subtraction(ir, f) -> bool:

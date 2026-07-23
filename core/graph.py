@@ -24,6 +24,7 @@ from core.auth_detection import (
 )
 from core.vault_detection import find_unsafe_share_price_divisor
 from core.spot_price_detection import find_unsafe_spot_price_dependency
+from core.staleness_detection import find_unstaled_latest_round_data_dependency
 from slither.slithir.operations import (
     InternalCall, HighLevelCall, LowLevelCall, SolidityCall, LibraryCall
 )
@@ -182,6 +183,20 @@ class FunctionNode:
     # directly from a single AMM pool's instantaneous reserve state,
     # manipulable within one flash-loaned transaction.
     unsafe_spot_price_dependency: Optional[str] = None
+    # Non-None (the call's own evidence string) if this function, or
+    # anything it reaches via bounded internal/high-level calls, calls
+    # Chainlink's AggregatorV3Interface.latestRoundData() and consumes
+    # the answer without a genuine elapsed-time freshness check on
+    # updatedAt (either a revert-capable check, or one propagated via a
+    # returned bool), AND writes real lending/valuation-shaped critical
+    # state in that same reachable scope — see core/
+    # staleness_detection.py::find_unstaled_latest_round_data_dependency.
+    # Real precedent: code-423n4/2024-07-loopfi-findings#494/#521 (the
+    # real AuraVault.sol shape — updatedAt destructured with a blank
+    # comma, never bound to any variable at all), and Cryptex Finance's
+    # actual deployed ChainlinkOracle.sol (round-completeness checks
+    # only, never elapsed real time).
+    unstaled_latest_round_data_dependency: Optional[str] = None
 
     # Layer 4 — graph edges (canonical IDs)
     internal_callees: List[str] = field(default_factory=list)
@@ -476,6 +491,7 @@ def build_graph(
                 self_scoped_liability_reductions = find_self_scoped_liability_reductions(f)
                 unsafe_share_price_divisor = find_unsafe_share_price_divisor(f) if not is_modifier else None
                 unsafe_spot_price_dependency = find_unsafe_spot_price_dependency(f) if not is_modifier else None
+                unstaled_latest_round_data_dependency = find_unstaled_latest_round_data_dependency(f) if not is_modifier else None
                 auth_state = (
                     "AUTHENTICATED" if structural_auth_score >= 3 else
                     "UNKNOWN" if structural_auth_score == 2 else
@@ -530,6 +546,7 @@ def build_graph(
                     self_scoped_liability_reduction_keys=self_scoped_liability_reductions,
                     unsafe_share_price_divisor=unsafe_share_price_divisor,
                     unsafe_spot_price_dependency=unsafe_spot_price_dependency,
+                    unstaled_latest_round_data_dependency=unstaled_latest_round_data_dependency,
                     internal_callees=int_callees,
                     external_callees=ext_callees,
                     state_writes=state_writes,

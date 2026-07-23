@@ -997,6 +997,55 @@ def _resolves_to_self(var, f) -> bool:
     return False
 
 
+def _single_source_operand(defining_op):
+    """
+    Return the one meaningful source operand of a pass-through IR op —
+    TypeConversion's `.variable` (`uint32(x)`-style casts) or
+    Assignment's `.rvalue` (the plain `lhs = rhs` op Slither inserts
+    between a temp and a named local — confirmed live via IR probe:
+    `uint32 timeElapsed = uint32(block.timestamp) - lastUpdate;` lowers
+    to a Binary SUBTRACTION into a TEMP, then a SEPARATE Assignment op
+    `timeElapsed := TEMP`, so callers resolving through a named local
+    variable must unwrap this hop too, not just TypeConversion) — or
+    None if defining_op isn't one of these pass-through shapes. Shared
+    by core/spot_price_detection.py and core/staleness_detection.py.
+    """
+    from slither.slithir.operations import Assignment, TypeConversion
+    if isinstance(defining_op, TypeConversion):
+        return getattr(defining_op, "variable", None)
+    if isinstance(defining_op, Assignment):
+        return getattr(defining_op, "rvalue", None)
+    return None
+
+
+def _resolves_to_block_timestamp(var, f, max_depth: int = 3) -> bool:
+    """
+    True if var is (or, via bounded TypeConversion/Assignment/reference
+    hops, resolves to) Solidity's own `block.timestamp` — confirmed
+    live via IR probe: `uint32(block.timestamp)` lowers to a
+    TypeConversion whose own `.variable` is a
+    SolidityVariableComposed("block.timestamp"), and a named local like
+    `timeElapsed` resolves to its Binary SUBTRACTION only through an
+    intervening Assignment op — see _single_source_operand. Shared by
+    core/spot_price_detection.py and core/staleness_detection.py.
+    """
+    from slither.core.declarations.solidity_variables import SolidityVariableComposed
+    if max_depth < 0:
+        return False
+    if isinstance(var, SolidityVariableComposed) and str(var) == "block.timestamp":
+        return True
+    resolved = _follow_reference(var)
+    if isinstance(resolved, SolidityVariableComposed) and str(resolved) == "block.timestamp":
+        return True
+    defining_op = _find_defining_op(resolved, f)
+    if defining_op is None:
+        return False
+    inner = _single_source_operand(defining_op)
+    if inner is not None and max_depth > 0:
+        return _resolves_to_block_timestamp(inner, f, max_depth - 1)
+    return False
+
+
 def _resolve_trust(ir, raw_type: str, f, auth_lookup: Optional[dict], node=None) -> tuple:
     """
     Decide trust for a call edge destination. Highlevel calls and

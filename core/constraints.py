@@ -148,6 +148,7 @@ def _validate_path(
     results.append(_check_access_control_gap(path, nodes, graph_edges))
     results.append(_check_missing_health_check(path, nodes, graph_edges))
     results.append(_check_oracle_dependency(path, nodes, graph_edges))
+    results.append(_check_stale_oracle(path, nodes, graph_edges))
     results.append(_check_flashloan_window(path, nodes, graph_edges))
     results.append(_check_unchecked_return(path, nodes, graph_edges))
     results.append(_check_share_inflation(path, nodes, graph_edges))
@@ -949,6 +950,73 @@ def _check_oracle_dependency(path, nodes, graph_edges) -> ConstraintResult:
         ),
         immunefi_impact="Manipulation of protocol's price oracle / direct theft",
         final_score=_final_score(path, 85),
+    )
+
+
+def _check_stale_oracle(path, nodes, graph_edges) -> ConstraintResult:
+    """
+    Detect Chainlink price-feed staleness patterns via core/
+    staleness_detection.py::find_unstaled_latest_round_data_dependency,
+    computed once from real Slither IR while building the graph (core/
+    graph.py). One of the single most common high-severity findings in
+    real Code4rena/Sherlock audits: a function calls
+    AggregatorV3Interface.latestRoundData() and consumes the returned
+    price without ever verifying the feed is fresh.
+
+    Real, verified shapes (confirmed live via IR probe): the real
+    2024-07-loopfi finding (code-423n4/2024-07-loopfi-findings#494/
+    #521) against AuraVault.sol's real _chainlinkSpot() — updatedAt is
+    destructured with a blank comma, never bound to any variable at
+    all. A subtler real case, confirmed live against Cryptex Finance's
+    actual deployed ChainlinkOracle.sol (cryptexfinance/contracts):
+    round-completeness checks (`timeStamp != 0`, `answeredInRound >=
+    roundID`) are present but NEVER a genuine elapsed-time check —
+    Chainlink itself documents answeredInRound as an unreliable
+    staleness indicator on newer aggregator versions, so this still
+    counts as unprotected. The real protected shape (confirmed live
+    against ButtonWood Protocol's actual deployed ChainlinkOracle.sol,
+    buttonwood-protocol/button-wrappers) computes
+    `block.timestamp - updatedAt` and either reverts on it directly or
+    propagates it as a returned validity bool for the caller to check.
+
+    Gated on path.sink.category == ASSET_DRAIN, matching the sibling
+    ORACLE_DEPENDENCY/SHARE_INFLATION checks' convention: a lending/
+    vault entry's own price-dependent path naturally reaches its own
+    asset-moving sink (borrow, mint, liquidate), keeping this to one
+    finding per real entry.
+    """
+    if path.sink.category != ASSET_DRAIN:
+        return _suppressed(path, "Not an asset drain path")
+
+    entry_node = nodes.get(path.entry)
+    evidence = getattr(entry_node, "unstaled_latest_round_data_dependency", None) if entry_node else None
+    if evidence is None:
+        return _suppressed(
+            path,
+            "No unstaled Chainlink latestRoundData() dependency found on this entry's "
+            "reachable scope — either no such call feeds critical state, or updatedAt is "
+            "genuinely freshness-checked (revert-capable or propagated) against "
+            "block.timestamp"
+        )
+
+    return ConstraintResult(
+        path=path,
+        verdict=CONFIRMED,
+        confidence=80,
+        constraint_type="STALE_ORACLE_DEPENDENCY",
+        reasoning=(
+            f"Entry {path.entry} calls Chainlink's latestRoundData() ({evidence}) and "
+            f"consumes the returned price without a genuine elapsed-time freshness check "
+            f"on updatedAt against block.timestamp — either updatedAt is never captured at "
+            f"all, or only round-completeness checks (timeStamp != 0, answeredInRound >= "
+            f"roundID) are present, which Chainlink itself documents as an unreliable "
+            f"staleness indicator. If the feed stops updating (deprecated, network issue, "
+            f"circuit breaker), this entry keeps using an arbitrarily old price. Sink: "
+            f"{path.sink.node_id}. Real precedent: code-423n4/2024-07-loopfi-findings#494/"
+            f"#521, and dozens of near-identical real Code4rena/Sherlock findings."
+        ),
+        immunefi_impact="Stale price feed manipulation / incorrect liquidation or valuation",
+        final_score=_final_score(path, 80),
     )
 
 
