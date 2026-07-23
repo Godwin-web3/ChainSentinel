@@ -97,6 +97,36 @@ def parse_slither_output(output: dict) -> list:
     findings.sort(key=lambda x: x["severity_score"], reverse=True)
     return findings
 
+def _ensure_solc_installed(version: str) -> None:
+    """
+    Install this solc version via solc-select if it isn't already
+    present, so solc-wrapper's `exec "$HOME/.solc-select/artifacts/
+    solc-$VERSION/solc-$VERSION"` (see solc-wrapper) has a real binary
+    to run. Without this, any contract pinned to a version this
+    environment doesn't happen to have preinstalled fails outright —
+    found live this session: real Berachain BEX Vault.sol (solc 0.7.1,
+    a real, actively-used protocol) produced "Version '0.7.1' not
+    installed" and zero analysis, purely because this specific patch
+    version had never been installed here before, regardless of how
+    common or well-formed the contract itself is. solc-select installs
+    a missing version in a few seconds (confirmed live), so this is
+    cheap insurance against ANY chain/protocol using a compiler patch
+    version this environment hasn't seen yet.
+    """
+    try:
+        installed = subprocess.run(
+            ["solc-select", "versions"], capture_output=True, text=True, timeout=15
+        )
+        if version in (installed.stdout or ""):
+            return
+        log.info(f"solc {version} not installed — installing via solc-select")
+        subprocess.run(
+            ["solc-select", "install", version], capture_output=True, text=True, timeout=120
+        )
+    except Exception as e:
+        log.warn(f"solc-select install {version} failed: {e}")
+
+
 def run_slither(resolved: dict) -> dict:
     source_data = resolved.get("source")
 
@@ -315,6 +345,7 @@ def run_slither(resolved: dict) -> dict:
 
     env = os.environ.copy()
     if solc_version:
+        _ensure_solc_installed(solc_version)
         env["SOLC_VERSION"] = solc_version
 
     try:
