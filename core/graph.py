@@ -27,6 +27,7 @@ from core.spot_price_detection import find_unsafe_spot_price_dependency
 from core.staleness_detection import find_unstaled_latest_round_data_dependency
 from core.initializer_detection import find_unprotected_initializer, has_one_time_latch_protection
 from core.fee_on_transfer_detection import find_unsafe_fee_on_transfer_credit
+from core.governance_snapshot_detection import find_unsafe_live_voting_power_execution
 from slither.slithir.operations import (
     InternalCall, HighLevelCall, LowLevelCall, SolidityCall, LibraryCall
 )
@@ -239,6 +240,19 @@ class FunctionNode:
     # flash-loaned swaps until the attacker drained the pool's other
     # real assets.
     unsafe_fee_on_transfer_credit: Optional[str] = None
+    # Non-None (the live accessor's own evidence string) if this
+    # function, or anything it reaches via bounded internal calls,
+    # gates an arbitrary external/low-level call behind a revert-
+    # capable threshold comparison whose voting-power operand is read
+    # LIVE — no historical/checkpoint dimension at all, or one that
+    # queries the raw, unmodified current block — see core/
+    # governance_snapshot_detection.py::
+    # find_unsafe_live_voting_power_execution. Real precedent:
+    # Beanstalk Farms' real $182M loss (April 2022) — a same-block
+    # flash loan minted enough live voting power ("stalk") to clear a
+    # supermajority threshold and execute a malicious proposal, all
+    # repaid within the same transaction.
+    unsafe_live_voting_power_execution: Optional[str] = None
 
     # Layer 4 — graph edges (canonical IDs)
     internal_callees: List[str] = field(default_factory=list)
@@ -537,6 +551,7 @@ def build_graph(
                 unprotected_initializer_write = find_unprotected_initializer(f, structural_auth_score) if not is_modifier else None
                 init_guard = has_one_time_latch_protection(f) if not is_modifier else False
                 unsafe_fee_on_transfer_credit = find_unsafe_fee_on_transfer_credit(f) if not is_modifier else None
+                unsafe_live_voting_power_execution = find_unsafe_live_voting_power_execution(f) if not is_modifier else None
                 auth_state = (
                     "AUTHENTICATED" if structural_auth_score >= 3 else
                     "UNKNOWN" if structural_auth_score == 2 else
@@ -595,6 +610,7 @@ def build_graph(
                     unprotected_initializer_write=unprotected_initializer_write,
                     has_initializer_guard=init_guard,
                     unsafe_fee_on_transfer_credit=unsafe_fee_on_transfer_credit,
+                    unsafe_live_voting_power_execution=unsafe_live_voting_power_execution,
                     internal_callees=int_callees,
                     external_callees=ext_callees,
                     state_writes=state_writes,

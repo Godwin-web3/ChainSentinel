@@ -151,6 +151,7 @@ def _validate_path(
     results.append(_check_stale_oracle(path, nodes, graph_edges))
     results.append(_check_unprotected_initializer(path, nodes, graph_edges))
     results.append(_check_fee_on_transfer_accounting(path, nodes, graph_edges))
+    results.append(_check_flashloan_governance(path, nodes, graph_edges))
     results.append(_check_flashloan_window(path, nodes, graph_edges))
     results.append(_check_unchecked_return(path, nodes, graph_edges))
     results.append(_check_share_inflation(path, nodes, graph_edges))
@@ -1177,6 +1178,72 @@ def _check_fee_on_transfer_accounting(path, nodes, graph_edges) -> ConstraintRes
         ),
         immunefi_impact="Accounting-state corruption via fee-on-transfer/rebasing token",
         final_score=_final_score(path, 80),
+    )
+
+
+def _check_flashloan_governance(path, nodes, graph_edges) -> ConstraintResult:
+    """
+    Detect a flash-loan governance-voting-power pattern via core/
+    governance_snapshot_detection.py::
+    find_unsafe_live_voting_power_execution, computed once from real
+    Slither IR while building the graph (core/graph.py).
+
+    Real precedent: Beanstalk Farms' real $182M loss (April 17 2022) —
+    the actual GovernanceFacet.sol's emergencyCommit() executed a
+    proposal (via a delegatecall-based diamond cut — confirmed live
+    against the real fetched source and Immunefi's technical writeup)
+    once LIVE voting power ("stalk", computed from whatever the Silo
+    currently held — no historical dimension) cleared a supermajority
+    threshold, with no delay between voting and execution. The
+    attacker flash-loaned over $1B, deposited it to mint stalk,
+    instantly cleared the threshold, and executed a malicious diamond
+    cut that drained the protocol — all within one transaction,
+    repaying the loan at the end of the SAME transaction.
+
+    Real, verified protected shapes (confirmed live via IR probe):
+    Compound's actual, widely-deployed Governor Bravo
+    (getPriorVotes(voter, proposal.startBlock), captured at proposal-
+    creation time — an earlier transaction) and the real Compound/OZ
+    "one block ago" idiom (block.number - 1) — a same-block flash loan
+    cannot retroactively alter a checkpoint as of an earlier block.
+
+    Gated on path.sink.category == DELEGATION_SINK — the vulnerable
+    entry's own execution step is itself a delegatecall/codecall to an
+    uncertain (attacker/proposal-supplied) destination, so it naturally
+    classifies as this sink already, matching the real Beanstalk
+    diamond-cut execution mechanism.
+    """
+    if path.sink.category != DELEGATION_SINK:
+        return _suppressed(path, "Not a delegation-sink path")
+
+    entry_node = nodes.get(path.entry)
+    evidence = getattr(entry_node, "unsafe_live_voting_power_execution", None) if entry_node else None
+    if evidence is None:
+        return _suppressed(
+            path,
+            "No unsafe live-voting-power-gated execution found on this entry's reachable "
+            "scope — either no revert-capable voting-power threshold gates an arbitrary "
+            "call, or the voting-power timepoint genuinely resolves to a past block/"
+            "checkpoint rather than the current one"
+        )
+
+    return ConstraintResult(
+        path=path,
+        verdict=CONFIRMED,
+        confidence=90,
+        constraint_type="FLASHLOAN_GOVERNANCE",
+        reasoning=(
+            f"Entry {path.entry} gates an arbitrary delegatecall/low-level execution behind a "
+            f"revert-capable voting-power threshold check ({evidence}) that reads voting power "
+            f"LIVE — no historical/checkpoint dimension at all, or one that queries the raw, "
+            f"unmodified CURRENT block. A same-block flash loan can inflate this live value, "
+            f"clear the threshold, and trigger the execution, all repaid within the same "
+            f"transaction. Sink: {path.sink.node_id}. Real precedent: Beanstalk Farms' $182M "
+            f"loss (April 17 2022) — a flash-loaned deposit minted enough live 'stalk' to clear "
+            f"a 2/3 supermajority and execute a malicious diamond cut in one transaction."
+        ),
+        immunefi_impact="Complete protocol takeover via flash-loaned governance voting power",
+        final_score=_final_score(path, 90),
     )
 
 

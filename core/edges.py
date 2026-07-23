@@ -376,7 +376,28 @@ def _is_caller_controlled(var) -> bool:
 
 
 def _follow_reference(var, max_depth: int = 5):
-    """Follow ReferenceVariable.points_to chains to the underlying variable."""
+    """
+    Follow ReferenceVariable.points_to chains to the underlying
+    variable.
+
+    KNOWN ISSUE, deliberately NOT fixed here: the import below
+    (slither.core.variables.reference_variable) does not exist in the
+    currently installed slither-analyzer (0.11.5) — the real class
+    lives at slither.slithir.variables.reference.ReferenceVariable —
+    so this has been a silent no-op for every one of this function's
+    ~29 call sites across core/ for the entire time it's existed.
+    Found live while building core/governance_snapshot_detection.py.
+    Fixing the import changes real behavior at every call site
+    simultaneously (confirmed live: it flips test_auth_detection.py's
+    test_nested_mapping_outer_key_self_scoping, a real, correctly-
+    designed test matching MakerDAO's actual Vat.hope() shape, from
+    passing to failing) — every caller was written and verified
+    against the no-op behavior, so this needs its own dedicated,
+    call-site-by-call-site audit, not a fix bundled into an unrelated
+    new detector. core/governance_snapshot_detection.py works around
+    this locally instead (its own Member/Index pass-through unwrap)
+    rather than depending on this function resolving references.
+    """
     try:
         from slither.core.variables.reference_variable import ReferenceVariable
     except Exception:
