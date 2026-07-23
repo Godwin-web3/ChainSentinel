@@ -222,3 +222,75 @@ contract Ownable2StepStyleAccept {
         balance -= amount;
     }
 }
+
+// Negative control (the critical adversarial regression case found
+// live this session against Morpho Labs' real, currently-deployed
+// MetaMorpho.sol): a genuinely permissionless "finalize" function,
+// protected by NEITHER a one-time latch NOR an msg.sender check, but
+// gated by a real elapsed-time delay since an EARLIER, privileged
+// call scheduled it — the actual MetaMorpho
+// `afterTimelock(pendingGuardian.validAt)` / `submitGuardian()` /
+// `acceptGuardian()` shape, confirmed live via direct verification
+// against the real fetched source. acceptOwner() can only ever
+// finalize an ownership change the CURRENT owner already approved and
+// scheduled via submitOwner's own onlyOwner gate. Must NOT fire — a
+// time-delay gate against an externally-sourced deadline is a third,
+// equally valid protection mechanism, distinct from a one-time latch
+// or a direct msg.sender comparison.
+contract TimelockGatedAccept {
+    struct Pending { address value; uint256 validAt; }
+
+    address public owner;
+    Pending public pendingOwner;
+    uint256 public timelock;
+    uint256 public balance;
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "not owner");
+        _;
+    }
+
+    modifier afterTimelock(uint256 validAt) {
+        require(validAt != 0, "no pending value");
+        require(block.timestamp >= validAt, "timelock not elapsed");
+        _;
+    }
+
+    function submitOwner(address newOwner) external onlyOwner {
+        pendingOwner = Pending(newOwner, block.timestamp + timelock);
+    }
+
+    function acceptOwner() external afterTimelock(pendingOwner.validAt) {
+        owner = pendingOwner.value;
+        delete pendingOwner;
+    }
+
+    function withdraw(uint256 amount) external onlyOwner {
+        balance -= amount;
+    }
+}
+
+// DANGEROUS: the critical adversarial regression case proving the fix
+// checks the deadline's actual PROVENANCE, not just "some elapsed-time
+// comparison exists" — the deadline here is freshly computed WITHIN
+// this same call, from the current block.timestamp, so the check is
+// pure theater and provides zero protection. Must still fire.
+contract FakeTimelockDoesNotSuppressFinding {
+    address public owner;
+    uint256 public balance;
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "not owner");
+        _;
+    }
+
+    function acceptOwner(address newOwner) external {
+        uint256 fakeValidAt = block.timestamp;
+        require(block.timestamp >= fakeValidAt, "timelock not elapsed");
+        owner = newOwner;
+    }
+
+    function withdraw(uint256 amount) external onlyOwner {
+        balance -= amount;
+    }
+}

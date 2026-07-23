@@ -124,6 +124,38 @@ def test_ownable2step_style_accept_does_not_false_positive():
     print("test_ownable2step_style_accept_does_not_false_positive: PASS")
 
 
+def test_metamorpho_style_timelock_gated_accept_does_not_false_positive():
+    """
+    Live-verification regression: found firing on Morpho Labs' actual,
+    currently-deployed MetaMorpho.acceptGuardian() (CONFIRMED, 99%
+    through the full pipeline). acceptOwner() writes owner (privileged)
+    with no one-time latch and no msg.sender check — it's genuinely
+    permissionless — but is gated by afterTimelock(pendingOwner.validAt),
+    a real elapsed-time delay since submitOwner's own onlyOwner call
+    scheduled it. A time-delay gate against an externally-sourced
+    deadline is a real, distinct protective mechanism. Must NOT flag.
+    """
+    nodes, *_ = _build("UnprotectedInit.sol")
+    fn = nodes["TimelockGatedAccept.acceptOwner()"]
+    assert fn.unprotected_initializer_write is None, f"real MetaMorpho-style timelock-gated accept must not flag, got {fn.unprotected_initializer_write}"
+    print("test_metamorpho_style_timelock_gated_accept_does_not_false_positive: PASS")
+
+
+def test_fake_timelock_does_not_suppress_finding():
+    """
+    Critical adversarial regression: proves the fix checks the
+    deadline's actual PROVENANCE, not just "some elapsed-time
+    comparison exists somewhere". The deadline here is freshly
+    computed WITHIN the same call, from the current block.timestamp —
+    pure theater, zero protection. Must still fire.
+    """
+    nodes, *_ = _build("UnprotectedInit.sol")
+    fn = nodes["FakeTimelockDoesNotSuppressFinding.acceptOwner(address)"]
+    assert fn.unprotected_initializer_write is not None, "a same-call, freshly-computed fake deadline must not suppress the real finding"
+    print("test_fake_timelock_does_not_suppress_finding: PASS —",
+          "evidence:", fn.unprotected_initializer_write)
+
+
 def test_unprotected_initializer_constraint_fires_only_on_real_vulnerable_contracts():
     """
     End-to-end: runs the full path-enumeration + constraint-validation
@@ -145,6 +177,7 @@ def test_unprotected_initializer_constraint_fires_only_on_real_vulnerable_contra
     for vulnerable_entry in (
         "ParityStyleWallet.initWallet(address)",
         "NonReentrantIsNotAnInitializerGuard.initialize(address)",
+        "FakeTimelockDoesNotSuppressFinding.acceptOwner(address)",
     ):
         vulnerable_findings = [
             r for r in report.confirmed
@@ -156,6 +189,7 @@ def test_unprotected_initializer_constraint_fires_only_on_real_vulnerable_contra
         "ProtectedInitializable.initialize(address)",
         "InlineGuardedInit.initialize(address)",
         "ConstructorOnly.constructor(address)",
+        "TimelockGatedAccept.acceptOwner()",
     ):
         safe_findings = [
             r for r in all_results
@@ -175,5 +209,7 @@ if __name__ == "__main__":
     test_real_constructor_does_not_false_positive()
     test_internal_helper_does_not_false_positive()
     test_ownable2step_style_accept_does_not_false_positive()
+    test_metamorpho_style_timelock_gated_accept_does_not_false_positive()
+    test_fake_timelock_does_not_suppress_finding()
     test_unprotected_initializer_constraint_fires_only_on_real_vulnerable_contracts()
     print("\nAll initializer_detection tests passed.")
