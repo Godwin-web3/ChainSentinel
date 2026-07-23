@@ -59,15 +59,6 @@ VERDICT_SCORE = {
 # in core/graph.py and looked up via FunctionNode.is_reentrancy_guard /
 # modifier_ids. No name list needed.
 
-# Oracle/price read function patterns
-ORACLE_READ_PATTERNS = {
-    "getprice", "latesranswer", "latestanswer", "consult",
-    "getreserves", "price0cumulativelast", "price1cumulativelast",
-    "twap", "gettwap", "oracle", "pricefeed",
-    "slot0",  # Uniswap V3 spot price
-}
-
-
 # ── Data model ────────────────────────────────────────────────────
 
 @dataclass
@@ -894,50 +885,70 @@ def _check_cross_function_state_race(path, nodes, graph_edges, invariant_index) 
 
 def _check_oracle_dependency(path, nodes, graph_edges) -> ConstraintResult:
     """
-    Detect asset flows that depend on manipulable price sources.
-    Pattern: asset movement reads spot price from DEX pool (getReserves, slot0).
-    Real exploits: bZx $600k, Harvest $34M, Mango $116M.
+    Detect spot-price-oracle-manipulation patterns via core/
+    spot_price_detection.py::find_unsafe_spot_price_dependency,
+    computed once from real Slither IR while building the graph (core/
+    graph.py) — not re-derived here from lossy CallEdge.function_name
+    string matching (the prior version grepped for substrings like
+    "oracle", "pricefeed", "twap" anywhere in a call's NAME, unable to
+    verify the value was ever actually used in a price computation, let
+    alone an unprotected one — a `getReserves()` call feeding into a
+    fully time-weighted average matched identically to a raw, single-
+    block spot read).
+
+    Real, verified IR shape (confirmed live via probe against Uniswap's
+    own real reference implementations, v2-periphery's
+    ExampleOracleSimple.sol and v3-periphery's OracleLibrary.sol): an
+    unsafe dependency is a security-critical value (collateral, debt,
+    borrow, liquidation, health, price) computed from Uniswap V2's
+    getReserves() / V3's slot0() where that SPECIFIC value is never
+    forward-tainted into a division by a real elapsed-time value before
+    reaching critical state — a single-block flash-loan swap can skew
+    the instantaneous reserves/tick, but a real TWAP dilutes that
+    contribution to economic irrelevance.
+
+    Real precedent: Harvest Finance's real $24M loss (Oct 2020, priced
+    vault shares from a live Curve pool reserve ratio with no time-
+    weighting), Warp Finance's real $8M loss (Dec 2020, priced
+    collateral directly from a Uniswap V2 pair's getReserves()).
+
+    Gated on path.sink.category == ASSET_DRAIN, matching this
+    constraint's prior integration and the sibling SHARE_INFLATION
+    check's convention: a lending/vault entry's own price-dependent
+    path naturally reaches its own asset-moving sink (borrow, mint,
+    liquidate), keeping this to one finding per real entry.
     """
     if path.sink.category != ASSET_DRAIN:
         return _suppressed(path, "Not an asset drain path")
 
-    oracle_reads = []
-
-    for edge in path.edge_chain:
-        fname = (edge.function_name or "").lower()
-        for pattern in ORACLE_READ_PATTERNS:
-            if pattern in fname:
-                oracle_reads.append(edge.function_name or fname)
-
-    # Check entry node external calls for oracle patterns
     entry_node = nodes.get(path.entry)
-    if entry_node:
-        for edge in graph_edges.get(path.entry, []):
-            fname = (edge.function_name or "").lower()
-            for pattern in ORACLE_READ_PATTERNS:
-                if pattern in fname and edge.is_external:
-                    oracle_reads.append(f"external.{edge.function_name or fname}")
-
-    if not oracle_reads:
-        return _suppressed(path, "No oracle reads on path")
-
-    # slot0 is especially dangerous — it's Uniswap V3 spot price, trivially manipulable
-    has_spot_price = any("slot0" in r.lower() or "getreserves" in r.lower() for r in oracle_reads)
-    confidence = 85 if has_spot_price else 65
+    evidence = getattr(entry_node, "unsafe_spot_price_dependency", None) if entry_node else None
+    if evidence is None:
+        return _suppressed(
+            path,
+            "No unprotected AMM spot-price dependency found on this entry's reachable "
+            "scope — either no getReserves()/slot0()-derived price computation feeds "
+            "critical state, or the specific value is diluted by a real elapsed-time "
+            "division before it gets there"
+        )
 
     return ConstraintResult(
         path=path,
-        verdict=CONFIRMED if has_spot_price else LIKELY,
-        confidence=confidence,
+        verdict=CONFIRMED,
+        confidence=85,
         constraint_type="ORACLE_DEPENDENCY",
         reasoning=(
-            f"Asset drain path reads from manipulable price source: {oracle_reads[:3]}. "
-            f"{'slot0/getReserves is trivially manipulable via flash loan in single block. ' if has_spot_price else ''}"
-            f"Entry: {path.entry} -> Sink: {path.sink.node_id}. "
-            f"Pattern matches Harvest Finance and bZx oracle manipulation."
+            f"Entry {path.entry} computes a security-critical value from an unprotected "
+            f"AMM spot-price accessor ({evidence}) — Uniswap V2's getReserves() or V3's "
+            f"slot0() — with no elapsed-time-gated division diluting that specific value "
+            f"before it reaches critical state. An attacker can flash-loan-swap to skew "
+            f"the pool's instantaneous state within one transaction, use the skewed price "
+            f"for this call, then reverse the swap. Sink: {path.sink.node_id}. Real "
+            f"precedent: Harvest Finance's $24M loss (Oct 2020), Warp Finance's $8M loss "
+            f"(Dec 2020)."
         ),
         immunefi_impact="Manipulation of protocol's price oracle / direct theft",
-        final_score=_final_score(path, confidence),
+        final_score=_final_score(path, 85),
     )
 
 

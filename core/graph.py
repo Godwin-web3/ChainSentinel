@@ -23,6 +23,7 @@ from core.auth_detection import (
     find_self_scoped_liability_reductions, find_economic_threshold_vars,
 )
 from core.vault_detection import find_unsafe_share_price_divisor
+from core.spot_price_detection import find_unsafe_spot_price_dependency
 from slither.slithir.operations import (
     InternalCall, HighLevelCall, LowLevelCall, SolidityCall, LibraryCall
 )
@@ -167,6 +168,20 @@ class FunctionNode:
     # to the vault (bypassing deposit()) to inflate totalAssets without
     # inflating totalSupply, rounding later depositors' shares to zero.
     unsafe_share_price_divisor: Optional[str] = None
+    # Non-None (the accessor call's own evidence string) if this
+    # function, or anything it reaches via bounded internal calls,
+    # computes a price/value from an unprotected AMM spot-price
+    # accessor call (Uniswap V2's getReserves() / V3's slot0()) used
+    # directly in a multiplication/division, that SPECIFIC value is not
+    # itself forward-tainted into a real elapsed-time-gated division
+    # within its own containing function, AND writes real lending/
+    # valuation-shaped critical state in that same reachable scope —
+    # see core/spot_price_detection.py::find_unsafe_spot_price_dependency.
+    # Real precedent: Harvest Finance's real $24M loss (Oct 2020),
+    # Warp Finance's real $8M loss (Dec 2020) — both priced collateral
+    # directly from a single AMM pool's instantaneous reserve state,
+    # manipulable within one flash-loaned transaction.
+    unsafe_spot_price_dependency: Optional[str] = None
 
     # Layer 4 — graph edges (canonical IDs)
     internal_callees: List[str] = field(default_factory=list)
@@ -460,6 +475,7 @@ def build_graph(
                 self_scoped_asset_moves = find_self_scoped_asset_moves(f)
                 self_scoped_liability_reductions = find_self_scoped_liability_reductions(f)
                 unsafe_share_price_divisor = find_unsafe_share_price_divisor(f) if not is_modifier else None
+                unsafe_spot_price_dependency = find_unsafe_spot_price_dependency(f) if not is_modifier else None
                 auth_state = (
                     "AUTHENTICATED" if structural_auth_score >= 3 else
                     "UNKNOWN" if structural_auth_score == 2 else
@@ -513,6 +529,7 @@ def build_graph(
                     self_scoped_asset_move_functions=self_scoped_asset_moves,
                     self_scoped_liability_reduction_keys=self_scoped_liability_reductions,
                     unsafe_share_price_divisor=unsafe_share_price_divisor,
+                    unsafe_spot_price_dependency=unsafe_spot_price_dependency,
                     internal_callees=int_callees,
                     external_callees=ext_callees,
                     state_writes=state_writes,
