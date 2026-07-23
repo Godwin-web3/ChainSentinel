@@ -41,21 +41,42 @@ much was actually received.
 
 from typing import Optional
 
+from slither.slithir.operations import LibraryCall
+
 from core.edges import _is_token_transfer_call, _resolves_to_self, _follow_reference
 from core.auth_detection import _expand_with_internal_calls
 
 _CRITICAL_STATE_KEYWORDS = ("balance", "deposit", "shares", "escrow", "principal", "collateral")
 
+# Real function names used for this purpose by every `using X for Y`
+# safe-transfer library found live this session (OpenZeppelin's
+# SafeERC20/SafeERC20Upgradeable — by far the most widely-deployed
+# instance) — a raw ERC20's own transferFrom used the same way is the
+# same shape.
+_LIBRARY_TRANSFER_FROM_NAMES = {"transferfrom", "safetransferfrom"}
+
 
 def _find_self_pull_transfer_amount_args(f):
     """
     Yield the raw `amount` argument Variable of every real token-
-    transfer-shaped HighLevelCall in f's own body that PULLS tokens
-    INTO this contract — a 3-(or 4-)argument transferFrom/
-    safeTransferFrom whose `to` (argument index 1) resolves to
-    address(this) — confirmed live via IR probe to match the real
-    Popcorn MultiRewardEscrow.lock() shape:
-    `token.safeTransferFrom(msg.sender, address(this), amount)`.
+    transfer-shaped call in f's own body that PULLS tokens INTO this
+    contract — either (a) a 3-(or 4-)argument transferFrom/
+    safeTransferFrom HighLevelCall whose `to` (argument index 1)
+    resolves to address(this) — the plain interface-call shape
+    (`IERC20(token).transferFrom(from, to, amount)`) — or (b) the real,
+    single most common shape in practice: a `using SafeERC20 for
+    IERC20`-style LibraryCall, confirmed live via IR probe against the
+    ACTUAL, currently-deployed Popcorn MultiRewardEscrow.lock()
+    (code-423n4/2023-01-popcorn-findings#503) — `token.safeTransferFrom
+    (msg.sender, address(this), amount)` lowers to a LibraryCall whose
+    own `.arguments` is the library FUNCTION's full declared parameter
+    list, `(token, from, to, amount)` — the "for" instance becomes a
+    real LEADING positional argument, shifting `to`/`amount` one slot
+    later than the HighLevelCall case. This was a real, undetected gap
+    in this module's own primary real-world grounding: the original
+    fixture only reproduced the plain-interface-call shape, never the
+    actual library-delegation mechanics SafeERC20 uses.
+
     Deliberately scoped to the PULL direction only — the real, most
     common, most clearly-defined instance of this bug class (crediting
     a deposit based on a nominal amount rather than what was actually
@@ -68,14 +89,23 @@ def _find_self_pull_transfer_amount_args(f):
         return
     for node in nodes:
         for ir in node.irs:
-            if not _is_token_transfer_call(ir):
-                continue
-            args = list(getattr(ir, "arguments", None) or [])
-            if len(args) < 3:
-                continue
-            if not _resolves_to_self(args[1], f):
-                continue
-            yield args[2]
+            if _is_token_transfer_call(ir):
+                args = list(getattr(ir, "arguments", None) or [])
+                if len(args) < 3:
+                    continue
+                if not _resolves_to_self(args[1], f):
+                    continue
+                yield args[2]
+            elif isinstance(ir, LibraryCall):
+                fname = str(getattr(ir, "function_name", "") or "").lower()
+                if fname not in _LIBRARY_TRANSFER_FROM_NAMES:
+                    continue
+                args = list(getattr(ir, "arguments", None) or [])
+                if len(args) < 4:
+                    continue
+                if not _resolves_to_self(args[-2], f):
+                    continue
+                yield args[-1]
 
 
 def _reaches_critical_accounting_write(seed, f, max_depth: int = 6) -> Optional[str]:

@@ -24,6 +24,25 @@ interface IERC20 {
     function balanceOf(address) external view returns (uint256);
 }
 
+// Faithful minimal reproduction of the real OpenZeppelin SafeERC20's
+// safeTransferFrom signature and `using X for Y` mechanics — confirmed
+// live via IR probe against the ACTUAL, currently-deployed
+// OpenZeppelin v4.9.3 SafeERC20.sol: a `using SafeERC20 for IERC20`
+// call lowers to a LibraryCall whose own `.arguments` is the library
+// FUNCTION's full declared parameter list `(token, from, to, amount)`
+// — the "for" instance becomes a real LEADING positional argument,
+// shifting `to`/`amount` one slot later than a plain HighLevelCall
+// interface call. This was a real, undetected gap in this module: the
+// real, currently-deployed Popcorn MultiRewardEscrow.lock()
+// (code-423n4/2023-01-popcorn-findings#503) — this module's own
+// primary real-world grounding — used exactly this LibraryCall shape
+// and was invisible to the original HighLevelCall-only detection.
+library SafeERC20 {
+    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {
+        require(token.transferFrom(from, to, value), "SafeERC20: transferFrom failed");
+    }
+}
+
 // DANGEROUS: faithful minimal reproduction of the real Popcorn
 // MultiRewardEscrow.lock() shape — credits the SAME nominal `amount`
 // argument directly into accounting with no check on what was
@@ -122,5 +141,46 @@ contract ThirdPartyRelayDoesNotFalsePositive {
         token.transferFrom(msg.sender, to, amount);
         uint256 id = nextId++;
         escrows[id].balance = amount;
+    }
+}
+
+// DANGEROUS: the real, currently-deployed Popcorn MultiRewardEscrow.
+// lock() shape, verified live against the actual fetched source —
+// `token.safeTransferFrom(msg.sender, address(this), amount)` via
+// `using SafeERC20 for IERC20`, crediting the raw amount directly.
+// Must fire evidence.
+contract VulnerableEscrowViaSafeERC20 {
+    using SafeERC20 for IERC20;
+
+    struct Escrow { uint256 balance; }
+    mapping(uint256 => Escrow) public escrows;
+    uint256 public nextId;
+
+    function lock(IERC20 token, uint256 amount) external {
+        token.safeTransferFrom(msg.sender, address(this), amount);
+        uint256 id = nextId++;
+        escrows[id].balance = amount;
+    }
+}
+
+// Safe: the same real SafeERC20 `using-for` LibraryCall shape, but
+// with the real balance-before/after delta fix applied. Proves the
+// LibraryCall handling doesn't just blanket-flag every SafeERC20 pull
+// — the delta must actually feed the write, same bar as the plain-
+// interface-call cases above. Must NOT fire.
+contract ProtectedEscrowViaSafeERC20 {
+    using SafeERC20 for IERC20;
+
+    struct Escrow { uint256 balance; }
+    mapping(uint256 => Escrow) public escrows;
+    uint256 public nextId;
+
+    function lock(IERC20 token, uint256 amount) external {
+        uint256 balanceBefore = token.balanceOf(address(this));
+        token.safeTransferFrom(msg.sender, address(this), amount);
+        uint256 balanceAfter = token.balanceOf(address(this));
+        uint256 actualAmount = balanceAfter - balanceBefore;
+        uint256 id = nextId++;
+        escrows[id].balance = actualAmount;
     }
 }

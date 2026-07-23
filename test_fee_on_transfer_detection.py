@@ -113,6 +113,40 @@ def test_third_party_relay_does_not_false_positive():
     print("test_third_party_relay_does_not_false_positive: PASS")
 
 
+def test_safe_erc20_library_call_shape_detected():
+    """
+    Live-verification regression: found via direct re-check against
+    the real, currently-deployed Popcorn MultiRewardEscrow.lock()
+    (code-423n4/2023-01-popcorn-findings#503) — this module's own
+    primary real-world grounding — which uses `token.safeTransferFrom
+    (msg.sender, address(this), amount)` via `using SafeERC20 for
+    IERC20`. This lowers to a LibraryCall whose own `.arguments` is the
+    library FUNCTION's full declared parameter list `(token, from, to,
+    amount)` — a real, undetected gap: the original detection only
+    handled the plain HighLevelCall interface-call shape
+    (`IERC20(token).transferFrom(from, to, amount)`, 3 args), never the
+    LibraryCall shape's shifted argument positions. Must fire evidence.
+    """
+    nodes, *_ = _build("UnsafeCredit.sol")
+    fn = nodes["VulnerableEscrowViaSafeERC20.lock(IERC20,uint256)"]
+    assert fn.unsafe_fee_on_transfer_credit is not None, "expected unsafe fee-on-transfer credit evidence via the real SafeERC20 LibraryCall shape"
+    print("test_safe_erc20_library_call_shape_detected: PASS —",
+          "evidence:", fn.unsafe_fee_on_transfer_credit)
+
+
+def test_safe_erc20_library_call_balance_delta_suppresses_finding():
+    """
+    The same real SafeERC20 `using-for` LibraryCall shape, but with the
+    real balance-before/after delta fix applied. Proves the new
+    LibraryCall handling doesn't just blanket-flag every SafeERC20
+    pull — the delta must actually feed the write. Must NOT flag.
+    """
+    nodes, *_ = _build("UnsafeCredit.sol")
+    fn = nodes["ProtectedEscrowViaSafeERC20.lock(IERC20,uint256)"]
+    assert fn.unsafe_fee_on_transfer_credit is None, f"balance-delta-protected SafeERC20 credit must not flag, got {fn.unsafe_fee_on_transfer_credit}"
+    print("test_safe_erc20_library_call_balance_delta_suppresses_finding: PASS")
+
+
 def test_fee_on_transfer_constraint_fires_only_on_real_vulnerable_contracts():
     """
     End-to-end: runs the full path-enumeration + constraint-validation
@@ -130,6 +164,7 @@ def test_fee_on_transfer_constraint_fires_only_on_real_vulnerable_contracts():
     for vulnerable_entry in (
         "VulnerableEscrow.lock(IERC20,uint256)",
         "UnrelatedBalanceCheckDoesNotSuppress.lock(IERC20,uint256)",
+        "VulnerableEscrowViaSafeERC20.lock(IERC20,uint256)",
     ):
         vulnerable_findings = [
             r for r in report.confirmed
@@ -142,6 +177,7 @@ def test_fee_on_transfer_constraint_fires_only_on_real_vulnerable_contracts():
         "UniswapV2StylePullAccounting.deposit()",
         "NameDecoyOnly.deposit()",
         "ThirdPartyRelayDoesNotFalsePositive.relay(IERC20,address,uint256)",
+        "ProtectedEscrowViaSafeERC20.lock(IERC20,uint256)",
     ):
         safe_findings = [
             r for r in all_results
@@ -160,5 +196,7 @@ if __name__ == "__main__":
     test_unrelated_balance_check_does_not_suppress_real_finding()
     test_name_decoy_does_not_false_positive()
     test_third_party_relay_does_not_false_positive()
+    test_safe_erc20_library_call_shape_detected()
+    test_safe_erc20_library_call_balance_delta_suppresses_finding()
     test_fee_on_transfer_constraint_fires_only_on_real_vulnerable_contracts()
     print("\nAll fee_on_transfer_detection tests passed.")
