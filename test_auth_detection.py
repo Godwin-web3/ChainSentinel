@@ -513,6 +513,46 @@ def test_ecrecover_signer_self_scoping_detected():
           "permit suppressed, corruptViaUnrelatedSignature still", dangerous_gap[0].verdict)
 
 
+def test_balance_invariant_suppresses_flashloan_window():
+    """
+    Reproduces the real false positive found live this session against
+    Uniswap V3's UniswapV3Pool.flash()/swap(): a value snapshotted
+    before an external callback is re-read after it and enforced via a
+    revert-capable invariant — the actual mechanism that makes an
+    unauthenticated flash-loan callback safe.
+    _check_flashloan_window's own docstring already claimed to check
+    for "no invariant enforced after", but the code never did — this
+    fired FLASHLOAN_WINDOW at 99% confidence on real, safe code.
+
+    Also proves this doesn't weaken detection: flashUnsafe() reproduces
+    the real PancakeBunny-style shape — a state write before the
+    callback with NO re-verification afterward at all. Must still fire.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("FlashLoanInvariant.sol")
+
+    safe = nodes["FlashLoanInvariant.flash(address,uint256)"]
+    assert safe.has_balance_invariant_after_call, "flash()'s balance0Before/After + require should be recognized as a real invariant"
+
+    dangerous = nodes["FlashLoanInvariant.flashUnsafe(address,uint256)"]
+    assert not dangerous.has_balance_invariant_after_call, "flashUnsafe() has no re-verification at all — must not be marked safe"
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible + report.suppressed
+
+    safe_window = [r for r in all_results if r.path.entry == safe.id and "FLASHLOAN_WINDOW" in r.constraint_type]
+    assert not safe_window, f"flash()'s callback window is closed by a real invariant — FLASHLOAN_WINDOW should not fire, got {safe_window}"
+
+    dangerous_window = [
+        r for r in (report.confirmed + report.likely + report.possible)
+        if r.path.entry == dangerous.id and "FLASHLOAN_WINDOW" in r.constraint_type
+    ]
+    assert dangerous_window, "flashUnsafe() has no invariant re-check at all — FLASHLOAN_WINDOW must still fire"
+    print("test_balance_invariant_suppresses_flashloan_window: PASS —",
+          "flash suppressed, flashUnsafe still", dangerous_window[0].verdict)
+
+
 if __name__ == "__main__":
     test_custom_named_auth_modifier_detected()
     test_real_access_control_struct_shape_detected()
@@ -529,4 +569,5 @@ if __name__ == "__main__":
     test_ownable2step_accept_ownership_suppressed()
     test_numeric_equality_constant_role_flag_detected()
     test_ecrecover_signer_self_scoping_detected()
+    test_balance_invariant_suppresses_flashloan_window()
     print("\nAll auth_detection tests passed.")

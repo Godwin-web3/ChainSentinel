@@ -927,6 +927,22 @@ def _check_flashloan_window(path, nodes, graph_edges) -> ConstraintResult:
     if not structural_match:
         return _suppressed(path, "No flash loan window pattern — no state+external signal")
 
+    # The "no invariant enforced after" half of this check's own
+    # docstring, which the structural signal above never actually
+    # verified — see core/auth_detection.py::
+    # has_balance_invariant_after_external_call. The real Uniswap V3
+    # flash()/swap() shape: a value snapshotted before the callback is
+    # re-read after it and compared via a revert-capable require — the
+    # actual mechanism that makes an unauthenticated flash-loan
+    # callback safe, structurally distinct from merely having some
+    # unrelated require() present somewhere in the function.
+    if entry_node is not None and getattr(entry_node, "has_balance_invariant_after_call", False):
+        return _suppressed(
+            path,
+            "Entry re-verifies a snapshotted quantity after the external call via a "
+            "revert-capable invariant — the callback window is closed, not open"
+        )
+
     # Name matching as confidence booster, not gate
     flashloan_signals = {
         "flashloan", "flash", "flashborrow", "executeoperation",

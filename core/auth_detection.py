@@ -50,7 +50,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from slither.slithir.operations import (
     Assignment, Binary, HighLevelCall, Index, InternalCall, LibraryCall, LowLevelCall,
-    Member, Return, Send, SolidityCall, Transfer,
+    Member, Return, Send, SolidityCall, Transfer, TypeConversion,
 )
 from slither.slithir.operations.binary import BinaryType
 from slither.slithir.variables.reference import ReferenceVariable
@@ -1372,6 +1372,153 @@ def has_state_write_after_external_call(f, max_depth: int = 30) -> bool:
             continue
         if _reaches_state_write(node, max_depth, set()):
             return True
+    return False
+
+
+def _snapshot_read_identity(ir):
+    """
+    If ir is a "balance-snapshot"-style read — an InternalCall to a
+    real function (e.g. Uniswap V3's own `balance0()` helper), or a
+    HighLevelCall whose destination and function name are both
+    resolvable (e.g. an inlined `token.balanceOf(address(this))`) —
+    return a hashable identity for WHAT it reads, so a second read of
+    the SAME thing later in the function can be recognized as a
+    matching before/after pair. Returns None for anything else (a
+    plain arithmetic op, a state-variable field read via Member, etc.)
+    — deliberately narrow, since those shapes don't reliably identify
+    "the same external quantity" the way a repeated call does.
+    """
+    if isinstance(ir, InternalCall) and getattr(ir, "function", None) is not None:
+        return ("internal", ir.function)
+    if isinstance(ir, HighLevelCall):
+        dest = getattr(ir, "destination", None)
+        fname = getattr(ir, "function_name", None)
+        if dest is not None and fname is not None:
+            return ("highlevel", str(dest), str(fname))
+    return None
+
+
+def _touched_leaf_vars(var, f, max_depth: int = 4, _visited: Optional[set] = None) -> Set:
+    """
+    Bounded, cycle-safe backward walk from var through its OWN defining
+    op (Assignment/Binary/LibraryCall/TypeConversion), collecting every
+    variable touched along the way — e.g. `balance0Before.add(fee0)`
+    (a LibraryCall with arguments=[balance0Before, fee0]) touches both
+    balance0Before and fee0. Used to recognize a require() that
+    compares a WRAPPED before-snapshot (through a SafeMath-style helper
+    call) against a raw after-snapshot, not just a bare variable-to-
+    variable comparison.
+    """
+    if _visited is None:
+        _visited = set()
+    if var is None or id(var) in _visited or max_depth <= 0:
+        return set()
+    _visited.add(id(var))
+    result = {var}
+    defining_op = _find_defining_op(var, f)
+    if defining_op is None:
+        return result
+    operands = []
+    for attr in ("variable_left", "variable_right", "rvalue", "variable"):
+        v = getattr(defining_op, attr, None)
+        if v is not None:
+            operands.append(v)
+    operands.extend(getattr(defining_op, "arguments", None) or [])
+    for op in operands:
+        result |= _touched_leaf_vars(op, f, max_depth - 1, _visited)
+    return result
+
+
+def has_balance_invariant_after_external_call(f, max_depth: int = 30) -> bool:
+    """
+    True if f's own body contains a genuine snapshot-callback-reverify
+    invariant around an external call — the real Uniswap V3 flash()
+    shape that's the actual mechanism preventing a flash-loan callback
+    exploit, not just "some check exists somewhere":
+        uint256 balance0Before = balance0();
+        ...
+        IUniswapV3FlashCallback(msg.sender).uniswapV3FlashCallback(...);
+        uint256 balance0After = balance0();
+        require(balance0Before.add(fee0) <= balance0After, 'F0');
+
+    Requires ALL THREE: (1) a snapshot read BEFORE the external call,
+    (2) a snapshot read of the SAME thing (_snapshot_read_identity)
+    CFG-reachable AFTER it, and (3) a revert-capable node, also
+    reachable after the call, whose comparison touches BOTH snapshot
+    variables (through a bounded backward walk that sees through
+    SafeMath-style wrapper calls). No single one of these alone is
+    real proof — e.g. a stray comparison touching only the after-
+    snapshot (never the before-snapshot) proves nothing about state
+    continuity across the callback window.
+
+    core/constraints.py::_check_flashloan_window's OWN docstring
+    already promises "external call + state write before it + no
+    invariant enforced after" — but its code never actually checked
+    for that missing third clause, so a real, present invariant like
+    this one never suppressed anything. Found live this session: real
+    Uniswap V3 Pool's flash()/swap()/collect() all flagged
+    FLASHLOAN_WINDOW despite flash() enforcing exactly this invariant.
+    """
+    try:
+        nodes = list(getattr(f, "nodes", []) or [])
+    except Exception:
+        return False
+
+    for node in nodes:
+        has_external = any(
+            isinstance(ir, (HighLevelCall, LowLevelCall)) and not isinstance(ir, LibraryCall)
+            for ir in getattr(node, "irs", []) or []
+        )
+        if not has_external:
+            continue
+
+        after_ids = set()
+        stack = [node]
+        while stack:
+            cur = stack.pop()
+            if id(cur) in after_ids or len(after_ids) > max_depth:
+                continue
+            after_ids.add(id(cur))
+            stack.extend(getattr(cur, "sons", []) or [])
+
+        before_snapshots = {}
+        for n in nodes:
+            if id(n) in after_ids:
+                continue
+            for ir in getattr(n, "irs", []) or []:
+                src = _snapshot_read_identity(ir)
+                lvalue = getattr(ir, "lvalue", None)
+                if src is not None and lvalue is not None:
+                    before_snapshots[src] = lvalue
+        if not before_snapshots:
+            continue
+
+        after_snapshots = {}
+        for n in nodes:
+            if id(n) not in after_ids:
+                continue
+            for ir in getattr(n, "irs", []) or []:
+                src = _snapshot_read_identity(ir)
+                lvalue = getattr(ir, "lvalue", None)
+                if src is not None and src in before_snapshots and lvalue is not None:
+                    after_snapshots[src] = lvalue
+        if not after_snapshots:
+            continue
+
+        for n in nodes:
+            if id(n) not in after_ids or not _node_can_revert(n):
+                continue
+            for ir in n.irs:
+                if not isinstance(ir, Binary) or ir.type not in (
+                    BinaryType.LESS_EQUAL, BinaryType.GREATER_EQUAL,
+                    BinaryType.LESS, BinaryType.GREATER, BinaryType.EQUAL,
+                ):
+                    continue
+                touched = _touched_leaf_vars(ir.variable_left, f) | _touched_leaf_vars(ir.variable_right, f)
+                for src, before_var in before_snapshots.items():
+                    after_var = after_snapshots.get(src)
+                    if after_var is not None and before_var in touched and after_var in touched:
+                        return True
     return False
 
 

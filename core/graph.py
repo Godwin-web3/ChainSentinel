@@ -18,6 +18,7 @@ from core.invariants import extract_field_precise_writes, extract_field_precise_
 from core.auth_detection import (
     compute_own_auth, is_reentrancy_guard, has_inline_reentrancy_guard,
     has_state_write_after_external_call, has_revert_capable_body,
+    has_balance_invariant_after_external_call,
     find_self_scoped_writes, find_self_scoped_asset_moves,
     find_self_scoped_liability_reductions, find_economic_threshold_vars,
 )
@@ -110,6 +111,16 @@ class FunctionNode:
     # condition is derived from a trusted EXTERNAL dependency (e.g. an
     # oracle) rather than local storage or caller identity.
     has_revert_capable_body: bool = False
+    # True if this function's own body re-reads, AFTER an external call
+    # it makes, the SAME quantity it snapshotted BEFORE that call, and
+    # enforces a revert-capable invariant comparing the two — see
+    # core/auth_detection.py::has_balance_invariant_after_external_call.
+    # The real Uniswap V3 flash() shape (balance0Before/balance0After
+    # + require(balance0Before.add(fee0) <= balance0After)) — the
+    # actual mechanism that makes an unauthenticated flash-loan
+    # callback safe, which core/constraints.py::_check_flashloan_window
+    # never checked for despite its own docstring promising to.
+    has_balance_invariant_after_call: bool = False
     # Privileged writes reachable from THIS entry that are PROVABLY keyed
     # by the caller's own identity (core/auth_detection.py::
     # find_self_scoped_writes) — e.g. AccessControl.renounceRole's
@@ -431,6 +442,7 @@ def build_graph(
                 inline_guard = has_inline_reentrancy_guard(f) if not is_modifier else False
                 write_follows_call = has_state_write_after_external_call(f)
                 revert_capable = has_revert_capable_body(f)
+                balance_invariant_after_call = has_balance_invariant_after_external_call(f)
                 self_scoped_writes = find_self_scoped_writes(f)
                 self_scoped_asset_moves = find_self_scoped_asset_moves(f)
                 self_scoped_liability_reductions = find_self_scoped_liability_reductions(f)
@@ -482,6 +494,7 @@ def build_graph(
                     has_inline_reentrancy_guard=inline_guard,
                     state_write_follows_external_call=write_follows_call,
                     has_revert_capable_body=revert_capable,
+                    has_balance_invariant_after_call=balance_invariant_after_call,
                     self_scoped_write_keys=self_scoped_writes,
                     self_scoped_asset_move_functions=self_scoped_asset_moves,
                     self_scoped_liability_reduction_keys=self_scoped_liability_reductions,
