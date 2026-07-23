@@ -85,6 +85,19 @@ contract ReentrancyEdgeCases {
     address public candidate;
     string public name_;
 
+    struct Slot0 {
+        bool unlocked;
+        uint256 price;
+    }
+    Slot0 public slot0;
+
+    struct ProtocolFees {
+        uint128 token0;
+        uint128 token1;
+    }
+    ProtocolFees public protocolFees;
+    uint256 public liquidity;
+
     // Unguarded on purpose: makes `voter` structurally untrusted
     // (core/edges.py's trust resolution — a state var written by an
     // unauthenticated function is never treated as a fixed, trusted
@@ -215,5 +228,43 @@ contract ReentrancyEdgeCases {
     function setNameViaFakeMarker(string calldata newName) external {
         require(IMarkerLike(candidate).reportAndMutate(), "rejected");
         name_ = newName;
+    }
+
+    // Safe: the real, currently-deployed Uniswap V3 UniswapV3Pool.
+    // swap() shape, confirmed live via IR probe against the actual
+    // fetched source — the guard check reads a LOCAL cache of the
+    // state variable (`Slot0 memory slot0Start = slot0;` then
+    // `require(slot0Start.unlocked, 'LOK')`), one hop removed from the
+    // state write itself (`slot0.unlocked = false`). Must NOT fire
+    // REENTRANCY_CEI — see
+    // core/auth_detection.py::_guard_shape_from_before_after's local-
+    // variable-taint hop.
+    function swapLikeUniswapV3() external {
+        Slot0 memory slot0Start = slot0;
+        require(slot0Start.unlocked, "LOK");
+        slot0.unlocked = false;
+        (bool ok, ) = msg.sender.call{value: 0}("");
+        require(ok, "call failed");
+        balance = 0;
+        slot0.unlocked = true;
+    }
+
+    // DANGEROUS: the critical adversarial regression case found live
+    // this session verifying against the real, currently-deployed
+    // Uniswap V3 UniswapV3Pool.flash() — TWO UNRELATED compound-
+    // assignment accumulator writes to the same struct
+    // (`protocolFees.token0 += ...` then `protocolFees.token1 += ...`)
+    // coincidentally satisfy "written twice, read at first occurrence"
+    // (compound assignment reads-then-writes) plus "some unrelated
+    // revert-capable node exists somewhere before" (require(liquidity
+    // > 0, "L")) — with ZERO actual guard relationship between the
+    // require and the accumulator. Must still fire REENTRANCY_CEI.
+    function flashLikeUniswapV3WithoutRealGuard() external {
+        require(liquidity > 0, "L");
+        protocolFees.token0 += 1;
+        (bool ok, ) = msg.sender.call{value: 0}("");
+        require(ok, "call failed");
+        balance = 0;
+        protocolFees.token1 += 1;
     }
 }

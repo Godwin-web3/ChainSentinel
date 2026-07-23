@@ -1577,10 +1577,30 @@ def _guard_shape_from_before_after(before: list, after: list) -> bool:
     """
     Shared core: True if `before`/`after` node lists match a
     reentrancy-guard's structural signature — a state variable written
-    in both, read somewhere in `before`, with a revert-capable node
-    also in `before`. Used both by is_reentrancy_guard (split at a
-    modifier's PLACEHOLDER) and has_inline_reentrancy_guard (split
-    around a plain function's own candidate guard-variable writes).
+    in both, with a revert-capable node in `before` that reads that
+    same candidate — either directly, or one hop through a LOCAL
+    variable cached from it earlier in `before` (the real, currently-
+    deployed Uniswap V3 UniswapV3Pool.swap() shape:
+    `Slot0 memory slot0Start = slot0; ... require(slot0Start.unlocked,
+    'LOK'); ... slot0.unlocked = false;` — the require reads the LOCAL
+    cache, not `slot0` itself).
+
+    Deliberately NOT just "some candidate is read somewhere in before"
+    and "some unrelated revert-capable node also exists somewhere in
+    before", checked as two independent facts — that weaker pairing,
+    found live this session verifying against the real deployed
+    source, coincidentally matched UniswapV3Pool.flash()'s own two
+    UNRELATED fee accumulators, `protocolFees.token0 += ...` then
+    `protocolFees.token1 += ...` (the compound assignment makes
+    `protocolFees` both read and written at its first occurrence) plus
+    flash()'s own unrelated `require(_liquidity > 0, 'L')` elsewhere in
+    the same span — zero actual guard relationship between them.
+    flash() was unaffected in practice only because it also carries a
+    real `lock` modifier, recognized separately.
+
+    Used both by is_reentrancy_guard (split at a modifier's
+    PLACEHOLDER) and has_inline_reentrancy_guard (split around a plain
+    function's own candidate guard-variable writes).
     """
     written_before = _state_vars_written(before)
     written_after = _state_vars_written(after)
@@ -1588,10 +1608,17 @@ def _guard_shape_from_before_after(before: list, after: list) -> bool:
     if not candidates:
         return False
 
-    read_before = _state_vars_read(before)
-    guarded_before = any(_node_can_revert(n) for n in before)
-
-    return bool(candidates & read_before) and guarded_before
+    tainted_locals = set()
+    for node in before:
+        state_reads = {str(v) for v in (getattr(node, "state_variables_read", []) or [])}
+        all_reads = {str(v) for v in (getattr(node, "variables_read", []) or [])}
+        touches_candidate = bool(candidates & state_reads) or bool(tainted_locals & all_reads)
+        if touches_candidate and _node_can_revert(node):
+            return True
+        if touches_candidate:
+            for var in getattr(node, "variables_written", []) or []:
+                tainted_locals.add(str(var))
+    return False
 
 
 def _counter_fence_guard_shape(before: list, after: list) -> bool:

@@ -390,6 +390,62 @@ def test_constant_variable_getter_not_misclassified_as_reentrancy_vector():
           "setNameViaConstantMarker suppressed, setNameViaFakeMarker still", dangerous_findings[0].verdict)
 
 
+def test_local_cache_guard_read_detected_without_coincidental_match():
+    """
+    Live-verification regression against the real, currently-deployed
+    Uniswap V3 UniswapV3Pool.sol source.
+
+    swapLikeUniswapV3() reproduces swap()'s real inline-guard shape: the
+    revert-capable check reads a LOCAL cache of the state variable
+    (`Slot0 memory slot0Start = slot0;` then
+    `require(slot0Start.unlocked, "LOK")`), one hop removed from the
+    direct state write (`slot0.unlocked = false`) —
+    _guard_shape_from_before_after originally required the revert node
+    to read the candidate STATE variable directly, missing this real,
+    extremely common cache-then-check gas optimization. Must be
+    suppressed.
+
+    flashLikeUniswapV3WithoutRealGuard() reproduces the critical
+    adversarial regression found live verifying flash(): two UNRELATED
+    compound-assignment accumulator writes to the same struct
+    (protocolFees.token0/token1 += ...) plus an unrelated
+    require(liquidity > 0) elsewhere coincidentally satisfied the
+    OLD, looser check ("some candidate read somewhere" AND "some
+    revert-capable node somewhere", checked independently) with zero
+    actual guard relationship. Must NOT be suppressed — REENTRANCY_CEI
+    must still fire.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("ReentrancyEdgeCases.sol")
+
+    real_cache_guard = nodes["ReentrancyEdgeCases.swapLikeUniswapV3()"]
+    coincidental = nodes["ReentrancyEdgeCases.flashLikeUniswapV3WithoutRealGuard()"]
+    assert real_cache_guard.has_inline_reentrancy_guard is True, (
+        "swapLikeUniswapV3()'s require reads a local cache of the state variable one hop removed — must be recognized"
+    )
+    assert coincidental.has_inline_reentrancy_guard is False, (
+        "flashLikeUniswapV3WithoutRealGuard()'s two accumulator writes and unrelated require() must not coincidentally match"
+    )
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible
+
+    guarded_findings = [
+        r for r in all_results
+        if r.path.entry == "ReentrancyEdgeCases.swapLikeUniswapV3()" and "REENTRANCY_CEI" in r.constraint_type
+    ]
+    assert not guarded_findings, f"swapLikeUniswapV3() has a real inline guard — must be suppressed, got {guarded_findings}"
+
+    coincidental_findings = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == "ReentrancyEdgeCases.flashLikeUniswapV3WithoutRealGuard()" and "REENTRANCY_CEI" in r.constraint_type
+    ]
+    assert coincidental_findings, "flashLikeUniswapV3WithoutRealGuard() has no real guard — REENTRANCY_CEI must still fire"
+    print("test_local_cache_guard_read_detected_without_coincidental_match: PASS —",
+          "swapLikeUniswapV3 suppressed, flashLikeUniswapV3WithoutRealGuard still", coincidental_findings[0].verdict)
+
+
 if __name__ == "__main__":
     test_entry_level_cei_violation_detected()
     test_staticcall_not_misclassified_as_asset_drain_or_callback()
@@ -400,4 +456,5 @@ if __name__ == "__main__":
     test_health_check_recognizes_trusted_external_dependency()
     test_view_call_not_misclassified_as_reentrancy_or_flashloan_vector()
     test_constant_variable_getter_not_misclassified_as_reentrancy_vector()
+    test_local_cache_guard_read_detected_without_coincidental_match()
     print("\nAll reentrancy_edges tests passed.")
