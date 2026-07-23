@@ -156,6 +156,51 @@ def test_fake_timelock_does_not_suppress_finding():
           "evidence:", fn.unprotected_initializer_write)
 
 
+def test_vat_style_self_scoped_permission_write_suppresses_finding():
+    """
+    Live-verification regression: found firing on the real, currently-
+    deployed MakerDAO Vat.sol — one of the most important, highest-TVL
+    contracts in all of DeFi. hope(usr)/nope(usr) write
+    `can[msg.sender][usr]` — a per-caller delegate-permission mapping —
+    with no one-time-latch and no msg.sender-based own-auth check
+    (there's genuinely no identity check needed: the write can only
+    ever land inside the CALLER's own subtree). The raw FunctionNode
+    field still reports evidence (that's the correct, narrower claim —
+    "this write is initializer-shaped"); the full constraint pipeline
+    must suppress it via the same self-scoped-write exemption
+    ACCESS_CONTROL_GAP already has. corruptGrant() proves this doesn't
+    weaken detection: the identical mapping, with neither key
+    self-scoped, must still fire CONFIRMED.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("UnprotectedInit.sol")
+
+    hope = nodes["VatStyleSelfScopedPermission.hope(address)"]
+    nope = nodes["VatStyleSelfScopedPermission.nope(address)"]
+    assert hope.unprotected_initializer_write is not None, "raw field should still report evidence — the exemption applies at the constraint level"
+    assert nope.unprotected_initializer_write is not None
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible
+
+    for safe_entry in ("VatStyleSelfScopedPermission.hope(address)", "VatStyleSelfScopedPermission.nope(address)"):
+        safe_findings = [
+            r for r in all_results
+            if "UNPROTECTED_INITIALIZER" in r.constraint_type and r.path.entry == safe_entry
+        ]
+        assert not safe_findings, f"{safe_entry} (real Vat shape) must not fire UNPROTECTED_INITIALIZER, got {safe_findings}"
+
+    dangerous_findings = [
+        r for r in report.confirmed
+        if "UNPROTECTED_INITIALIZER" in r.constraint_type
+        and r.path.entry == "VatStyleSelfScopedPermission.corruptGrant(address,address)"
+    ]
+    assert dangerous_findings, "corruptGrant() (neither key self-scoped) must still fire UNPROTECTED_INITIALIZER CONFIRMED"
+    print("test_vat_style_self_scoped_permission_write_suppresses_finding: PASS —",
+          "hope/nope suppressed, corruptGrant still", dangerous_findings[0].verdict)
+
+
 def test_unprotected_initializer_constraint_fires_only_on_real_vulnerable_contracts():
     """
     End-to-end: runs the full path-enumeration + constraint-validation
@@ -211,5 +256,6 @@ if __name__ == "__main__":
     test_ownable2step_style_accept_does_not_false_positive()
     test_metamorpho_style_timelock_gated_accept_does_not_false_positive()
     test_fake_timelock_does_not_suppress_finding()
+    test_vat_style_self_scoped_permission_write_suppresses_finding()
     test_unprotected_initializer_constraint_fires_only_on_real_vulnerable_contracts()
     print("\nAll initializer_detection tests passed.")

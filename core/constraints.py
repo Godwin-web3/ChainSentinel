@@ -1101,6 +1101,34 @@ def _check_unprotected_initializer(path, nodes, graph_edges) -> ConstraintResult
             "protected by a one-time-latch guard"
         )
 
+    # Self-scoped write: same exemption ACCESS_CONTROL_GAP already
+    # applies (core/auth_detection.py::find_self_scoped_writes) — the
+    # sink's privileged write is PROVABLY keyed by the caller's own
+    # identity, so an attacker reaching this can only ever corrupt
+    # their OWN storage slot. Found live verifying against the real,
+    # currently-deployed MakerDAO Vat.sol: hope(usr)/nope(usr) write
+    # `can[msg.sender][usr]` — a per-user delegate-permission mapping,
+    # not a global admin/owner variable — and previously false-
+    # positived UNPROTECTED_INITIALIZER ("attacker can... become
+    # owner/admin") despite being safe by construction: calling
+    # hope(evil) can only ever grant `evil` permission over the
+    # CALLER's own vault, never anyone else's. This exemption was
+    # already proven correct for ACCESS_CONTROL_GAP; UNPROTECTED_
+    # INITIALIZER shares the exact same STORAGE_CORRUPTION sink and
+    # privileged_writes data, so the identical check applies.
+    if path.sink.privileged_writes:
+        self_scoped = getattr(entry_node, "self_scoped_write_keys", set()) if entry_node else set()
+        self_funded = getattr(entry_node, "self_scoped_liability_reduction_keys", set()) if entry_node else set()
+        combined = self_scoped | self_funded
+        if combined and path.sink.privileged_writes.issubset(combined):
+            return _suppressed(
+                path,
+                f"All privileged writes on this path ({path.sink.evidence}) are provably "
+                f"keyed by the caller's own identity — an attacker reaching this entry can "
+                f"only ever corrupt their OWN storage slot, never another user's or a global "
+                f"admin variable, regardless of the missing latch/identity guard"
+            )
+
     return ConstraintResult(
         path=path,
         verdict=CONFIRMED,

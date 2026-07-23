@@ -294,3 +294,53 @@ contract FakeTimelockDoesNotSuppressFinding {
         balance -= amount;
     }
 }
+
+// Negative control (the critical adversarial regression case found
+// live this session verifying against the real, currently-deployed
+// MakerDAO Vat.sol — one of the most important, highest-TVL contracts
+// in all of DeFi): hope(usr)/nope(usr) write `can[msg.sender][usr]` —
+// a per-CALLER delegate-permission mapping (the exact same real
+// pattern already proven self-scoped for ACCESS_CONTROL_GAP in
+// fixture/auth_detection/NestedMappingSelfScope.sol) — with NO
+// one-time-latch guard and no msg.sender-based own-auth check, since
+// there's genuinely no identity check needed: the write can only ever
+// land inside the CALLER's own subtree of `can`, never anyone else's,
+// regardless of what `usr` is chosen. Previously false-positived
+// UNPROTECTED_INITIALIZER with a reasoning string that was flatly
+// wrong for this shape ("attacker can... become owner/admin"). Must
+// NOT fire — core/constraints.py::_check_unprotected_initializer now
+// applies the same self-scoped-write exemption ACCESS_CONTROL_GAP
+// already had.
+contract VatStyleSelfScopedPermission {
+    address public constant ADMIN = address(0xdead);
+    mapping(address => mapping(address => bool)) public can;
+
+    // Makes `can` structurally "privileged" for classify_sinks — a
+    // real msg.sender-keyed boolean lookup gating a revert, matching
+    // the real AccessControl.hasRole shape.
+    modifier onlyAdminApproved() {
+        require(can[ADMIN][msg.sender], "not approved by admin");
+        _;
+    }
+
+    function privilegedAction() external onlyAdminApproved {}
+
+    function hope(address usr) external {
+        can[msg.sender][usr] = true;
+    }
+
+    function nope(address usr) external {
+        can[msg.sender][usr] = false;
+    }
+
+    // DANGEROUS: structurally identical shape (writes the SAME
+    // privileged mapping, same lack of any guard), but neither the
+    // outer key (victim) nor the inner key (usr) is msg.sender — an
+    // attacker can corrupt an ARBITRARY victim's permission row. Must
+    // still fire — proves the exemption requires genuine self-scoping,
+    // not just "this privileged var has SOME self-scoped write
+    // somewhere in the contract".
+    function corruptGrant(address victim, address usr) external {
+        can[victim][usr] = true;
+    }
+}
