@@ -311,7 +311,25 @@ def run_slither(resolved: dict) -> dict:
     def _core(s: str) -> str:
         return "".join(w for w in _word_tokens(s) if w not in _FILLER_WORDS)
 
-    bare_first_segments = {p.split("/")[0] for p in bare_import_paths}
+    # For each bare import, match candidates are normally just the
+    # first path segment — but for an npm-SCOPED package (a first
+    # segment starting with "@", e.g. "@rari-capital"), ALSO consider
+    # the second segment as an independent match candidate, keyed by
+    # the FULL "scope/package" prefix. Found live this session against
+    # real GoGoPool/Hypha's TokenggAVAX.sol (Avalanche): imports
+    # `@rari-capital/solmate/src/mixins/ERC4626.sol`, but the fetched
+    # tree only vendors it as `lib/solmate/` — no directory anywhere is
+    # named "rari-capital" (Solmate's ORIGINAL npm scope, before the
+    # package moved to the unscoped transmissions11/solmate), so
+    # matching on the first segment alone can never succeed; "solmate"
+    # (the second segment, the actual package name) does.
+    alias_candidates: dict = {}  # remap LHS prefix -> segment to alias-match against directory names
+    for p in bare_import_paths:
+        parts = p.split("/")
+        alias_candidates[parts[0]] = parts[0]
+        if parts[0].startswith("@") and len(parts) > 1:
+            alias_candidates[f"{parts[0]}/{parts[1]}"] = parts[1]
+
     alias_targets: dict = {}
     alias_best_diff: dict = {}
     for root, dirs, files in os.walk(project_root):
@@ -321,7 +339,7 @@ def run_slither(resolved: dict) -> dict:
             if not norm_d:
                 continue
             core_d = _core(d)
-            for seg in bare_first_segments:
+            for lhs, seg in alias_candidates.items():
                 norm_seg = _normalize(seg)
                 if not norm_seg:
                     continue
@@ -338,9 +356,9 @@ def run_slither(resolved: dict) -> dict:
                     ):
                         matched = True
                         diff = abs(len(core_seg) - len(core_d))
-                if matched and diff < alias_best_diff.get(seg, float("inf")):
-                    alias_targets[seg] = full
-                    alias_best_diff[seg] = diff
+                if matched and diff < alias_best_diff.get(lhs, float("inf")):
+                    alias_targets[lhs] = full
+                    alias_best_diff[lhs] = diff
 
     # A name-matched alias target may not be the real package ROOT —
     # some vendoring tools nest the fetched package one level deeper

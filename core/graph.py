@@ -22,6 +22,7 @@ from core.auth_detection import (
     find_self_scoped_writes, find_self_scoped_asset_moves,
     find_self_scoped_liability_reductions, find_economic_threshold_vars,
 )
+from core.vault_detection import find_unsafe_share_price_divisor
 from slither.slithir.operations import (
     InternalCall, HighLevelCall, LowLevelCall, SolidityCall, LibraryCall
 )
@@ -154,6 +155,18 @@ class FunctionNode:
     # msg.sender itself; this instead requires the write's magnitude to
     # be provably funded BY msg.sender, regardless of who benefits.
     self_scoped_liability_reduction_keys: Set[tuple] = field(default_factory=set)
+    # Non-None (the divisor's own evidence string) if this function, or
+    # anything it reaches via bounded internal calls, computes a
+    # share/asset conversion ratio (a raw Division or a mulDiv-family
+    # library call) whose divisor is an unprotected `token.
+    # balanceOf(address(this))` read AND writes share-supply-shaped
+    # state in that same reachable scope — see core/vault_detection.py
+    # ::find_unsafe_share_price_divisor. The real ERC4626 donation/
+    # inflation attack shape (Sherlock 2024-01-napier-judging#125,
+    # Zellic's Perennial report): an attacker donates tokens directly
+    # to the vault (bypassing deposit()) to inflate totalAssets without
+    # inflating totalSupply, rounding later depositors' shares to zero.
+    unsafe_share_price_divisor: Optional[str] = None
 
     # Layer 4 — graph edges (canonical IDs)
     internal_callees: List[str] = field(default_factory=list)
@@ -446,6 +459,7 @@ def build_graph(
                 self_scoped_writes = find_self_scoped_writes(f)
                 self_scoped_asset_moves = find_self_scoped_asset_moves(f)
                 self_scoped_liability_reductions = find_self_scoped_liability_reductions(f)
+                unsafe_share_price_divisor = find_unsafe_share_price_divisor(f) if not is_modifier else None
                 auth_state = (
                     "AUTHENTICATED" if structural_auth_score >= 3 else
                     "UNKNOWN" if structural_auth_score == 2 else
@@ -498,6 +512,7 @@ def build_graph(
                     self_scoped_write_keys=self_scoped_writes,
                     self_scoped_asset_move_functions=self_scoped_asset_moves,
                     self_scoped_liability_reduction_keys=self_scoped_liability_reductions,
+                    unsafe_share_price_divisor=unsafe_share_price_divisor,
                     internal_callees=int_callees,
                     external_callees=ext_callees,
                     state_writes=state_writes,

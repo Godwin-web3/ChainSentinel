@@ -1084,151 +1084,60 @@ def _check_unchecked_return(path, nodes, graph_edges) -> ConstraintResult:
 
 # ── Constraint 7: Share inflation / exchange rate manipulation ────
 
-def _rate_is_balance_derived(node_id: str, graph_edges: dict, depth: int = 2, _visited: set = None) -> bool:
-    """
-    Walk the subgraph from a totalAssets()/totalSupply()-style node up to
-    `depth` hops. Returns True only if a live balance read (balanceOf,
-    asset.balanceOf, address(this).balance) is found in its call tree -
-    meaning the exchange-rate denominator CAN be inflated by directly
-    transferring tokens into the contract (the donation-attack precondition).
-
-    Protocols that track assets via internal accounting (a state variable
-    updated only through tracked deposit/withdraw/accrual deltas, e.g.
-    Aave, Compound, Exactly) are NOT balance-derived and are immune to
-    this specific attack vector even without a virtual-shares offset.
-    """
-    if _visited is None:
-        _visited = set()
-    if depth == 0 or node_id in _visited:
-        return False
-    _visited.add(node_id)
-    for edge in graph_edges.get(node_id, []):
-        name = (edge.function_name or "").lower()
-        if "balanceof" in name or "address(this).balance" in name:
-            return True
-        if _rate_is_balance_derived(edge.dst, graph_edges, depth - 1, _visited):
-            return True
-    return False
-
-
 def _check_share_inflation(path, nodes, graph_edges) -> ConstraintResult:
     """
-    Detect ERC4626 vault share inflation and donation attack patterns.
-    Pattern: deposit/mint reads exchange rate from totalAssets/totalSupply
-    without rounding protection or virtual offset.
-    Real exploits: Wise Lending $460k, Sonne Finance $20M, numerous 2024 vaults.
+    Detect ERC4626 vault share-price-manipulation (donation/inflation
+    attack) patterns via core/vault_detection.py::
+    find_unsafe_share_price_divisor, computed once from real Slither
+    IR while building the graph (core/graph.py) — not re-derived here
+    from lossy CallEdge.function_name string matching. Real, verified
+    IR shapes (confirmed live via probe against the actual Solmate
+    FixedPointMathLib and OpenZeppelin ERC4626 v4.9+/v5 source):
+    an unsafe divisor is a share/asset conversion ratio whose
+    denominator traces to a raw `token.balanceOf(address(this))` read
+    with no additive virtual-offset term on it, in the same function-
+    or-reachable-helper scope as a share-supply-shaped state write.
+
+    Real precedent: Sherlock's real 2024-01-napier-judging#125 finding
+    against Napier's BaseLSTAdapter (`totalAssets()` summing
+    `STETH.balanceOf(address(this))` with no offset), and Zellic's real
+    Perennial audit finding of the identical shape.
+
+    Gated on path.sink.category == ASSET_DRAIN, matching this
+    constraint's prior integration: a vault's own deposit()/mint() path
+    naturally reaches its own asset-moving sink (the token transfer it
+    performs), keeping this to one finding per real entry rather than
+    one per every path the entry happens to enumerate.
     """
     if path.sink.category != ASSET_DRAIN:
         return _suppressed(path, "Not an asset drain path")
 
-    inflation_signals = {
-        "totalassets", "totalsupply", "converttoshares", "converttoassets",
-        "previewdeposit", "previewmint", "previewwithdraw", "previewredeem",
-        "exchangerate", "getrate", "pricepereshare", "shareprice",
-        "assetsperShare", "virtualoffset", "decimalsoffset",
-    }
-
-    rounding_protection = {
-        "offset", "virtual", "dead", "minimum", "minshares",
-        "decimalsoffset", "roundingoffset",
-    }
-
-    donation_signals = {
-        "donate", "transfer", "directtransfer", "selfbalance",
-        "address(this).balance", "balanceof",
-    }
-
-    inflation_reads = []
-    has_rounding_protection = False
-    has_donation_vector = False
-
-    for edge in path.edge_chain:
-        fname = (edge.function_name or "").lower()
-
-        for sig in inflation_signals:
-            if sig in fname:
-                inflation_reads.append(edge.function_name or fname)
-
-        for sig in rounding_protection:
-            if sig in fname:
-                has_rounding_protection = True
-
-        for sig in donation_signals:
-            if sig in fname:
-                has_donation_vector = True
-
-        # One-hop lookahead
-        for inner_edge in graph_edges.get(edge.dst, []):
-            inner_name = (inner_edge.function_name or "").lower()
-            for sig in inflation_signals:
-                if sig in inner_name:
-                    inflation_reads.append(inner_name)
-            for sig in rounding_protection:
-                if sig in inner_name:
-                    has_rounding_protection = True
-
-    # Re-scan specifically for totalAssets()/totalSupply()-style rate
-    # functions (the actual exchange-rate denominator) and check whether
-    # any of them is balance-derived. Catches protocols (Aave, Compound,
-    # Exactly) that track assets via internal accounting state rather than
-    # asset.balanceOf(address(this)), which are immune to the donation/
-    # inflation attack precondition even without a virtual-shares offset.
-    ACCOUNTING_RATE_SIGNALS = {"totalassets", "totalsupply"}
-    rate_node_ids = []
-    for edge in path.edge_chain:
-        fname = (edge.function_name or "").lower()
-        if any(sig in fname for sig in ACCOUNTING_RATE_SIGNALS):
-            rate_node_ids.append(edge.dst)
-        for inner_edge in graph_edges.get(edge.dst, []):
-            inner_name = (inner_edge.function_name or "").lower()
-            if any(sig in inner_name for sig in ACCOUNTING_RATE_SIGNALS):
-                rate_node_ids.append(inner_edge.dst)
-
-    if rate_node_ids and not any(
-        _rate_is_balance_derived(n, graph_edges, depth=2) for n in rate_node_ids
-    ):
+    entry_node = nodes.get(path.entry)
+    evidence = getattr(entry_node, "unsafe_share_price_divisor", None) if entry_node else None
+    if evidence is None:
         return _suppressed(
             path,
-            "Exchange rate computed from internal accounting state, not live "
-            "balanceOf - donation/inflation attack precondition not met"
+            "No unprotected balanceOf(this)-derived share-price ratio found on this entry's "
+            "reachable scope — either no such ratio exists, its divisor is internally tracked "
+            "(immune to direct-donation manipulation), or it carries a real virtual-offset term"
         )
-
-    # Check entry node for deposit/mint context
-    entry_name = path.entry.split(".")[-1].split("(")[0].lower()
-    vault_entry = any(sig in entry_name for sig in (
-        "deposit", "mint", "withdraw", "redeem",
-        "borrow", "supply", "lend",
-    ))
-
-    if not inflation_reads or not vault_entry:
-        return _suppressed(path, "No share inflation signals on path")
-
-    if has_rounding_protection:
-        return _suppressed(path, "Rounding protection detected — inflation attack unlikely")
-
-    # Confidence scaling
-    confidence = 70
-    if has_donation_vector:
-        confidence = 85  # donation vector + no rounding = classic inflation attack
-    if len(inflation_reads) >= 3:
-        confidence = min(92, confidence + 10)
-
-    verdict = CONFIRMED if confidence >= 85 else LIKELY
 
     return ConstraintResult(
         path=path,
-        verdict=verdict,
-        confidence=confidence,
+        verdict=CONFIRMED,
+        confidence=90,
         constraint_type="SHARE_INFLATION",
         reasoning=(
-            f"Vault entry {path.entry} reads exchange rate from {inflation_reads[:3]} "
-            f"without rounding protection. "
-            f"{'Donation vector detected — first depositor attack possible. ' if has_donation_vector else ''}"
-            f"Sink: {path.sink.node_id}. "
-            f"Pattern matches ERC4626 inflation attacks (Wise Lending, Sonne Finance)."
+            f"Entry {path.entry} computes a share/asset conversion ratio whose divisor "
+            f"({evidence}) is an unprotected balanceOf(address(this)) read, with no additive "
+            f"virtual-offset term and no internal accounting — an attacker can donate tokens "
+            f"directly to the contract (bypassing deposit()) to inflate this divisor without "
+            f"inflating totalSupply, rounding later depositors' shares to zero. Sink: "
+            f"{path.sink.node_id}. Real precedent: Sherlock 2024-01-napier-judging#125, "
+            f"Zellic's Perennial ERC-4626 inflation attack finding."
         ),
         immunefi_impact="Direct theft of user funds via share price manipulation",
-        final_score=_final_score(path, confidence),
+        final_score=_final_score(path, 90),
     )
 
 
