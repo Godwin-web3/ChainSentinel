@@ -250,6 +250,23 @@ def run_slither(resolved: dict) -> dict:
     def _normalize(s: str) -> str:
         return _re.sub(r'[^a-z0-9]', '', s.lower())
 
+    # Well-known historical package renames — the SAME real library
+    # published under a different npm package name at different points
+    # in time, so its normalized old name shares no substring with its
+    # normalized new one. `openzeppelin-solidity` was OpenZeppelin's own
+    # npm package name through v2.x (pre-2019), before the
+    # `@openzeppelin/contracts` rename — real, still-live pre-Foundry
+    # Solidity 0.4.x/0.5.x contracts (found live this session against
+    # Mento Protocol's real Broker implementation on Celo, solc 0.5.17)
+    # still import it by that name. "openzeppelinsolidity" is not a
+    # substring of "openzeppelincontracts" (different second word), so
+    # the plain substring match below can't bridge them — even when the
+    # exact same vendored OZ tree is already sitting in the project,
+    # fetched for a sibling dependency's own needs.
+    _KNOWN_PACKAGE_SYNONYMS = {
+        "openzeppelinsolidity": "openzeppelincontracts",
+    }
+
     bare_first_segments = {p.split("/")[0] for p in bare_import_paths}
     alias_targets: dict = {}
     for root, dirs, files in os.walk(project_root):
@@ -262,7 +279,10 @@ def run_slither(resolved: dict) -> dict:
                 if seg in alias_targets:
                     continue
                 norm_seg = _normalize(seg)
-                if norm_seg and norm_seg in norm_d:
+                candidates = {norm_seg}
+                if norm_seg in _KNOWN_PACKAGE_SYNONYMS:
+                    candidates.add(_KNOWN_PACKAGE_SYNONYMS[norm_seg])
+                if norm_seg and any(c in norm_d for c in candidates):
                     alias_targets[seg] = full
 
     remappings = []
@@ -284,7 +304,7 @@ def run_slither(resolved: dict) -> dict:
 
     # Prioritize known packages that commonly fail remapping in deep lib trees
     PRIORITY_PACKAGES = {
-        "openzeppelin-contracts", "@openzeppelin", "forge-std",
+        "openzeppelin-contracts", "@openzeppelin", "openzeppelin-solidity", "forge-std",
         "solmate", "solady", "ds-test", "prb-math",
     }
     priority = [r for r in remappings if any(p in r for p in PRIORITY_PACKAGES)]

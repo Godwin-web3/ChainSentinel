@@ -176,12 +176,26 @@ def _classify_node(node_id: str, node, edges: List[CallEdge], privileged_vars: O
     node_name = getattr(node, 'name', '').lower().split('(')[0]
     if node_name in PROXY_DISPATCHER_NAMES:
         return None
-    # Also exclude nodes whose only edges are delegatecalls to
-    # statically known implementation slots (not attacker-controlled)
-    if node_name in ("fallback", "receive") and all(
-        e.raw_type in ("delegatecall", "codecall") and not e.uncertain
-        for e in edges if e.raw_type in ("delegatecall", "codecall")
-    ) and edges:
+    # Also exclude nodes whose only delegatecall/codecall edges target a
+    # real, actively governance-gated implementation slot — the
+    # standard transparent-proxy pattern (e.g. Compound V2's Unitroller.
+    # fallback() -> comptrollerImplementation.delegatecall(msg.data)):
+    # the dispatcher itself has no auth check by design, because the
+    # actual privilege enforcement lives inside each of the
+    # implementation's own functions, re-checked against the SAME
+    # shared storage the delegatecall preserves. governance_gated (not
+    # the weaker `trusted`) is required — evidence of a REAL, ongoing,
+    # non-constructor admin-gated setter for the destination, not just
+    # an immutable/constructor-fixed one, matching the same bar
+    # core/cross_market.py already requires before trusting a
+    # delegation target. Note: edge.uncertain is hardcoded True for
+    # every delegatecall/codecall in core/edges.py::_semantic_properties
+    # regardless of destination trust — this check must use
+    # governance_gated, not uncertain, which can never be False here.
+    delegation_edges = [e for e in edges if e.raw_type in ("delegatecall", "codecall")]
+    if node_name in ("fallback", "receive") and delegation_edges and all(
+        getattr(e, "governance_gated", False) for e in delegation_edges
+    ):
         return None
 
     # ── 1. Selfdestruct ──────────────────────────────────────────

@@ -641,6 +641,53 @@ def test_fresh_deployment_destination_excludes_cross_function_race():
           "createPair suppressed, UnsafeFactory.createPair still", dangerous_race[0].verdict)
 
 
+def test_transparent_proxy_fallback_governance_gated_destination_excludes_delegation_sink():
+    """
+    Reproduces the real false positive found live this session against
+    Takara Lend, a real Compound V2 fork deployed on Sei (Comptroller
+    at 0x56A171Acb1bBa46D4fdF21AfBE89377574B8D9BD):
+    SafeUnitroller.fallback() unconditionally delegatecalls
+    `comptrollerImpl.delegatecall(msg.data)` with no auth check of its
+    own — the standard transparent-proxy pattern. That's correct: the
+    actual privilege enforcement happens inside each of the
+    implementation's own functions, re-checked against the SAME shared
+    storage the delegatecall preserves. core/edges.py hardcoded
+    trusted=False for EVERY delegatecall regardless of destination, and
+    core/sinks.py's carve-out for exactly this pattern checked
+    `not e.uncertain` — a flag ALSO hardcoded True for every
+    delegatecall — so the carve-out could never actually fire.
+
+    Also proves this doesn't weaken detection: UnsafeProxy.fallback()
+    is structurally identical, except its implementation slot is set by
+    a completely UNGUARDED function — must still fire ACCESS_CONTROL_GAP
+    and classify as DELEGATION_SINK.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("TransparentProxyDelegation.sol")
+
+    sinks = classify_sinks(nodes, graph_edges)
+    safe_id = "SafeUnitroller.fallback()"
+    unsafe_id = "UnsafeProxy.fallback()"
+    assert safe_id not in sinks, f"SafeUnitroller.fallback()'s implementation slot is governance-gated — must not be a sink at all, got {sinks.get(safe_id)}"
+    assert unsafe_id in sinks and sinks[unsafe_id].category == "DELEGATION_SINK", (
+        f"UnsafeProxy.fallback()'s implementation slot is unguarded — must still classify as DELEGATION_SINK, got {sinks.get(unsafe_id)}"
+    )
+
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible
+
+    safe_findings = [r for r in all_results if r.path.entry == safe_id and "ACCESS_CONTROL_GAP" in r.constraint_type]
+    assert not safe_findings, f"SafeUnitroller.fallback() must not fire ACCESS_CONTROL_GAP, got {safe_findings}"
+
+    unsafe_findings = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == unsafe_id and "ACCESS_CONTROL_GAP" in r.constraint_type
+    ]
+    assert unsafe_findings, "UnsafeProxy.fallback()'s implementation slot is unguarded — ACCESS_CONTROL_GAP must still fire"
+    print("test_transparent_proxy_fallback_governance_gated_destination_excludes_delegation_sink: PASS —",
+          "SafeUnitroller excluded, UnsafeProxy still", unsafe_findings[0].verdict)
+
+
 def test_external_view_return_verdict_auth_detected():
     """
     Reproduces the real Balancer/Berachain BEX Authorizer false positive
@@ -709,5 +756,6 @@ if __name__ == "__main__":
     test_balance_invariant_suppresses_flashloan_window()
     test_self_scoped_getter_funds_asset_move()
     test_fresh_deployment_destination_excludes_cross_function_race()
+    test_transparent_proxy_fallback_governance_gated_destination_excludes_delegation_sink()
     test_external_view_return_verdict_auth_detected()
     print("\nAll auth_detection tests passed.")

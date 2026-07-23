@@ -66,12 +66,23 @@ interface IVoterLike {
     function notifyRewardAmount(uint256 amount) external;
 }
 
+// The real Compound V2 fork (Takara Lend on Sei) shape: an abstract
+// base declares `bool public constant isComptroller = true;` as a
+// cheap marker other contracts check before trusting an address as a
+// real implementation of the interface. Slither resolves a call to
+// this auto-generated getter to a StateVariable, not a Function.
+abstract contract IMarkerLike {
+    bool public constant isMarker = true;
+    function reportAndMutate() external virtual returns (bool);
+}
+
 contract ReentrancyEdgeCases {
     uint256 public balance;
     address public token0;
     bool public locked;
     uint256 public counter;
     address public voter;
+    address public candidate;
     string public name_;
 
     // Unguarded on purpose: makes `voter` structurally untrusted
@@ -174,6 +185,35 @@ contract ReentrancyEdgeCases {
     // fire REENTRANCY_CEI/FLASHLOAN_WINDOW.
     function setNameViaMutatingCall(string calldata newName) external {
         IVoterLike(voter).notifyRewardAmount(0);
+        name_ = newName;
+    }
+
+    // Unguarded on purpose, same reasoning as setVoter() above.
+    function setCandidate(address _candidate) external {
+        candidate = _candidate;
+    }
+
+    // Safe: the real Takara Lend (Compound V2 fork on Sei)
+    // TToken._setComptroller() shape — `IMarkerLike(candidate).
+    // isMarker()` calls a `public constant` variable's compiler-
+    // synthesized getter, which Slither resolves to a StateVariable,
+    // not a Function (no .view/.pure attribute at all). No custom logic
+    // can ever be attached to an auto-generated public-variable getter,
+    // so it can never write state or reenter — a state write right
+    // after it is not a reentrancy surface. Must NOT fire
+    // REENTRANCY_CEI or FLASHLOAN_WINDOW.
+    function setNameViaConstantMarker(string calldata newName) external {
+        require(IMarkerLike(candidate).isMarker(), "not a marker");
+        name_ = newName;
+    }
+
+    // DANGEROUS: structurally identical to setNameViaConstantMarker()
+    // — same auth-check shape, same state write — except the external
+    // call (reportAndMutate) is a REAL function, not an auto-generated
+    // constant-variable getter, and can have side effects. Must still
+    // fire REENTRANCY_CEI/FLASHLOAN_WINDOW.
+    function setNameViaFakeMarker(string calldata newName) external {
+        require(IMarkerLike(candidate).reportAndMutate(), "rejected");
         name_ = newName;
     }
 }

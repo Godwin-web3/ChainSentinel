@@ -152,6 +152,45 @@ def _raw_type_from_ir(ir) -> str:
 
 # ── Layer 2: Semantic inference ───────────────────────────────────
 
+def _is_view_or_pure_callee(fn) -> bool:
+    """
+    True if fn is provably side-effect-free: either a real Function/
+    Modifier declared view/pure, or a StateVariable — i.e. a call that
+    resolves to a `public` state variable's compiler-synthesized getter
+    (`uint256 public foo;` -> callable as `foo()`), for ANY visibility-
+    exposed variable, constant/immutable or plain mutable storage alike.
+
+    Slither resolves such a call's ir.function to a StateVariable
+    object, NOT a Function — so it carries no .view/.pure attribute at
+    all (both getattr(fn, "view", False) and getattr(fn, "pure", False)
+    silently return the False default). Confirmed live against the real
+    Compound V2 fork Takara Lend on Sei: `newComptroller.
+    isComptroller()`, a call to `bool public constant isComptroller =
+    true;` declared on an abstract base contract, resolves ir.function
+    to a StateVariable — every mutability check in this module was
+    treating it as an ordinary, unknown-mutability external call,
+    causing a false REENTRANCY_CEI/FLASHLOAN_WINDOW on
+    TToken._setComptroller().
+
+    Not limited to constant/immutable: a public variable's
+    auto-generated getter can ONLY ever be a compiler-synthesized
+    SLOAD-and-return accessor — Solidity gives no way to attach custom
+    logic to it (any custom logic requires writing a real explicit
+    function instead, which resolves to a genuine Function object with
+    real .view/.pure attributes, not a StateVariable). That holds
+    regardless of whether the underlying value can change over time, so
+    ANY StateVariable-resolved call is unconditionally safe from state-
+    crossing/reentrancy — it can never itself write state or call back
+    into anything.
+    """
+    if fn is None:
+        return False
+    if getattr(fn, "view", False) or getattr(fn, "pure", False):
+        return True
+    from slither.core.variables.state_variable import StateVariable
+    return isinstance(fn, StateVariable)
+
+
 def _semantic_properties(raw_type: str, ir=None) -> dict:
     """
     Derive semantic flags from raw type.
@@ -280,7 +319,7 @@ def _semantic_properties(raw_type: str, ir=None) -> dict:
 
     if raw_type == "highlevel" and ir is not None:
         fn = getattr(ir, "function", None)
-        if fn is not None and (getattr(fn, "view", False) or getattr(fn, "pure", False)):
+        if _is_view_or_pure_callee(fn):
             props["is_state_crossing"] = False
 
     return props
@@ -931,8 +970,28 @@ def _registry_validates_struct(f, struct_param, call_node=None) -> bool:
 
 def _resolve_trust(ir, raw_type: str, f, auth_lookup: Optional[dict], node=None) -> tuple:
     """
-    Decide trust for a call edge destination. Only highlevel calls are
-    considered (lowlevel / delegatecall destinations are always untrusted).
+    Decide trust for a call edge destination. Highlevel calls and
+    delegatecall/codecall are considered (raw .call()/.staticcall()
+    destinations are always untrusted — a low-level call's destination
+    carries no ABI-level identity to even ask "which state variable is
+    this," and .call() specifically is the highest-risk, most-arbitrary
+    call shape, so it stays conservative regardless).
+
+    delegatecall/codecall share the same destination-trust question as
+    a highlevel call: is the address a real, actively-governed storage
+    slot (e.g. a transparent proxy's `comptrollerImplementation`, set
+    only via a real 2-step admin handoff), or genuinely attacker/
+    caller-controlled? Found live this session against the real
+    Compound V2 fork Takara Lend on Sei: `Unitroller.fallback()`
+    delegatecalls `comptrollerImplementation.delegatecall(msg.data)`
+    with no auth check of its own — correct, since the actual privilege
+    enforcement happens inside each of the implementation's own
+    functions (`require(msg.sender == admin)`, reading the SAME shared
+    storage slot the delegatecall preserves) — but this function
+    previously hardcoded trusted=False for EVERY delegatecall
+    regardless of destination, so core/sinks.py's fallback/receive
+    proxy-dispatcher carve-out (which depends on this signal) could
+    never actually fire.
 
     Returns (trusted, governance_gated):
       trusted            -> destination is a storage variable written only
@@ -958,7 +1017,7 @@ def _resolve_trust(ir, raw_type: str, f, auth_lookup: Optional[dict], node=None)
                              vector real hacks exploit).
     Default -> (False, False), conservative.
     """
-    if raw_type != "highlevel":
+    if raw_type not in ("highlevel", "delegatecall", "codecall"):
         return False, False
     if not auth_lookup:
         return False, False
@@ -1018,7 +1077,8 @@ def _resolve_dst(ir, src_id: str, raw_type: str, f=None, auth_lookup: Optional[d
     Attempt to resolve destination canonical ID and name.
     Returns (dst_id, function_name, destination_str, trusted, governance_gated).
     Unresolvable targets return a labeled unknown with trusted=False,
-    governance_gated=False. Only highlevel calls may resolve either True.
+    governance_gated=False. Only highlevel and delegatecall/codecall
+    edges may resolve either True (see _resolve_trust).
     """
     if raw_type == "internal":
         try:
@@ -1098,7 +1158,16 @@ def _resolve_dst(ir, src_id: str, raw_type: str, f=None, auth_lookup: Optional[d
         except Exception:
             return f"{src_id}.__unresolved_external__", None, None, False, False
 
-    if raw_type in ("lowlevel_call", "delegatecall", "codecall", "staticcall"):
+    if raw_type in ("delegatecall", "codecall"):
+        try:
+            dest = str(ir.destination)
+            fname = getattr(ir, "function_name", "") or "call"
+            trusted, governance_gated = _resolve_trust(ir, raw_type, f, auth_lookup, node)
+            return f"lowlevel.{dest}.{fname}", fname, dest, trusted, governance_gated
+        except Exception:
+            return f"{src_id}.__unresolved_lowlevel__", None, None, False, False
+
+    if raw_type in ("lowlevel_call", "staticcall"):
         try:
             dest = str(ir.destination)
             fname = getattr(ir, "function_name", "") or "call"

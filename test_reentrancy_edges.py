@@ -348,6 +348,48 @@ def test_view_call_not_misclassified_as_reentrancy_or_flashloan_vector():
           "setNameLikeVelodrome suppressed, setNameViaMutatingCall still", dangerous_findings[0].verdict)
 
 
+def test_constant_variable_getter_not_misclassified_as_reentrancy_vector():
+    """
+    Reproduces the real false positive found live this session against
+    Takara Lend (a real Compound V2 fork deployed on Sei):
+    TToken._setComptroller() calls `newComptroller.isComptroller()`,
+    where `isComptroller` is `bool public constant` on an abstract base
+    contract. Slither resolves that call's ir.function to a
+    StateVariable, not a Function — so it carries no .view/.pure
+    attribute at all, and core/edges.py::_semantic_properties'
+    view/pure carve-out (built for the Velodrome fix above) silently
+    fell through to "unknown mutability, treat as dangerous."
+
+    Also proves this doesn't weaken detection:
+    setNameViaFakeMarker() is structurally identical (same call shape,
+    same state write) except the callee is a real function that can
+    have side effects, not an auto-generated constant-variable getter —
+    must still fire.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("ReentrancyEdgeCases.sol")
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible + report.suppressed
+
+    safe_id = "ReentrancyEdgeCases.setNameViaConstantMarker(string)"
+    safe_findings = [
+        r for r in all_results
+        if r.path.entry == safe_id and ("REENTRANCY_CEI" in r.constraint_type or "FLASHLOAN_WINDOW" in r.constraint_type)
+    ]
+    assert not safe_findings, f"setNameViaConstantMarker()'s only external call is a constant-variable getter — must not fire, got {safe_findings}"
+
+    dangerous_id = "ReentrancyEdgeCases.setNameViaFakeMarker(string)"
+    dangerous_findings = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == dangerous_id and ("REENTRANCY_CEI" in r.constraint_type or "FLASHLOAN_WINDOW" in r.constraint_type)
+    ]
+    assert dangerous_findings, "setNameViaFakeMarker()'s external call is a real function, not a constant getter — must still fire"
+    print("test_constant_variable_getter_not_misclassified_as_reentrancy_vector: PASS —",
+          "setNameViaConstantMarker suppressed, setNameViaFakeMarker still", dangerous_findings[0].verdict)
+
+
 if __name__ == "__main__":
     test_entry_level_cei_violation_detected()
     test_staticcall_not_misclassified_as_asset_drain_or_callback()
@@ -357,4 +399,5 @@ if __name__ == "__main__":
     test_cei_check_is_order_aware_not_co_occurrence()
     test_health_check_recognizes_trusted_external_dependency()
     test_view_call_not_misclassified_as_reentrancy_or_flashloan_vector()
+    test_constant_variable_getter_not_misclassified_as_reentrancy_vector()
     print("\nAll reentrancy_edges tests passed.")

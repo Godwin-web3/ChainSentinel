@@ -66,6 +66,7 @@ from core.edges import (
     _find_defining_op,
     _func_canonical_id,
     _node_can_revert,
+    _is_view_or_pure_callee,
 )
 
 # Origins that count as "not caller-controlled" on the non-msg.sender side
@@ -231,7 +232,7 @@ def _external_view_comparison_ir(node, f, known_msg_sender: frozenset = frozense
         if not isinstance(call_ir, HighLevelCall):
             continue
         callee = getattr(call_ir, "function", None)
-        if not (getattr(callee, "view", False) or getattr(callee, "pure", False)):
+        if not _is_view_or_pure_callee(callee):
             continue
         dest = getattr(call_ir, "destination", None)
         if dest is None:
@@ -293,7 +294,7 @@ def _is_fixed_call_destination(var, f, max_depth: int = 3) -> bool:
                 call_ir = _find_defining_op(v, callee)
                 if isinstance(call_ir, HighLevelCall):
                     callee_fn = getattr(call_ir, "function", None)
-                    if not (getattr(callee_fn, "view", False) or getattr(callee_fn, "pure", False)):
+                    if not _is_view_or_pure_callee(callee_fn):
                         continue
                     call_dest = getattr(call_ir, "destination", None)
                     if call_dest is not None and _is_fixed_call_destination(call_dest, callee, max_depth - 1):
@@ -340,7 +341,7 @@ def _external_view_return_verdict_ir(node, f, known_msg_sender: frozenset = froz
             if not isinstance(call_ir, HighLevelCall):
                 continue
             callee = getattr(call_ir, "function", None)
-            if not (getattr(callee, "view", False) or getattr(callee, "pure", False)):
+            if not _is_view_or_pure_callee(callee):
                 continue
             if str(getattr(call_ir.lvalue, "type", None)) != "bool":
                 continue
