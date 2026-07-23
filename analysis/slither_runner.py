@@ -144,16 +144,110 @@ def run_slither(resolved: dict) -> dict:
     # the Foundry platform entirely and falls back to plain solc.
     _has_local_foundry = _os.path.isfile(_os.path.join(project_root, "foundry.toml"))
 
-    # Build remappings from directory structure
+    # Build remappings, but ONLY for directories a real BARE (non-
+    # relative) import somewhere in the project actually references —
+    # not, as before, blindly for every directory in the tree.
+    #
+    # solc resolves a plain relative import (./, ../) purely by joining
+    # it onto the IMPORTING file's own path — no remapping is supposed
+    # to be involved. But once a remapping's LHS prefix happens to
+    # match that JOINED/normalized path too, solc's resolver applies it
+    # anyway, giving the file a SECOND, remapped-absolute identity
+    # distinct from the first, relative one it already has as the
+    # compile target or another relative import's target — and then
+    # declares every contract in it twice ("Identifier already
+    # declared"). Found live and reproduced down to a single-remap
+    # solc-only repro: a real Solidly-fork Pair.sol (Velodrome on
+    # Optimism, Lynex on Linea — same upstream code) entry file imports
+    # `./factories/PairFactory.sol`, which imports `../Pair.sol` right
+    # back — a real, safe, ordinary circular relative import solc
+    # handles fine with ZERO remappings (confirmed live) — but adding
+    # `contracts/factories/=<project_root>/contracts/factories/` (which
+    # the old blanket "remap every directory" loop always generated)
+    # collides with the FIRST import's own resolved path and triggers
+    # exactly this crash, silently failing analysis for every such
+    # protocol regardless of chain. Checked live: this real project's
+    # imports are 100% relative — not one bare import anywhere — so the
+    # old logic was generating remappings for it that were not just
+    # unneeded but actively fatal.
+    #
+    # Remapping direct/bare imports (package-style
+    # `@openzeppelin/contracts/...`, or a flattened multi-file fetch
+    # using absolute-style `contracts/Foo.sol`) is still exactly as
+    # important as before — those genuinely can't resolve without it —
+    # so this keeps full coverage for THAT real need while eliminating
+    # the case that can never legitimately require a remap: a directory
+    # nothing in the project ever references via a bare import.
+    import re as _re
+    _IMPORT_RE = _re.compile(r'import\s+(?:[^"\';]*?\bfrom\s+)?["\']([^"\']+)["\']')
+    bare_import_paths = set()
+    for root, _dirs, files in os.walk(project_root):
+        for fname in files:
+            if not fname.endswith(".sol"):
+                continue
+            try:
+                with open(os.path.join(root, fname), "r", errors="ignore") as fh:
+                    content = fh.read()
+            except Exception:
+                continue
+            for m in _IMPORT_RE.finditer(content):
+                path = m.group(1)
+                if path.startswith("./") or path.startswith("../"):
+                    continue
+                bare_import_paths.add(path)
+
+    def _needed_by_bare_import(rel: str) -> bool:
+        prefix = rel + "/"
+        return any(p == rel or p.startswith(prefix) for p in bare_import_paths)
+
+    # Package-alias fallback: a bare import's first segment (e.g.
+    # `@openzeppelin`) frequently doesn't literally match ANY directory
+    # name on disk, even though the real package IS present — a
+    # Foundry-verified contract's multi-file bundle commonly preserves
+    # the PHYSICAL vendored layout (e.g. `lib/openzeppelin-contracts/`)
+    # rather than the import-alias path, relying on a separate
+    # remappings.txt (not part of the bundle) to bridge them. Found
+    # live: real Velodrome's Pool.sol imports
+    # `@openzeppelin/contracts/token/ERC20/ERC20.sol` but the fetched
+    # tree only has `lib/openzeppelin-contracts/contracts/...` — no
+    # directory anywhere is literally named `@openzeppelin`, so the
+    # exact-match logic above (correctly) finds nothing to remap, and
+    # the import fails outright. Matches by checking whether a known
+    # package directory's normalized name (strip non-alphanumerics,
+    # lowercase) contains the import segment's own normalized form —
+    # `openzeppelin` (from `@openzeppelin`) is a substring of
+    # `openzeppelincontracts` (from `openzeppelin-contracts`).
+    def _normalize(s: str) -> str:
+        return _re.sub(r'[^a-z0-9]', '', s.lower())
+
+    bare_first_segments = {p.split("/")[0] for p in bare_import_paths}
+    alias_targets: dict = {}
+    for root, dirs, files in os.walk(project_root):
+        for d in dirs:
+            full = os.path.join(root, d)
+            norm_d = _normalize(d)
+            if not norm_d:
+                continue
+            for seg in bare_first_segments:
+                if seg in alias_targets:
+                    continue
+                norm_seg = _normalize(seg)
+                if norm_seg and norm_seg in norm_d:
+                    alias_targets[seg] = full
+
     remappings = []
+    for seg, full in alias_targets.items():
+        remappings.append(f"{seg}/={full}/")
+
     for root, dirs, files in os.walk(project_root):
         for d in dirs:
             full = os.path.join(root, d)
             rel = os.path.relpath(full, project_root)
+            short = rel.split("/")[-1] if "/" in rel else None
             # Use relative left side, absolute right side
-            remappings.append(f"{rel}/={full}/")
-            if "/" in rel:
-                short = rel.split("/")[-1]
+            if _needed_by_bare_import(rel):
+                remappings.append(f"{rel}/={full}/")
+            if short is not None and _needed_by_bare_import(short):
                 remappings.append(f"{short}/={full}/")
 
     remappings = list(dict.fromkeys(remappings))
