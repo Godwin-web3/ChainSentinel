@@ -1,5 +1,5 @@
 # Exploit Agent — Security Report
-> Generated: 2026-07-23T19:27:16.923248+00:00
+> Generated: 2026-07-23T20:19:28.998030+00:00
 
 ## Target
 | Field | Value |
@@ -246,14 +246,7 @@
 
 | Nodes | Sinks | Confirmed | Likely | Possible | Suppressed |
 |-------|-------|-----------|--------|----------|------------|
-| 388 | 3 | 2 | 0 | 0 | 1 |
-
-### Constraint Engine Findings
-
-- **CONFIRMED** (90%) `UNPROTECTED_INITIALIZER` — Pool.approvePositionManager(address,bool) → Pool.approvePositionManager(address,bool)
-  - Entry Pool.approvePositionManager(address,bool) writes privileged state (_positionManager) with NO guard against being invoked more than once, or by anyone — neither a one-time-latch modifier (the rea
-- **CONFIRMED** (90%) `UNPROTECTED_INITIALIZER` — Pool.renouncePositionManagerRole(address) → Pool.renouncePositionManagerRole(address)
-  - Entry Pool.renouncePositionManagerRole(address) writes privileged state (_positionManager) with NO guard against being invoked more than once, or by anyone — neither a one-time-latch modifier (the rea
+| 388 | 3 | 0 | 0 | 0 | 3 |
 
 ### Cross-Contract Dependency Resolution
 
