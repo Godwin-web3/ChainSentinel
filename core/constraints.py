@@ -150,6 +150,7 @@ def _validate_path(
     results.append(_check_oracle_dependency(path, nodes, graph_edges))
     results.append(_check_stale_oracle(path, nodes, graph_edges))
     results.append(_check_unprotected_initializer(path, nodes, graph_edges))
+    results.append(_check_fee_on_transfer_accounting(path, nodes, graph_edges))
     results.append(_check_flashloan_window(path, nodes, graph_edges))
     results.append(_check_unchecked_return(path, nodes, graph_edges))
     results.append(_check_share_inflation(path, nodes, graph_edges))
@@ -1117,6 +1118,65 @@ def _check_unprotected_initializer(path, nodes, graph_edges) -> ConstraintResult
         ),
         immunefi_impact="Complete protocol takeover via unprotected initializer",
         final_score=_final_score(path, 90),
+    )
+
+
+def _check_fee_on_transfer_accounting(path, nodes, graph_edges) -> ConstraintResult:
+    """
+    Detect a fee-on-transfer/rebasing-token accounting-mismatch pattern
+    via core/fee_on_transfer_detection.py::
+    find_unsafe_fee_on_transfer_credit, computed once from real Slither
+    IR while building the graph (core/graph.py).
+
+    Real precedent: Balancer's real $500K loss (June 2020) — a pool
+    holding Statera (STA), a deflationary token that burns 1% per
+    transfer, assumed each swap's IN amount was fully received; the
+    discrepancy compounded across 24 flash-loaned swaps until the
+    attacker drained the pool's other real assets (WBTC, LINK, SNX).
+    Also the real code-423n4/2023-01-popcorn-findings#503
+    (MultiRewardEscrow.lock()) — one of dozens of near-identical real
+    Code4rena/Sherlock findings whose recommended fix ("measure the
+    contract balance before and after the transfer, and use the
+    difference as the amount") appears near-verbatim across audits.
+
+    Gated on path.sink.category == ASSET_DRAIN — the vulnerable
+    entry's own transferFrom pull is itself a real token-transfer-
+    shaped call, so it naturally classifies as this sink already (the
+    same shape the sibling SHARE_INFLATION/ORACLE_DEPENDENCY checks
+    rely on for their own deposit-path entries).
+    """
+    if path.sink.category != ASSET_DRAIN:
+        return _suppressed(path, "Not an asset drain path")
+
+    entry_node = nodes.get(path.entry)
+    evidence = getattr(entry_node, "unsafe_fee_on_transfer_credit", None) if entry_node else None
+    if evidence is None:
+        return _suppressed(
+            path,
+            "No unsafe fee-on-transfer credit found on this entry's reachable scope — either "
+            "no self-pull transfer feeds accounting state directly, or a balanceOf(address"
+            "(this))-delta computation is genuinely interposed before the credit"
+        )
+
+    return ConstraintResult(
+        path=path,
+        verdict=CONFIRMED,
+        confidence=80,
+        constraint_type="FEE_ON_TRANSFER_ACCOUNTING",
+        reasoning=(
+            f"Entry {path.entry} pulls tokens via transferFrom/safeTransferFrom and directly "
+            f"credits the RAW, nominal amount argument into accounting state ({evidence}), "
+            f"with no balanceOf(address(this))-delta check on what was actually received. A "
+            f"fee-on-transfer or rebasing token can deliver less than the nominal amount, "
+            f"overcrediting this accounting — the discrepancy compounds across repeated calls "
+            f"until the contract's recorded accounting exceeds what it actually holds, letting "
+            f"later callers withdraw against balances the contract never received. Sink: "
+            f"{path.sink.node_id}. Real precedent: Balancer's $500K loss (June 2020, the real "
+            f"Statera/STA deflationary-token exploit), and code-423n4/2023-01-popcorn-findings"
+            f"#503."
+        ),
+        immunefi_impact="Accounting-state corruption via fee-on-transfer/rebasing token",
+        final_score=_final_score(path, 80),
     )
 
 
