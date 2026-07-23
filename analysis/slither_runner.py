@@ -263,7 +263,20 @@ def run_slither(resolved: dict) -> dict:
 
     log.debug(f"Remappings: {remappings[:5]}")
 
-    # --via-ir --optimize only supported in solc >= 0.8.13
+    # --via-ir only exists from solc 0.8.13 onward, but --optimize alone
+    # has existed since Solidity's earliest releases and needs no such
+    # gate. Real Aave V2-family lending pools (Aave itself, and forks:
+    # Celo's Moola, Mantle's Lendle, and virtually every other chain's
+    # AToken/LendingPool clone) are pinned to solc 0.6.x/0.7.x — too old
+    # for --via-ir — and without ANY optimizer flag, solc's own legacy
+    # codegen hits a hard "Stack too deep when compiling inline
+    # assembly" compile error on LendingPool.sol's real complexity,
+    # aborting analysis outright with no findings and no graph.
+    # Confirmed live: the identical compile with nothing but --optimize
+    # added (no --via-ir, since 0.7.6 doesn't support it) succeeds
+    # cleanly. Splitting the two flags apart — always pass --optimize,
+    # gate --via-ir separately — fixes this whole real, common protocol
+    # family without changing behavior for anything already working.
     try:
         version_parts = tuple(int(x) for x in solc_version.split(".")[:3])
         major, minor, patch = version_parts
@@ -271,7 +284,7 @@ def run_slither(resolved: dict) -> dict:
         version_parts = None
         major = minor = patch = 0
     use_ir = version_parts is not None and (major, minor) >= (0, 8) and patch >= 13
-    solc_extra = " --via-ir --optimize" if use_ir else ""
+    solc_extra = " --via-ir --optimize" if use_ir else " --optimize"
 
     # --allow-paths itself doesn't exist before solc 0.5.0 — passing it to
     # older compilers doesn't get ignored, it's a hard "unrecognised option"
@@ -283,7 +296,18 @@ def run_slither(resolved: dict) -> dict:
     solc_args = f"--allow-paths {project_root}{solc_extra}" if supports_allow_paths else solc_extra.strip()
     cmd = ["slither", filepath, "--solc", "solc-wrapper", "--json", "-"]
     if solc_args:
-        cmd += ["--solc-args", solc_args]
+        # `=`-joined, not two separate argv items: slither's own
+        # argparse mis-parses `--solc-args --optimize` (a bare value
+        # that itself looks like a flag) as "--solc-args got zero
+        # arguments, --optimize is a separate unknown flag" and aborts
+        # with "expected one argument" — confirmed live, this broke
+        # EVERY pre-0.5.0 compiler (solc_args is a bare "--optimize"
+        # there, no --allow-paths prefix to disguise it) the moment
+        # --optimize started being passed unconditionally. The `=`
+        # form sidesteps the ambiguity entirely and was verified live
+        # to still work for the existing multi-word case too (e.g.
+        # `--allow-paths /tmp/x --via-ir --optimize`).
+        cmd.append(f"--solc-args={solc_args}")
     if not _has_local_foundry:
         cmd.append("--foundry-ignore")
     if remappings:
