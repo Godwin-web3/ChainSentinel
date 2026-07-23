@@ -100,20 +100,56 @@ def _base_of_pass_through(defining_op):
     return None
 
 
+def _is_trivial_subtraction_wrapper(callee) -> bool:
+    """
+    True if callee's own body is a trivial `return a - b` wrapper
+    around its first two parameters — the real, extremely common pre-
+    Solidity-0.8 SafeMath-style idiom (no automatic overflow checks
+    existed yet), confirmed live via IR probe against Compound's
+    actual, currently-deployed GovernorBravoDelegate.sol:
+        function sub256(uint256 a, uint256 b) internal pure returns (uint) {
+            require(b <= a, "subtraction underflow");
+            return a - b;
+        }
+    used directly in cancel()'s real proposer-threshold check:
+    `comp.getPriorVotes(proposal.proposer, sub256(block.number, 1))`.
+    A leading require() guard (or any other node) doesn't affect this
+    — only that SOME Binary SUBTRACTION reading exactly callee's own
+    first two parameters exists in its body.
+    """
+    try:
+        params = list(getattr(callee, "parameters", []) or [])
+        nodes = list(getattr(callee, "nodes", []) or [])
+    except Exception:
+        return False
+    if len(params) < 2:
+        return False
+    a_param, b_param = params[0], params[1]
+    for node in nodes:
+        for ir in node.irs:
+            if isinstance(ir, Binary) and ir.type == BinaryType.SUBTRACTION:
+                if ir.variable_left is a_param and ir.variable_right is b_param:
+                    return True
+    return False
+
+
 def _resolves_to_past_timepoint(var, f, max_depth: int = 6) -> bool:
     """
     True if var is genuinely immune to same-block flash-loan
     manipulation as a governance voting-power timepoint argument:
     either (a) a Binary SUBTRACTION whose LEFT operand is the CURRENT
     block.number/block.timestamp (`block.number - k` — the real
-    Compound Governor Bravo / OZ Governor pattern), or (b) traces back
-    — through bounded pass-through hops (see _base_of_pass_through) —
-    to a value with NO local defining IR op in f at all: a state
-    variable, a struct field read from persistent storage, or a
-    function parameter, none of which can be freshly computed from the
-    CURRENT block within this same call (the real Compound Bravo
-    shape: `proposal.startBlock`, captured and stored at proposal-
-    creation time — an EARLIER transaction).
+    Compound Governor Bravo / OZ Governor pattern), (a2) a call to a
+    trivial subtraction-wrapper function (see
+    _is_trivial_subtraction_wrapper) whose OWN first argument is the
+    current block — the real `sub256(block.number, 1)` shape, or (b)
+    traces back — through bounded pass-through hops (see
+    _base_of_pass_through) — to a value with NO local defining IR op
+    in f at all: a state variable, a struct field read from persistent
+    storage, or a function parameter, none of which can be freshly
+    computed from the CURRENT block within this same call (the real
+    Compound Bravo shape: `proposal.startBlock`, captured and stored
+    at proposal-creation time — an EARLIER transaction).
 
     False if var IS (or resolves to) the raw, unmodified CURRENT
     block.number/block.timestamp — querying "right now" provides zero
@@ -131,6 +167,11 @@ def _resolves_to_past_timepoint(var, f, max_depth: int = 6) -> bool:
         left = defining_op.variable_left
         if _resolves_to_current_block_number(left, f) or _resolves_to_block_timestamp(left, f):
             return True
+    if isinstance(defining_op, InternalCall) and getattr(defining_op, "function", None) is not None:
+        call_args = list(getattr(defining_op, "arguments", None) or [])
+        if len(call_args) >= 2 and _is_trivial_subtraction_wrapper(defining_op.function):
+            if _resolves_to_current_block_number(call_args[0], f) or _resolves_to_block_timestamp(call_args[0], f):
+                return True
     inner = _base_of_pass_through(defining_op)
     if inner is not None:
         return _resolves_to_past_timepoint(inner, f, max_depth - 1)
@@ -195,10 +236,29 @@ def _traces_to_live_voting_power(var, f, max_depth: int = 4) -> Optional[str]:
 def _has_arbitrary_call_after(nodes: list, check_node) -> bool:
     """
     True if any node AFTER check_node (in program order within the
-    same node list) contains a HighLevelCall or LowLevelCall — the
-    real "execute the proposal" consequence (an arbitrary encoded
-    action, or a raw .call()), confirmed live via IR probe against a
-    faithful reproduction of the real Beanstalk emergencyCommit() shape.
+    same node list) contains a LowLevelCall (a raw .call()/
+    .delegatecall(), a call to WHATEVER address and data are supplied,
+    no fixed callee interface) — the real "execute the proposal"
+    consequence, confirmed live via IR probe against a faithful
+    reproduction of the real Beanstalk emergencyCommit() shape (its
+    real _execute() -> cutBip() chain performs a delegatecall to
+    attacker-supplied proposal data).
+
+    Deliberately does NOT count a HighLevelCall — a call through a
+    KNOWN, resolved interface with a fixed selector — as this
+    "arbitrary execution" evidence, even though one might reach an
+    untrusted destination for OTHER reasons (that's a different,
+    already-covered question — core/sinks.py's own CALLBACK_SINK/
+    trust-resolution machinery). Found live verifying against
+    Compound's actual, currently-deployed GovernorBravoDelegate.sol:
+    cancel()'s real `timelock.cancelTransaction(...)` — a HighLevelCall
+    through a known interface to a fixed, governance-set state
+    variable, not attacker-controlled — was originally being counted
+    as "arbitrary execution" evidence, which this module's own
+    DELEGATION_SINK-gated constraint check happened to filter out
+    downstream (timelock isn't an uncertain delegatecall destination),
+    but the FunctionNode-level field itself was imprecise regardless of
+    whether that specific case survived into a final finding.
     """
     try:
         idx = nodes.index(check_node)
@@ -206,7 +266,7 @@ def _has_arbitrary_call_after(nodes: list, check_node) -> bool:
         return False
     for node in nodes[idx + 1:]:
         for ir in node.irs:
-            if isinstance(ir, (HighLevelCall, LowLevelCall)):
+            if isinstance(ir, LowLevelCall):
                 return True
     return False
 

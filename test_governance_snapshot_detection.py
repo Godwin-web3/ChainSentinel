@@ -119,6 +119,25 @@ def test_vote_recording_without_execution_does_not_false_positive():
     print("test_vote_recording_without_execution_does_not_false_positive: PASS")
 
 
+def test_compound_bravo_real_cancel_shape_does_not_false_positive():
+    """
+    Live-verification regression: found firing on Compound's actual,
+    currently-deployed GovernorBravoDelegate.sol's real cancel()
+    function. Two distinct real-world idioms combine: (1)
+    sub256(block.number, 1) — the extremely common pre-Solidity-0.8
+    SafeMath-style subtraction-wrapper idiom, equivalent to the raw
+    `block.number - 1` this module already recognized, and (2) a
+    HighLevelCall (through a KNOWN, resolved interface) to a fixed,
+    governance-set state variable (timelock.cancelTransaction) — not
+    an arbitrary delegatecall to caller-supplied data. Both gaps are
+    now fixed. Must NOT flag.
+    """
+    nodes, *_ = _build("FlashLoanGovernance.sol")
+    fn = nodes["CompoundBravoStyleCancel.cancel()"]
+    assert fn.unsafe_live_voting_power_execution is None, f"real Compound Bravo cancel() shape must not flag, got {fn.unsafe_live_voting_power_execution}"
+    print("test_compound_bravo_real_cancel_shape_does_not_false_positive: PASS")
+
+
 def test_governance_snapshot_constraint_fires_only_on_real_vulnerable_contracts():
     """
     End-to-end: runs the full path-enumeration + constraint-validation
@@ -148,6 +167,7 @@ def test_governance_snapshot_constraint_fires_only_on_real_vulnerable_contracts(
         "ProtectedPreviousBlockStyle.execute(address,bytes)",
         "NameDecoyOnly.execute()",
         "VoteRecordingOnlyDoesNotFalsePositive.castVote(uint256)",
+        "CompoundBravoStyleCancel.cancel()",
     ):
         safe_findings = [
             r for r in all_results
@@ -156,7 +176,7 @@ def test_governance_snapshot_constraint_fires_only_on_real_vulnerable_contracts(
         assert not safe_findings, f"{safe_entry} must not fire FLASHLOAN_GOVERNANCE, got {safe_findings}"
 
     print("test_governance_snapshot_constraint_fires_only_on_real_vulnerable_contracts: PASS —",
-          "both vulnerable entries CONFIRMED, all four safe/decoy contracts correctly unflagged")
+          "both vulnerable entries CONFIRMED, all five safe/decoy contracts correctly unflagged")
 
 
 if __name__ == "__main__":
@@ -166,5 +186,6 @@ if __name__ == "__main__":
     test_fake_checkpoint_current_block_does_not_suppress_real_finding()
     test_name_decoy_does_not_false_positive()
     test_vote_recording_without_execution_does_not_false_positive()
+    test_compound_bravo_real_cancel_shape_does_not_false_positive()
     test_governance_snapshot_constraint_fires_only_on_real_vulnerable_contracts()
     print("\nAll governance_snapshot_detection tests passed.")

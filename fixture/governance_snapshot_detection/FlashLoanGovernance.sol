@@ -138,3 +138,43 @@ contract VoteRecordingOnlyDoesNotFalsePositive {
         votesFor[proposalId] += power;
     }
 }
+
+// Safe: the real, currently-deployed Compound GovernorBravoDelegate.
+// cancel() shape, found live via direct verification against the
+// actual fetched source. Two distinct real-world idioms combine here:
+// (1) sub256(block.number, 1) — the extremely common pre-Solidity-0.8
+// SafeMath-style subtraction-wrapper idiom, equivalent to the raw
+// `block.number - 1` this module already recognized, and (2) a
+// HighLevelCall (through a KNOWN, resolved interface) to a fixed,
+// governance-set state variable — not an arbitrary delegatecall to
+// caller-supplied data. Both must be recognized correctly: the first
+// false-negative check (querying a sub256-wrapped past block) proves
+// the wrapper is recognized as protective; the second (a regular
+// interface call is not "arbitrary execution") proves a known-
+// interface call to a fixed destination doesn't count as the
+// consequence this detector looks for. Must NOT fire.
+interface ITimelock {
+    function cancelTransaction(address target, bytes calldata data) external;
+}
+
+contract CompoundBravoStyleCancel {
+    IComp public comp;
+    ITimelock public timelock;
+    uint256 public proposalThreshold;
+    address public proposalProposer;
+    address public proposalTarget;
+    bytes public proposalData;
+
+    function sub256(uint256 a, uint256 b) internal pure returns (uint256) {
+        require(b <= a, "subtraction underflow");
+        return a - b;
+    }
+
+    function cancel() external {
+        require(
+            comp.getPriorVotes(proposalProposer, sub256(block.number, 1)) < proposalThreshold,
+            "proposer above threshold"
+        );
+        timelock.cancelTransaction(proposalTarget, proposalData);
+    }
+}
