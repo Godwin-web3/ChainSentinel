@@ -10,14 +10,16 @@ Any require/assert comparing two expressions, where at least one
 side touches state, becomes a candidate invariant.
 """
 
+import re
 from dataclasses import dataclass, field
 from typing import Optional, Set, Any
 
-from slither.slithir.operations import SolidityCall
+from slither.slithir.operations import SolidityCall, Assignment
 from slither.core.expressions.binary_operation import BinaryOperation
 from slither.core.expressions.member_access import MemberAccess
 from slither.core.expressions.index_access import IndexAccess
 from slither.core.expressions.identifier import Identifier
+from core.edges import _find_defining_op
 
 
 @dataclass
@@ -340,7 +342,118 @@ class CallEvent:
     call_kind: str   # one of CALLBACK_CAPABLE, READ_ONLY, UNKNOWN_EXTERNAL
 
 
-def _classify_call(ir) -> str:
+def _fresh_deployment_contract(f):
+    """
+    If f's own body computes creation bytecode via a real
+    `type(X).creationCode`/`.runtimeCode` SolidityCall — X being an
+    actual contract declared in this same compilation, whose entire
+    source Slither has already parsed — return that Contract object X.
+    None if no such pattern exists, or if more than one appears (an
+    ambiguous case this stays conservative about rather than guessing
+    which one a later CREATE2 destination belongs to).
+
+    `ir.lvalue.type` for this SolidityCall shape is a
+    TypeInformation node whose OWN `.type` is the real Contract
+    reference (confirmed live via real IR: `type(address)(UniswapV2Pair)`
+    ⇒ `ir.lvalue.type.type is <Contract UniswapV2Pair>`).
+    """
+    targets = []
+    try:
+        nodes = list(getattr(f, "nodes", []) or [])
+    except Exception:
+        return None
+    for node in nodes:
+        for ir in node.irs:
+            if not isinstance(ir, SolidityCall):
+                continue
+            name = str(getattr(ir.function, "name", "") or "")
+            if not name.startswith("type("):
+                continue
+            lvalue_type = getattr(ir.lvalue, "type", None)
+            inner = getattr(lvalue_type, "type", None)
+            if inner is not None and hasattr(inner, "functions"):
+                targets.append(inner)
+    if len(targets) == 1:
+        return targets[0]
+    return None
+
+
+def _fresh_deployment_destinations(f) -> set:
+    """
+    Scan f's own body for the CREATE2-factory pattern — a create/
+    create2 assigning a local variable, paired with a same-function
+    _fresh_deployment_contract — and return the id()s of every such
+    destination variable.
+
+    Two real IR shapes, both confirmed live this session against the
+    SAME source pattern compiled by different solc versions:
+      1. Newer solc/Slither combinations actually decompose a simple
+         inline-assembly create2 block into structured IR — a real
+         `SolidityCall create2(uint256,uint256,uint256,uint256)(...)`
+         whose own `.lvalue` IS the destination variable directly
+         (confirmed live: solc 0.8.19 on a from-scratch fixture).
+      2. Older solc/Slither combinations (confirmed live: real
+         UniswapV2Factory on solc 0.5.16) leave the assembly block
+         fully opaque — an ASSEMBLY node whose own node.irs is empty
+         — so the raw `inline_asm` text is the only available signal.
+         The EVM opcode mnemonic matched there is a fixed language
+         keyword, not a developer-chosen name — the same category of
+         match core/sinks.py's own SELFDESTRUCT_NAMES already relies
+         on for selfdestruct/suicide.
+    """
+    contract = _fresh_deployment_contract(f)
+    if contract is None:
+        return set()
+    destinations = set()
+    try:
+        nodes = list(getattr(f, "nodes", []) or [])
+        variables = list(getattr(f, "variables", []) or [])
+    except Exception:
+        return set()
+    for node in nodes:
+        for ir in node.irs:
+            if isinstance(ir, SolidityCall):
+                name = (getattr(ir.function, "name", "") or "")
+                if name.startswith("create2(") or name.startswith("create("):
+                    lvalue = getattr(ir, "lvalue", None)
+                    if lvalue is not None:
+                        destinations.add(id(lvalue))
+                        # The create2 SolidityCall's own lvalue is a
+                        # fresh TEMPORARY (TMP_n); the actual named
+                        # variable used later (`pair`) is assigned
+                        # from it via a separate Assignment in the
+                        # SAME node — confirmed live IR shape.
+                        for other in node.irs:
+                            if isinstance(other, Assignment) and other.rvalue is lvalue:
+                                destinations.add(id(other.lvalue))
+        if str(getattr(node, "type", "")) != "NodeType.ASSEMBLY":
+            continue
+        asm_text = getattr(node, "inline_asm", "") or ""
+        for m in re.finditer(r'\b([A-Za-z_$][A-Za-z0-9_$]*)\s*:=\s*create2?\s*\(', asm_text):
+            var_name = m.group(1)
+            for v in variables:
+                if getattr(v, "name", None) == var_name:
+                    destinations.add(id(v))
+                    break
+    return destinations
+
+
+def _function_has_external_call(fn) -> bool:
+    """True if fn's own body contains any HighLevelCall/LowLevelCall (not LibraryCall)."""
+    try:
+        nodes = list(getattr(fn, "nodes", []) or [])
+    except Exception:
+        return True  # unresolvable body — conservative, assume it could call out
+    for node in nodes:
+        for ir in node.irs:
+            if isinstance(ir, _LibraryCallCheck):
+                continue
+            if isinstance(ir, (HighLevelCall, LowLevelCall)):
+                return True
+    return False
+
+
+def _classify_call(ir, fresh_deployments: Optional[set] = None) -> str:
     """
     Classify a single call IR by whether it can execute attacker-
     controlled logic that mutates state. Based on the CALLED
@@ -354,6 +467,23 @@ def _classify_call(ir) -> str:
     and could theoretically be used for other attacks, but it is
     not a state-mutation reentrancy vector — which is specifically
     what CROSS_FUNCTION_STATE_RACE checks for.
+
+    A call to a destination this SAME function just deployed via
+    CREATE2 with KNOWN, in-project bytecode (fresh_deployments — see
+    _fresh_deployment_destinations) is a real second exception, found
+    live this session against real UniswapV2Factory.createPair():
+    `IUniswapV2Pair(pair).initialize(token0, token1)` is a genuine
+    HighLevelCall to a non-view function — but `pair` was CREATE2'd
+    two lines earlier from `type(UniswapV2Pair).creationCode`, this
+    exact factory's own, fully-known contract, not an
+    attacker-substitutable address. Verified sound rather than merely
+    trusted: the REAL implementation's matching function (resolved via
+    the deployed Contract object, not the abstract interface stub the
+    call itself is typed through) is checked for having no external
+    call of its own — real UniswapV2Pair.initialize() is a two-field
+    setter with none, confirmed live — so this can't be reduced to
+    "trust anything freshly deployed" when the deployed code itself
+    turns around and calls back out to attacker logic.
     """
     fn = getattr(ir, "function", None)
     if fn is None:
@@ -364,6 +494,23 @@ def _classify_call(ir) -> str:
         return UNKNOWN_EXTERNAL
     if is_view or is_pure:
         return READ_ONLY
+
+    if fresh_deployments:
+        dest = getattr(ir, "destination", None)
+        defining_op = _find_defining_op(dest, ir.node.function) if dest is not None else None
+        # A TypeConversion (`IUniswapV2Pair(pair)`) sits between the
+        # raw CREATE2'd variable and the call's own destination — one
+        # hop to see through, confirmed live via real IR.
+        base = getattr(defining_op, "variable", None) if defining_op is not None else None
+        if base is not None and id(base) in fresh_deployments:
+            real_contract = _fresh_deployment_contract(ir.node.function)
+            if real_contract is not None:
+                for real_fn in real_contract.functions:
+                    if real_fn.name == fn.name and not real_fn.is_shadowed:
+                        if not _function_has_external_call(real_fn):
+                            return READ_ONLY
+                        break
+
     return CALLBACK_CAPABLE
 
 
@@ -372,7 +519,9 @@ def get_call_events(f) -> list:
     Return every genuine external call in a function as an ordered
     list of CallEvent, in source order, each classified by whether
     it can actually mutate state (callback_capable) or is
-    structurally incapable of doing so (read_only, via view/pure).
+    structurally incapable of doing so (read_only, via view/pure, or
+    a freshly-CREATE2'd known-bytecode destination whose own matching
+    function makes no external call — see _classify_call).
     Excludes LibraryCall (never leaves trust — see graph.py's
     _extract_calls for the same distinction).
 
@@ -384,6 +533,8 @@ def get_call_events(f) -> list:
     if not getattr(f, "is_implemented", False):
         return events
 
+    fresh_deployments = _fresh_deployment_destinations(f)
+
     for i, node in enumerate(f.nodes):
         for ir in node.irs:
             if isinstance(ir, _LibraryCallCheck):
@@ -392,7 +543,7 @@ def get_call_events(f) -> list:
                 events.append(CallEvent(
                     node_index=i,
                     node_expr_str=str(node.expression),
-                    call_kind=_classify_call(ir),
+                    call_kind=_classify_call(ir, fresh_deployments),
                 ))
     return events
 

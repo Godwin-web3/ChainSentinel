@@ -600,6 +600,47 @@ def test_self_scoped_getter_funds_asset_move():
           "collect suppressed, collectFor/collectDecoupled still fire")
 
 
+def test_fresh_deployment_destination_excludes_cross_function_race():
+    """
+    Reproduces the real CROSS_FUNCTION_STATE_RACE false positive found
+    live this session against QuickSwap/UniswapV2Factory.createPair()
+    on Polygon: `IUniswapV2Pair(pair).initialize(token0, token1)` is a
+    genuine HighLevelCall to a non-view function, but `pair` was
+    CREATE2'd two lines earlier from this same factory's own, fully-
+    known bytecode (type(UniswapV2Pair).creationCode) — not an
+    attacker-substitutable address. core/invariants.py::_classify_call
+    previously treated it as CALLBACK_CAPABLE purely from the callee's
+    mutability, with zero awareness of destination trust.
+
+    Also proves this doesn't weaken detection: UnsafeFactory's deployed
+    contract (UnsafeKnownPair) is freshly-CREATE2'd the exact same way,
+    but its own initialize() makes a real external call to an
+    attacker-supplied hookTarget — "freshly deployed" alone doesn't
+    prove the deployed code itself is safe. Must still fire.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("FreshDeploymentCallback.sol")
+
+    safe = nodes["KnownFactory.createPair(address,address)"]
+    assert safe.race_findings == [], f"createPair()'s callback target is freshly CREATE2'd known bytecode with no external call of its own — race_findings should be empty, got {safe.race_findings}"
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible + report.suppressed
+
+    safe_race = [r for r in all_results if r.path.entry == safe.id and "CROSS_FUNCTION_STATE_RACE" in r.constraint_type]
+    assert not safe_race, f"createPair()'s deployed contract makes no external call of its own — CROSS_FUNCTION_STATE_RACE should not fire, got {safe_race}"
+
+    dangerous_id = "UnsafeFactory.createPair(address,address,address)"
+    dangerous_race = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == dangerous_id and "CROSS_FUNCTION_STATE_RACE" in r.constraint_type
+    ]
+    assert dangerous_race, "UnsafeFactory's deployed contract calls back out to an attacker-supplied address — CROSS_FUNCTION_STATE_RACE must still fire"
+    print("test_fresh_deployment_destination_excludes_cross_function_race: PASS —",
+          "createPair suppressed, UnsafeFactory.createPair still", dangerous_race[0].verdict)
+
+
 if __name__ == "__main__":
     test_custom_named_auth_modifier_detected()
     test_real_access_control_struct_shape_detected()
@@ -618,4 +659,5 @@ if __name__ == "__main__":
     test_ecrecover_signer_self_scoping_detected()
     test_balance_invariant_suppresses_flashloan_window()
     test_self_scoped_getter_funds_asset_move()
+    test_fresh_deployment_destination_excludes_cross_function_race()
     print("\nAll auth_detection tests passed.")
