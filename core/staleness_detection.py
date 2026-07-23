@@ -40,11 +40,24 @@ valid` for the caller to act on. Both a revert-capable check and a
 propagated-via-Return check are treated as protective here, matching
 how this codebase already treats "checked or propagated" for low-level
 call return values (core/edges.py::_value_checked_or_propagated).
+
+A cross-function case, found live this session via direct verification
+against Liquity V2 (Bold)'s actual, currently-deployed
+MainnetPriceFeedBase.sol: `_getCurrentChainlinkResponse()` calls
+latestRoundData() and packs `updatedAt` straight into a
+`ChainlinkResponse` struct's `.timestamp` field with NO check in that
+same function at all — the freshness check
+(`block.timestamp - chainlinkResponse.timestamp < threshold`) lives in
+a SEPARATE sibling function, `_isValidChainlinkPrice()`, called by
+their shared caller with the returned struct. This module's single-
+function-scoped check originally missed this real, genuinely-safe
+pattern; see _struct_field_written_from/_field_freshness_check_present
+for the struct-field-name-keyed cross-function extension.
 """
 
 from typing import Optional
 
-from slither.slithir.operations import Binary, HighLevelCall, InternalCall, Return
+from slither.slithir.operations import Assignment, Binary, HighLevelCall, InternalCall, Member, Return
 from slither.slithir.operations.binary import BinaryType
 from slither.slithir.operations.unpack import Unpack
 
@@ -147,6 +160,117 @@ def _find_freshness_linking_op(updated_at_var, f):
     return None
 
 
+def _member_field_map(f) -> dict:
+    """
+    Map id(reference variable) -> field name, for every Member op in f
+    — e.g. `REF_6 -> chainlinkResponse.timestamp` becomes
+    {id(REF_6): "timestamp"}. A Member op's own `.variable_right` is
+    the field-name Constant regardless of which struct instance is
+    being accessed — confirmed live via IR probe against a faithful
+    reproduction of the real Liquity V2 (Bold) shape.
+    """
+    out = {}
+    try:
+        nodes = list(getattr(f, "nodes", []) or [])
+    except Exception:
+        return out
+    for node in nodes:
+        for ir in node.irs:
+            if isinstance(ir, Member):
+                out[id(ir.lvalue)] = str(ir.variable_right)
+    return out
+
+
+def _struct_field_written_from(updated_at_var, f) -> Optional[str]:
+    """
+    True (the field name) if updated_at_var is written directly into a
+    struct field within f, via `REF -> obj.field` (Member) followed by
+    `REF := updated_at_var` (Assignment) — the real Liquity V2 (Bold)
+    MainnetPriceFeedBase.sol shape:
+    `chainlinkResponse.timestamp = updatedAt`, where the struct is then
+    returned and the actual freshness check happens in a DIFFERENT,
+    sibling function against that field, read back out through a
+    brand-new (differently-identified) reference variable. Returns the
+    field name (e.g. "timestamp"), or None if updated_at_var is never
+    packed into a struct field at all in f.
+    """
+    field_map = _member_field_map(f)
+    try:
+        nodes = list(getattr(f, "nodes", []) or [])
+    except Exception:
+        return None
+    for node in nodes:
+        for ir in node.irs:
+            if isinstance(ir, Assignment) and _same_var(_follow_reference(ir.rvalue), updated_at_var):
+                fname = field_map.get(id(ir.lvalue))
+                if fname is not None:
+                    return fname
+    return None
+
+
+def _field_freshness_check_present(field_name, f) -> bool:
+    """
+    Same structural signature as _staleness_check_present, but matches
+    the freshness-linking Binary's operand by STRUCT FIELD NAME (see
+    _member_field_map) instead of variable identity — for the real
+    cross-function shape where updatedAt is captured in one function,
+    packed into a struct, and only checked in a DIFFERENT function
+    against that struct's field, read back out via a brand-new Member
+    op producing a DIFFERENT reference-variable identity than the one
+    that originally wrote it.
+    """
+    field_map = _member_field_map(f)
+    try:
+        nodes = list(getattr(f, "nodes", []) or [])
+    except Exception:
+        return False
+    linking_op = None
+    for node in nodes:
+        for ir in node.irs:
+            if not isinstance(ir, Binary) or ir.type not in _LINKING_BINARY_TYPES:
+                continue
+            left, right = ir.variable_left, ir.variable_right
+            if field_map.get(id(left)) == field_name and _derives_from_block_timestamp_within_one_hop(right, f):
+                linking_op = ir
+                break
+            if field_map.get(id(right)) == field_name and _derives_from_block_timestamp_within_one_hop(left, f):
+                linking_op = ir
+                break
+        if linking_op is not None:
+            break
+    if linking_op is None:
+        return False
+    return _reaches_protective_use(linking_op.lvalue, f)
+
+
+def _reachable_functions(f, max_depth: int = 3, _visited: Optional[set] = None) -> list:
+    """
+    All functions reachable from f via bounded InternalCall hops
+    (including f itself) — the scope _staleness_check_present's cross-
+    function struct-field extension searches for a sibling function
+    that performs the actual freshness check, since a callee (like the
+    real _getCurrentChainlinkResponse) cannot see its OWN caller's
+    other callees (like the real _isValidChainlinkPrice) via forward
+    expansion alone.
+    """
+    if _visited is None:
+        _visited = set()
+    fid = id(f)
+    if fid in _visited or max_depth < 0:
+        return []
+    _visited.add(fid)
+    out = [f]
+    try:
+        nodes = list(getattr(f, "nodes", []) or [])
+    except Exception:
+        return out
+    for node in nodes:
+        for ir in node.irs:
+            if isinstance(ir, InternalCall) and getattr(ir, "function", None) is not None:
+                out.extend(_reachable_functions(ir.function, max_depth - 1, _visited))
+    return out
+
+
 def _reaches_protective_use(seed, f, max_depth: int = 6) -> bool:
     """
     Forward-taint seed through f's own IR, in bounded fixed-point
@@ -199,7 +323,7 @@ def _reaches_protective_use(seed, f, max_depth: int = 6) -> bool:
     return False
 
 
-def _staleness_check_present(updated_at_var, f) -> bool:
+def _staleness_check_present(updated_at_var, f, cross_function_scope: Optional[list] = None) -> bool:
     """
     True if updated_at_var is genuinely, structurally freshness-checked
     in f: linked to block.timestamp via a real Binary op (see
@@ -211,13 +335,32 @@ def _staleness_check_present(updated_at_var, f) -> bool:
     deployed ChainlinkOracle.sol, which has exactly these checks and
     NOTHING else, matching a real, common, incomplete pattern real
     audits still flag as vulnerable to genuine staleness.
+
+    Falls back to the cross-function struct-field case (see
+    _struct_field_written_from/_field_freshness_check_present) if
+    updated_at_var isn't checked directly in f but IS packed into a
+    struct field there — the real Liquity V2 (Bold)
+    MainnetPriceFeedBase.sol shape, where the actual check lives in a
+    SIBLING function reached from f's own caller, not from f itself.
+    cross_function_scope is the bounded reachable-function set computed
+    once at find_unstaled_latest_round_data_dependency's own top level
+    (see _reachable_functions) — a callee cannot see its own caller's
+    OTHER callees via forward expansion alone.
     """
     if updated_at_var is None:
         return False
     linking_op = _find_freshness_linking_op(updated_at_var, f)
-    if linking_op is None:
-        return False
-    return _reaches_protective_use(linking_op.lvalue, f)
+    if linking_op is not None and _reaches_protective_use(linking_op.lvalue, f):
+        return True
+    if cross_function_scope:
+        field_name = _struct_field_written_from(updated_at_var, f)
+        if field_name is not None:
+            for g in cross_function_scope:
+                if g is f:
+                    continue
+                if _field_freshness_check_present(field_name, g):
+                    return True
+    return False
 
 
 def _writes_critical_state(nodes) -> bool:
@@ -239,7 +382,7 @@ def _writes_critical_state(nodes) -> bool:
     return False
 
 
-def _find_unstaled_latest_round_data_evidence(f, max_depth: int, _visited: Optional[set] = None) -> Optional[str]:
+def _find_unstaled_latest_round_data_evidence(f, max_depth: int, cross_function_scope: Optional[list] = None, _visited: Optional[set] = None) -> Optional[str]:
     """
     Recursively scan f's own nodes, and (bounded, cycle-safe) any
     internal OR resolved high-level call it makes, for a
@@ -247,7 +390,9 @@ def _find_unstaled_latest_round_data_evidence(f, max_depth: int, _visited: Optio
     but whose updatedAt (index 3) is NOT genuinely freshness-checked —
     either never captured at all (the real LoopFi AuraVault.sol shape)
     or captured but never linked to block.timestamp via a
-    revert-capable-or-propagated check (see _staleness_check_present).
+    revert-capable-or-propagated check, in f itself OR (see
+    _staleness_check_present's cross-function fallback) a sibling
+    function reached from the ORIGINAL top-level entry point.
     Returns the call's own stringified IR as evidence, or None.
     """
     if _visited is None:
@@ -274,7 +419,7 @@ def _find_unstaled_latest_round_data_evidence(f, max_depth: int, _visited: Optio
             if answer_var is None:
                 continue  # answer itself discarded — nothing to protect
             updated_at_var = _unpack_index_value(tuple_var, _UPDATED_AT_INDEX, f)
-            if _staleness_check_present(updated_at_var, f):
+            if _staleness_check_present(updated_at_var, f, cross_function_scope):
                 continue  # genuinely protected
             return str(ir)
 
@@ -284,7 +429,7 @@ def _find_unstaled_latest_round_data_evidence(f, max_depth: int, _visited: Optio
     for node in nodes:
         for ir in node.irs:
             if isinstance(ir, (InternalCall, HighLevelCall)) and getattr(ir, "function", None) is not None:
-                nested = _find_unstaled_latest_round_data_evidence(ir.function, max_depth - 1, _visited)
+                nested = _find_unstaled_latest_round_data_evidence(ir.function, max_depth - 1, cross_function_scope, _visited)
                 if nested is not None:
                     return nested
     return None
@@ -301,7 +446,8 @@ def find_unstaled_latest_round_data_dependency(f, max_depth: int = 3) -> Optiona
     reachable scope — see _writes_critical_state — keeping this from
     firing on a pure informational/view getter with no consequence.
     """
-    evidence = _find_unstaled_latest_round_data_evidence(f, max_depth)
+    scope = _reachable_functions(f, max_depth)
+    evidence = _find_unstaled_latest_round_data_evidence(f, max_depth, scope)
     if evidence is None:
         return None
     expanded = _expand_with_internal_calls(list(getattr(f, "nodes", []) or []), max_depth)

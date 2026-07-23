@@ -118,6 +118,52 @@ def test_informational_use_does_not_false_positive():
     print("test_informational_use_does_not_false_positive: PASS")
 
 
+def test_liquity_style_cross_function_check_suppresses_finding():
+    """
+    Live-verification regression: found firing on Liquity V2 (Bold)'s
+    actual, currently-deployed MainnetPriceFeedBase.sol.
+    _getCurrentChainlinkResponse() packs updatedAt into a struct field
+    with NO check in that same function — the real freshness check
+    lives in a SEPARATE sibling function (_isValidChainlinkPrice),
+    called by their shared caller with the returned struct. Must NOT
+    flag.
+    """
+    nodes, *_ = _build("StaleOracle.sol")
+    fn = nodes["LiquityStyleCrossFunctionOracle.updateCollateralValue(address,uint256)"]
+    assert fn.unstaled_latest_round_data_dependency is None, f"real Liquity V2 cross-function-checked shape must not flag, got {fn.unstaled_latest_round_data_dependency}"
+    print("test_liquity_style_cross_function_check_suppresses_finding: PASS")
+
+
+def test_struct_never_checked_anywhere_does_not_suppress_finding():
+    """
+    Critical adversarial regression: the same struct-crossing SHAPE as
+    LiquityStyleCrossFunctionOracle, but no sibling function anywhere
+    ever actually checks the timestamp field. Proves the cross-function
+    fallback doesn't just accept "packed into a struct" as protective
+    on its own. Must still fire.
+    """
+    nodes, *_ = _build("StaleOracle.sol")
+    fn = nodes["StructNeverCheckedAnywhere.updateCollateralValue(address,uint256)"]
+    assert fn.unstaled_latest_round_data_dependency is not None, "an unchecked struct field must not suppress the real finding"
+    print("test_struct_never_checked_anywhere_does_not_suppress_finding: PASS —",
+          "evidence:", fn.unstaled_latest_round_data_dependency)
+
+
+def test_wrong_field_checked_in_sibling_does_not_suppress_finding():
+    """
+    Critical adversarial regression: proves the cross-function fallback
+    matches by exact struct FIELD NAME, not "any freshness-shaped check
+    exists somewhere in a sibling function". The sibling here checks a
+    DIFFERENT field (submittedAt); the field actually holding updatedAt
+    (timestamp) is never checked. Must still fire.
+    """
+    nodes, *_ = _build("StaleOracle.sol")
+    fn = nodes["WrongFieldCheckedInSibling.updateCollateralValue(address,uint256)"]
+    assert fn.unstaled_latest_round_data_dependency is not None, "a same-named-but-wrong field check must not suppress the real finding"
+    print("test_wrong_field_checked_in_sibling_does_not_suppress_finding: PASS —",
+          "evidence:", fn.unstaled_latest_round_data_dependency)
+
+
 def test_stale_oracle_constraint_fires_only_on_real_vulnerable_contracts():
     """
     End-to-end: runs the full path-enumeration + constraint-validation
@@ -135,6 +181,8 @@ def test_stale_oracle_constraint_fires_only_on_real_vulnerable_contracts():
     for vulnerable_entry in (
         "LoopFiStyleVault.updateCollateralValue(address,uint256)",
         "CryptexStyleOracle.updateCollateralValue(address,uint256)",
+        "StructNeverCheckedAnywhere.updateCollateralValue(address,uint256)",
+        "WrongFieldCheckedInSibling.updateCollateralValue(address,uint256)",
     ):
         vulnerable_findings = [
             r for r in report.confirmed
@@ -147,6 +195,7 @@ def test_stale_oracle_constraint_fires_only_on_real_vulnerable_contracts():
         "RequireStyleOracle.updateCollateralValue(address,uint256)",
         "NameDecoyOnly.updateCollateralValue(address,uint256)",
         "InformationalPriceDecoy.observeFeed()",
+        "LiquityStyleCrossFunctionOracle.updateCollateralValue(address,uint256)",
     ):
         safe_findings = [
             r for r in all_results
@@ -165,5 +214,8 @@ if __name__ == "__main__":
     test_require_style_check_suppresses_finding()
     test_name_decoy_does_not_false_positive()
     test_informational_use_does_not_false_positive()
+    test_liquity_style_cross_function_check_suppresses_finding()
+    test_struct_never_checked_anywhere_does_not_suppress_finding()
+    test_wrong_field_checked_in_sibling_does_not_suppress_finding()
     test_stale_oracle_constraint_fires_only_on_real_vulnerable_contracts()
     print("\nAll staleness_detection tests passed.")

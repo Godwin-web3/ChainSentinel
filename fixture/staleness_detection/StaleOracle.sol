@@ -159,3 +159,109 @@ contract InformationalPriceDecoy {
         lastReading = answer;
     }
 }
+
+// Safe: faithful minimal reproduction of the real, currently-deployed
+// Liquity V2 (Bold) MainnetPriceFeedBase.sol shape, found live via
+// direct verification against the real fetched source.
+// _getCurrentChainlinkResponse() calls latestRoundData() and packs
+// updatedAt straight into a ChainlinkResponse struct's own .timestamp
+// field with NO check in that same function at all — the actual
+// freshness check (block.timestamp - chainlinkResponse.timestamp <
+// threshold) lives in a SEPARATE sibling function,
+// _isValidChainlinkPrice(), called by their shared caller
+// (fetchPrice()) with the returned struct. This module's original
+// single-function-scoped check false-positived here. Must NOT fire.
+contract LiquityStyleCrossFunctionOracle {
+    AggregatorV3Interface public aggregator;
+    uint256 public stalenessThreshold;
+    IERC20 public borrowToken;
+    mapping(address => uint256) public collateralValue;
+
+    struct ChainlinkResponse {
+        int256 answer;
+        uint256 timestamp;
+    }
+
+    function _getCurrentChainlinkResponse() internal view returns (ChainlinkResponse memory chainlinkResponse) {
+        (, int256 answer, , uint256 updatedAt, ) = aggregator.latestRoundData();
+        chainlinkResponse.answer = answer;
+        chainlinkResponse.timestamp = updatedAt;
+    }
+
+    function _isValidChainlinkPrice(ChainlinkResponse memory chainlinkResponse) internal view returns (bool) {
+        return block.timestamp - chainlinkResponse.timestamp < stalenessThreshold && chainlinkResponse.answer > 0;
+    }
+
+    function updateCollateralValue(address user, uint256 amount) external {
+        ChainlinkResponse memory resp = _getCurrentChainlinkResponse();
+        require(_isValidChainlinkPrice(resp), "stale or invalid");
+        collateralValue[user] = amount * uint256(resp.answer);
+        borrowToken.transfer(user, collateralValue[user]);
+    }
+}
+
+// DANGEROUS: the critical adversarial regression case — the same
+// struct-crossing SHAPE as LiquityStyleCrossFunctionOracle, but NO
+// sibling function anywhere ever actually checks the timestamp field
+// against block.timestamp. Proves the cross-function fallback doesn't
+// just accept "packed into a struct" as protective on its own — it
+// still requires finding a REAL check. Must fire evidence.
+contract StructNeverCheckedAnywhere {
+    AggregatorV3Interface public aggregator;
+    IERC20 public borrowToken;
+    mapping(address => uint256) public collateralValue;
+
+    struct ChainlinkResponse {
+        int256 answer;
+        uint256 timestamp;
+    }
+
+    function _getCurrentChainlinkResponse() internal view returns (ChainlinkResponse memory chainlinkResponse) {
+        (, int256 answer, , uint256 updatedAt, ) = aggregator.latestRoundData();
+        chainlinkResponse.answer = answer;
+        chainlinkResponse.timestamp = updatedAt;
+    }
+
+    function updateCollateralValue(address user, uint256 amount) external {
+        ChainlinkResponse memory resp = _getCurrentChainlinkResponse();
+        collateralValue[user] = amount * uint256(resp.answer);
+        borrowToken.transfer(user, collateralValue[user]);
+    }
+}
+
+// DANGEROUS: the second critical adversarial regression case — proves
+// the cross-function fallback matches by exact struct FIELD NAME, not
+// "any freshness-shaped check exists somewhere in a sibling function".
+// The sibling here checks a DIFFERENT field (submittedAt) against
+// block.timestamp; the field that actually holds updatedAt
+// (timestamp) is never checked at all. Must fire evidence.
+contract WrongFieldCheckedInSibling {
+    AggregatorV3Interface public aggregator;
+    IERC20 public borrowToken;
+    mapping(address => uint256) public collateralValue;
+    uint256 public lastSubmission;
+
+    struct ChainlinkResponse {
+        int256 answer;
+        uint256 timestamp;
+        uint256 submittedAt;
+    }
+
+    function _getCurrentChainlinkResponse() internal view returns (ChainlinkResponse memory chainlinkResponse) {
+        (, int256 answer, , uint256 updatedAt, ) = aggregator.latestRoundData();
+        chainlinkResponse.answer = answer;
+        chainlinkResponse.timestamp = updatedAt;
+        chainlinkResponse.submittedAt = lastSubmission;
+    }
+
+    function _isSubmissionRecent(ChainlinkResponse memory chainlinkResponse) internal view returns (bool) {
+        return block.timestamp - chainlinkResponse.submittedAt < 1 hours;
+    }
+
+    function updateCollateralValue(address user, uint256 amount) external {
+        ChainlinkResponse memory resp = _getCurrentChainlinkResponse();
+        require(_isSubmissionRecent(resp), "stale submission");
+        collateralValue[user] = amount * uint256(resp.answer);
+        borrowToken.transfer(user, collateralValue[user]);
+    }
+}
