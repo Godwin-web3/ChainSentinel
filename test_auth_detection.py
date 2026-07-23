@@ -841,6 +841,51 @@ def test_external_view_return_verdict_auth_detected():
           "withdrawCollectedFees", withdraw.auth_score, "| bad variants correctly unscored")
 
 
+def test_ownable_internal_getter_comparison_auth_detected():
+    """
+    Live-verification finding: the real, currently-deployed OpenZeppelin
+    v4.9.3 Ownable.sol shape — onlyOwner -> _checkOwner() ->
+    require(owner() == _msgSender()), where owner() is an INTERNAL call
+    (same contract/inheritance chain) that trivially returns the state
+    variable _owner — scored auth_score 0 everywhere before this fix.
+    _external_view_comparison_ir only handles an EXTERNAL call's return
+    value; _resolve_operand's existing internal-call unwrap only ever
+    checked "does the callee return msg.sender", never "does the callee
+    return a fixed state variable/immutable". This is the single most
+    widely-deployed access-control pattern on Ethereum.
+
+    backdoorSetOwner and setCriticalParamBad prove this doesn't weaken
+    detection: bypassing onlyOwner entirely, and a fake getter that just
+    echoes back a caller-supplied parameter instead of a real state
+    variable, must NOT be treated as auth evidence even though the
+    latter superficially resembles the real shape (same
+    require(fn(x) == msg.sender) call pattern).
+    """
+    nodes, *_ = _build("OwnableGetterAuth.sol")
+
+    check_owner = nodes["OwnableGetterAuth._checkOwner()"]
+    assert check_owner.auth_score >= 3, f"expected internal-getter-comparison evidence, got {check_owner.auth_score}"
+    assert check_owner.auth_state == "AUTHENTICATED"
+    assert check_owner.structural_auth_var == "_owner"
+
+    set_param = nodes["OwnableGetterAuth.setCriticalParam(uint256)"]
+    assert set_param.auth_score >= 3
+    assert set_param.auth_state == "AUTHENTICATED"
+
+    backdoor = nodes["OwnableGetterAuth.backdoorSetOwner(address)"]
+    assert backdoor.auth_score < 3, (
+        "writes _owner directly, bypassing onlyOwner entirely — must not score as auth-protected"
+    )
+
+    fake_getter = nodes["OwnableGetterAuth.setCriticalParamBad(uint256,address)"]
+    assert fake_getter.auth_score < 3, (
+        "fakeOwner() just echoes back a caller-supplied parameter, not a real state variable — must not score as auth"
+    )
+    print("test_ownable_internal_getter_comparison_auth_detected: PASS —",
+          "_checkOwner", check_owner.auth_score, check_owner.structural_auth_var,
+          "| bad variants correctly unscored")
+
+
 if __name__ == "__main__":
     test_custom_named_auth_modifier_detected()
     test_real_access_control_struct_shape_detected()
@@ -864,4 +909,5 @@ if __name__ == "__main__":
     test_transparent_proxy_fallback_governance_gated_destination_excludes_delegation_sink()
     test_self_delegatecall_multicall_excludes_delegation_sink()
     test_external_view_return_verdict_auth_detected()
+    test_ownable_internal_getter_comparison_auth_detected()
     print("\nAll auth_detection tests passed.")

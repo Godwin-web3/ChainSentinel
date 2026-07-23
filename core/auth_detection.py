@@ -112,6 +112,23 @@ def _resolve_operand(var, f, known_msg_sender: frozenset = frozenset(), max_dept
        call's return value could be anything. Verifies the callee's own
        body actually, structurally, returns msg.sender/tx.origin before
        treating the wrapper's result as such.
+
+       The SAME unwrap also checks the other direction — does the
+       callee's body just return a state variable/immutable? — found
+       live this session as a real gap against Ownable's own actual,
+       currently-deployed require(owner() == _msgSender()) shape:
+       owner() is an INTERNAL call (same contract/inheritance chain,
+       not the external-view-comparison case _external_view_comparison_ir
+       already handles for a DIFFERENT contract's getter) that trivially
+       returns `_owner`. Without this, compute_own_auth scored 0 on
+       Ownable's onlyOwner — the single most widely-deployed access-
+       control pattern on Ethereum — because this function only ever
+       unwrapped toward MSG_SENDER, never toward a FIXED_ORIGIN. No
+       extra purity gate is needed the way the external-call case
+       needs one: an internal callee's body is fully visible here, so
+       structurally proving its Return value resolves to a state
+       variable/immutable is strictly stronger evidence than the
+       external case's view/pure heuristic.
     """
     if any(var is p for p in known_msg_sender):
         return DestinationOrigin.MSG_SENDER, var
@@ -137,6 +154,8 @@ def _resolve_operand(var, f, known_msg_sender: frozenset = frozenset(), max_dept
                     r_origin, r_var = _resolve_operand(v, callee, callee_known, max_depth - 1)
                     if _is_msg_sender_origin(r_origin):
                         return DestinationOrigin.MSG_SENDER, r_var
+                    if r_origin in _FIXED_ORIGINS:
+                        return r_origin, r_var
     return origin, resolved
 
 
