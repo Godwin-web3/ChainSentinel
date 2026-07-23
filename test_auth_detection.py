@@ -553,6 +553,53 @@ def test_balance_invariant_suppresses_flashloan_window():
           "flash suppressed, flashUnsafe still", dangerous_window[0].verdict)
 
 
+def test_self_scoped_getter_funds_asset_move():
+    """
+    Reproduces the real Uniswap V3 UniswapV3Pool.collect() false
+    positive found live this session: `recipient` is an arbitrary
+    parameter (safe by design — collect() lets you withdraw your fees
+    to any address), and find_self_scoped_asset_moves previously only
+    understood a self-scoped DESTINATION (to == msg.sender) or a
+    self-scoped SOURCE via transferFrom's `from` — neither matches this
+    shape. Safety instead comes from the AMOUNT: it's bounded by, and
+    simultaneously debited from, the caller's own accrued balance,
+    looked up via a getter whose owner argument is hardcoded to
+    msg.sender at the real call site.
+
+    Also proves this doesn't weaken detection:
+      - collectFor() reproduces the shape a naive "any getter-derived
+        decrement counts" fix would wrongly suppress — the getter is
+        called with an ATTACKER-CHOSEN owner, not msg.sender. Must
+        still fire.
+      - collectDecoupled() reproduces a real self-scoped getter
+        reference, but the transferred amount is a completely
+        different, decoupled parameter from the one actually debited.
+        Must still fire.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("SelfScopedGetterCollect.sol")
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible + report.suppressed
+
+    safe_id = "SelfScopedGetterCollect.collect(address,int24,int24,uint128)"
+    safe_gap = [r for r in all_results if r.path.entry == safe_id and "ACCESS_CONTROL_GAP" in r.constraint_type]
+    assert not safe_gap, f"collect()'s amount is provably self-funded from the caller's own position — ACCESS_CONTROL_GAP should not fire, got {safe_gap}"
+
+    for dangerous_id in (
+        "SelfScopedGetterCollect.collectFor(address,address,int24,int24,uint128)",
+        "SelfScopedGetterCollect.collectDecoupled(address,int24,int24,uint128,uint128)",
+    ):
+        dangerous_gap = [
+            r for r in (report.confirmed + report.likely)
+            if r.path.entry == dangerous_id and "ACCESS_CONTROL_GAP" in r.constraint_type
+        ]
+        assert dangerous_gap, f"{dangerous_id} is not actually self-funded — ACCESS_CONTROL_GAP must still fire"
+    print("test_self_scoped_getter_funds_asset_move: PASS —",
+          "collect suppressed, collectFor/collectDecoupled still fire")
+
+
 if __name__ == "__main__":
     test_custom_named_auth_modifier_detected()
     test_real_access_control_struct_shape_detected()
@@ -570,4 +617,5 @@ if __name__ == "__main__":
     test_numeric_equality_constant_role_flag_detected()
     test_ecrecover_signer_self_scoping_detected()
     test_balance_invariant_suppresses_flashloan_window()
+    test_self_scoped_getter_funds_asset_move()
     print("\nAll auth_detection tests passed.")

@@ -937,6 +937,144 @@ def _transfer_call_arg_offset(ir) -> int:
     return 1 if isinstance(ir, LibraryCall) else 0
 
 
+def _returned_reference(callee):
+    """First value in callee's own Return IR, or None (e.g. void functions)."""
+    try:
+        nodes = list(getattr(callee, "nodes", []) or [])
+    except Exception:
+        return None
+    for node in nodes:
+        for ir in node.irs:
+            if isinstance(ir, Return):
+                values = getattr(ir, "values", None) or []
+                if values:
+                    return values[0]
+    return None
+
+
+def _is_self_scoped_getter_ref(var, f, known_msg_sender: frozenset) -> bool:
+    """
+    True if var was assigned from a LibraryCall/InternalCall ("get()"-
+    shaped accessor) whose call-site arguments prove one of them is
+    msg.sender-bound, and whose OWN body's returned value traces to an
+    Index into one of its OTHER parameters (the "self" storage mapping)
+    keyed either directly by that msg.sender-bound parameter, or by the
+    result of a keccak256/sha256 hash whose own arguments include it —
+    the real Uniswap V3 Position.get(self, owner, tickLower, tickUpper)
+    shape:
+        position = self[keccak256(abi.encodePacked(owner, tickLower, tickUpper))];
+    An attacker calling collect() can choose tickLower/tickUpper
+    freely, but never `owner` — that argument is hardcoded to
+    msg.sender at the real call site (`positions.get(msg.sender,
+    tickLower, tickUpper)`) — so no matter what else is hashed
+    alongside it, the resulting slot can only ever fall in the
+    CALLER's own subtree. Exactly the same "outer key is fixed"
+    guarantee _outermost_index_key already relies on for a plain
+    nested mapping (`can[msg.sender][usr]`), just one indirection (a
+    getter call + a hash) further — real Slither IR confirmed live
+    this session: Position.get()'s only Index op keys `self` by
+    exactly this keccak256(abi.encodePacked(owner, ...)) shape, and
+    its Return IR returns precisely that Index's own lvalue, no branches
+    or alternate paths to second-guess.
+    """
+    defining_op = _find_defining_op(var, f)
+    # `Position.Info storage position = positions.get(...)` lowers to a
+    # LibraryCall assigning a TEMPORARY, then a separate Assignment
+    # into the named local `position` — one hop to see through before
+    # reaching the actual call, confirmed via real IR (`position :=
+    # TMP_2`, TMP_2 being the LibraryCall's own lvalue).
+    if isinstance(defining_op, Assignment):
+        defining_op = _find_defining_op(defining_op.rvalue, f)
+    if not isinstance(defining_op, (LibraryCall, InternalCall)):
+        return False
+    callee = getattr(defining_op, "function", None)
+    if callee is None:
+        return False
+
+    args = list(getattr(defining_op, "arguments", None) or [])
+    params = list(getattr(callee, "parameters", None) or [])
+    if len(args) != len(params):
+        return False
+
+    bound_params = set()
+    for param, arg in zip(params, args):
+        origin, _ = _resolve_operand(arg, f, known_msg_sender)
+        if _is_msg_sender_origin(origin):
+            bound_params.add(param)
+    if not bound_params:
+        return False
+
+    return_var = _returned_reference(callee)
+    if return_var is None:
+        return False
+
+    index_ir = _find_defining_op(return_var, callee)
+    if isinstance(index_ir, Assignment):
+        index_ir = _find_defining_op(index_ir.rvalue, callee)
+    if not isinstance(index_ir, Index):
+        return False
+
+    key = index_ir.variable_right
+    if any(key is p for p in bound_params):
+        return True
+
+    key_op = _find_defining_op(key, callee)
+    if isinstance(key_op, SolidityCall):
+        name = (getattr(key_op.function, "name", "") or "").split("(")[0]
+        if name in ("keccak256", "sha256", "sha3"):
+            for hash_arg in getattr(key_op, "arguments", None) or []:
+                if any(hash_arg is p for p in bound_params):
+                    return True
+                inner_op = _find_defining_op(hash_arg, callee)
+                if isinstance(inner_op, SolidityCall):
+                    for inner_arg in getattr(inner_op, "arguments", None) or []:
+                        if any(inner_arg is p for p in bound_params):
+                            return True
+    return False
+
+
+def _amount_is_self_funded_decrement(amount_var, f, known_msg_sender: frozenset) -> bool:
+    """
+    True if, anywhere in f's own body, there is a compound decrement
+    (`x -= amount_var`) whose written field's BASE reference is proven
+    self-scoped via a getter call (_is_self_scoped_getter_ref) — the
+    real Uniswap V3 collect() shape:
+        position.tokensOwed0 -= amount0;
+        token0.transfer(recipient, amount0);
+    where `position` comes from `positions.get(msg.sender, ...)`. The
+    exact SAME variable identity is required for both the decrement
+    and the transferred amount — no separate "same root" tracing
+    needed (unlike find_self_scoped_liability_reductions, which has to
+    see through a unit-conversion helper) since here it's literally
+    the same value moved without transformation: the caller can never
+    transfer out more than what was just debited from their OWN
+    accrued balance in this SAME call, regardless of `to`.
+    """
+    try:
+        nodes = list(getattr(f, "nodes", []) or [])
+    except Exception:
+        return False
+    for node in nodes:
+        for ir in node.irs:
+            if not isinstance(ir, Binary) or ir.type != BinaryType.SUBTRACTION:
+                continue
+            if ir.variable_right is not amount_var:
+                continue
+            if not isinstance(getattr(ir, "lvalue", None), ReferenceVariable):
+                continue
+            base_member = None
+            for cand in node.irs:
+                if isinstance(cand, Member) and cand.lvalue is ir.lvalue:
+                    base_member = cand
+                    break
+            if base_member is None:
+                continue
+            base = getattr(base_member, "variable_left", None)
+            if base is not None and _is_self_scoped_getter_ref(base, f, known_msg_sender):
+                return True
+    return False
+
+
 def find_self_scoped_asset_moves(
     f, max_depth: int = 3, _visited: Optional[set] = None, known_msg_sender: frozenset = frozenset()
 ) -> Set[str]:
@@ -958,6 +1096,17 @@ def find_self_scoped_asset_moves(
         _sendETHGainToDepositor(), found live this session — the ETH
         destination is msg.sender directly, no auth gate needed or
         present in the real, audited contract).
+      - transfer(to, amount)-shaped with an ARBITRARY `to`: safe
+        instead when `amount` is proven a self-funded decrement
+        (_amount_is_self_funded_decrement) — the real Uniswap V3
+        collect() shape, where the caller's own accrued fee balance
+        (looked up via a msg.sender-bound getter, see
+        _is_self_scoped_getter_ref) is what's debited and sent, not an
+        arbitrary amount. A self-scoped DESTINATION and a self-scoped
+        SOURCE are different proofs of the same underlying safety
+        property — either the caller can only receive their own funds,
+        or the caller can only ever move funds that were already
+        theirs — so both count as safe without an auth gate.
 
     Same conservative principle as find_self_scoped_writes: a function
     that ALSO makes a single unsafe move (e.g. transferFrom(victim, ...)
@@ -1012,7 +1161,19 @@ def _self_scoped_and_unsafe_asset_moves(f, max_depth: int, _visited: set, known_
                 if idx >= len(args):
                     continue
                 origin, _ = _resolve_operand(args[idx], f, known_msg_sender)
-                _record(_is_msg_sender_origin(origin))
+                is_safe = _is_msg_sender_origin(origin)
+                # transfer(to, amount)-shaped with an unproven `to`:
+                # try the OTHER safety basis — a self-funded amount
+                # (real Uniswap V3 collect() shape). Only meaningful
+                # for the 2-arg transfer/safeTransfer shape (amount is
+                # always the argument right after `to`), not
+                # transferFrom (a 3-arg pull with a different safety
+                # story already covered above).
+                if not is_safe and sig in _TRANSFER_TO_ARG_INDEX:
+                    amount_idx = idx + 1
+                    if amount_idx < len(args):
+                        is_safe = _amount_is_self_funded_decrement(args[amount_idx], f, known_msg_sender)
+                _record(is_safe)
             elif isinstance(ir, (LowLevelCall, Send, Transfer)):
                 dest = getattr(ir, "destination", None)
                 if dest is None:
