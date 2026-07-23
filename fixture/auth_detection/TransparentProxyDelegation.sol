@@ -26,6 +26,15 @@ pragma solidity ^0.8.19;
 // inheriting contract, so a shared base would let the safe contract's
 // real admin-gated setter accidentally "prove" the unsafe contract's
 // unguarded one governance_gated too, defeating the counter-example.
+//
+// Also tests a second, related fix: a SELF-delegatecall
+// (`address(this).delegatecall(...)`, the real OpenZeppelin-style
+// Multicall batching pattern) — found live this session, ALSO against
+// INIT Capital's real InitCore.sol on Blast. `address(this)` lowers to
+// a TypeConversion producing a TemporaryVariable, so it never matched
+// the state-variable trust path at all; and core/sinks.py's carve-out
+// was gated to functions literally named "fallback"/"receive", which
+// "multicall" isn't. See SelfMulticall / UnsafeDelegateToParam below.
 
 // Safe: the real Compound V2 Unitroller pattern. comptrollerImpl is
 // only ever settable via a real 2-step admin handoff
@@ -78,5 +87,49 @@ contract UnsafeProxy {
     fallback() external {
         (bool success, ) = implementation.delegatecall(msg.data);
         require(success, "delegatecall failed");
+    }
+}
+
+// Safe: the real OpenZeppelin-style Multicall batching pattern, found
+// live this session against INIT Capital's real InitCore.sol on
+// Blast — a SELF-delegatecall (`address(this).delegatecall(...)`),
+// not a proxy dispatching to a separate implementation. Not gated on
+// a function name like "fallback"/"receive" at all — a batching
+// helper delegating to its OWN address is exactly as safe as a real
+// proxy's governance-gated implementation slot, since the destination
+// can never be attacker-redirected: it IS this exact contract,
+// definitionally. Must NOT fire ACCESS_CONTROL_GAP and must NOT
+// classify as DELEGATION_SINK.
+contract SelfMulticall {
+    uint256 public counter;
+
+    function bump() external {
+        counter += 1;
+    }
+
+    function multicall(bytes[] calldata data) external returns (bytes[] memory results) {
+        results = new bytes[](data.length);
+        for (uint256 i = 0; i < data.length; i++) {
+            (bool success, bytes memory result) = address(this).delegatecall(data[i]);
+            require(success, "MC");
+            results[i] = result;
+        }
+    }
+}
+
+// DANGEROUS: structurally similar to SelfMulticall (a delegatecall
+// inside a loop, no fallback()/receive() name) — but the destination
+// is an ATTACKER-SUPPLIED PARAMETER, not `address(this)`. Must NOT be
+// misdetected as a safe self-delegation just because it superficially
+// resembles a multicall helper. Must still fire ACCESS_CONTROL_GAP /
+// classify as DELEGATION_SINK.
+contract UnsafeDelegateToParam {
+    function batchCall(address target, bytes[] calldata data) external returns (bytes[] memory results) {
+        results = new bytes[](data.length);
+        for (uint256 i = 0; i < data.length; i++) {
+            (bool success, bytes memory result) = target.delegatecall(data[i]);
+            require(success, "MC");
+            results[i] = result;
+        }
     }
 }

@@ -267,23 +267,115 @@ def run_slither(resolved: dict) -> dict:
         "openzeppelinsolidity": "openzeppelincontracts",
     }
 
+    # Filler-word-stripped match — a second, independent alias check
+    # alongside the plain character-substring one above. The character
+    # check only catches a geometry where one FULL normalized name is a
+    # contiguous run inside the other (`openzeppelin` inside
+    # `openzeppelincontracts`). It can't bridge a real gap found live
+    # this session against INIT Capital's real InitCore.sol (Blast):
+    # imports `@openzeppelin-contracts-upgradeable/...`, but the
+    # project's own Hardhat dependency cache vendors it at
+    # `contracts/.cache/OpenZeppelin-Upgradeable/v4.9.3/...` — the
+    # import's normalized form is "openzeppelincontractsupgradeable",
+    # the directory's is "openzeppelinupgradeable"; neither is a
+    # substring of the other, because "contracts" sits INSERTED between
+    # "openzeppelin" and "upgradeable" in the import name, breaking
+    # contiguity in both directions. Stripping the single, ubiquitous
+    # filler word "contracts" (present in nearly every OZ-family
+    # package/directory name and never itself distinguishing) from both
+    # sides before comparing bridges exactly this.
+    #
+    # A naive "is either core string a substring of the other" check on
+    # its own is unsafe two ways, both hit live against this exact
+    # project: (1) it would match the top-level `contracts/` directory
+    # itself, whose ENTIRE name is the filler word — stripped, its core
+    # is empty, a substring of everything; guarded by a minimum core
+    # length. (2) when the project vendors BOTH `OpenZeppelin/` and
+    # `OpenZeppelin-Upgradeable/`, `@openzeppelin-contracts-upgradeable`
+    # substring-matches EITHER one (its stripped core, "openzeppelin
+    # upgradeable", contains plain "openzeppelin" too) — first-found-
+    # wins (os.walk order) could silently pick the WRONG tree, which is
+    # worse than no match at all (wrong files compiled, not just none).
+    # Guarded by scoring every candidate directory by how close its own
+    # core length is to the import segment's core length — an exact or
+    # near-exact match (OpenZeppelin-Upgradeable, diff 0) always beats a
+    # partial one (plain OpenZeppelin, diff 11) — and keeping only the
+    # best-scoring directory per segment across the WHOLE tree, not the
+    # first one encountered.
+    _FILLER_WORDS = {"contracts", "contract"}
+    _MIN_CORE_LEN = 4
+
+    def _word_tokens(s: str) -> list:
+        return [w for w in _re.split(r'[^a-z0-9]+', s.lower()) if w]
+
+    def _core(s: str) -> str:
+        return "".join(w for w in _word_tokens(s) if w not in _FILLER_WORDS)
+
     bare_first_segments = {p.split("/")[0] for p in bare_import_paths}
     alias_targets: dict = {}
+    alias_best_diff: dict = {}
     for root, dirs, files in os.walk(project_root):
         for d in dirs:
             full = os.path.join(root, d)
             norm_d = _normalize(d)
             if not norm_d:
                 continue
+            core_d = _core(d)
             for seg in bare_first_segments:
-                if seg in alias_targets:
-                    continue
                 norm_seg = _normalize(seg)
+                if not norm_seg:
+                    continue
                 candidates = {norm_seg}
                 if norm_seg in _KNOWN_PACKAGE_SYNONYMS:
                     candidates.add(_KNOWN_PACKAGE_SYNONYMS[norm_seg])
-                if norm_seg and any(c in norm_d for c in candidates):
+                matched = any(c in norm_d for c in candidates)
+                diff = abs(len(norm_seg) - len(norm_d))
+                if not matched:
+                    core_seg = _core(seg)
+                    if (
+                        len(core_seg) >= _MIN_CORE_LEN and len(core_d) >= _MIN_CORE_LEN
+                        and (core_seg in core_d or core_d in core_seg)
+                    ):
+                        matched = True
+                        diff = abs(len(core_seg) - len(core_d))
+                if matched and diff < alias_best_diff.get(seg, float("inf")):
                     alias_targets[seg] = full
+                    alias_best_diff[seg] = diff
+
+    # A name-matched alias target may not be the real package ROOT —
+    # some vendoring tools nest the fetched package one level deeper
+    # inside a version folder. Found live this session against INIT
+    # Capital's real InitCore.sol (Blast): Hardhat's dependency-compiler
+    # cache lays out `contracts/.cache/OpenZeppelin/v4.9.3/token/ERC20/
+    # IERC20.sol`, not `contracts/.cache/OpenZeppelin/token/ERC20/
+    # IERC20.sol` — the name match correctly finds `.../OpenZeppelin/`,
+    # but the import's own remainder path (`token/ERC20/IERC20.sol`)
+    # doesn't exist directly under it, only one level further in.
+    # Validate each matched target against a REAL bare import under
+    # that exact segment (join the import's own remainder onto the
+    # candidate and check the file actually exists); if it doesn't,
+    # descend one level into each of the candidate's own subdirectories
+    # and keep whichever one actually resolves a real file.
+    for seg in list(alias_targets.keys()):
+        candidate = alias_targets[seg]
+        seg_prefix = seg + "/"
+        remainders = [p[len(seg_prefix):] for p in bare_import_paths if p.startswith(seg_prefix)]
+        if not remainders:
+            continue
+
+        def _validates(root: str) -> bool:
+            return any(os.path.isfile(os.path.join(root, r)) for r in remainders)
+
+        if _validates(candidate):
+            continue
+        try:
+            for entry in sorted(os.listdir(candidate)):
+                sub = os.path.join(candidate, entry)
+                if os.path.isdir(sub) and _validates(sub):
+                    alias_targets[seg] = sub
+                    break
+        except Exception:
+            pass
 
     remappings = []
     for seg, full in alias_targets.items():

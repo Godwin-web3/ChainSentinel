@@ -968,6 +968,35 @@ def _registry_validates_struct(f, struct_param, call_node=None) -> bool:
         return False
 
 
+def _resolves_to_self(var, f) -> bool:
+    """
+    True if var is (or, via a single TypeConversion hop, resolves to)
+    Solidity's own `this` — i.e. `address(this)`. A self-delegatecall
+    (`address(this).delegatecall(...)`, the real OpenZeppelin-style
+    Multicall batching pattern found live this session against INIT
+    Capital's real InitCore.sol on Blast) can never be redirected by an
+    attacker: the destination IS this exact contract, definitionally,
+    not a variable an attacker could ever repoint. `address(this)`
+    lowers to a TypeConversion (`CONVERT this to address`) producing a
+    TemporaryVariable — confirmed live via real IR — so plain
+    _is_state_variable/_is_caller_controlled checks never match it at
+    all.
+    """
+    try:
+        from slither.core.declarations.solidity_variables import SolidityVariable
+        from slither.slithir.operations import TypeConversion
+        if isinstance(var, SolidityVariable) and var.name == "this":
+            return True
+        defining_op = _find_defining_op(var, f)
+        if isinstance(defining_op, TypeConversion):
+            inner = getattr(defining_op, "variable", None)
+            if isinstance(inner, SolidityVariable) and inner.name == "this":
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _resolve_trust(ir, raw_type: str, f, auth_lookup: Optional[dict], node=None) -> tuple:
     """
     Decide trust for a call edge destination. Highlevel calls and
@@ -1019,18 +1048,39 @@ def _resolve_trust(ir, raw_type: str, f, auth_lookup: Optional[dict], node=None)
     """
     if raw_type not in ("highlevel", "delegatecall", "codecall"):
         return False, False
-    if not auth_lookup:
-        return False, False
 
     try:
         dest = ir.destination
     except Exception:
         return False, False
 
-    contract = getattr(f, "contract_declarer", None)
-
     # Resolve reference chains to the underlying variable
     dest = _follow_reference(dest)
+
+    # Self-delegatecall (`address(this).delegatecall(...)`) — the real
+    # OpenZeppelin-style Multicall batching pattern, found live this
+    # session against INIT Capital's real InitCore.sol on Blast:
+    #     function multicall(bytes[] calldata _data) ... {
+    #         for (...) { address(this).delegatecall(_data[i]); }
+    #     }
+    # can never be redirected by an attacker — the destination IS this
+    # exact contract, definitionally, not a variable anyone could ever
+    # repoint. Checked BEFORE the auth_lookup gate below (unlike the
+    # rest of this function): this is a purely structural fact about
+    # the destination expression itself, unrelated to any auth-scored
+    # writer evidence, so it must hold even when auth_lookup is empty.
+    # `address(this)` lowers to a TypeConversion (`CONVERT this to
+    # address`) producing a TemporaryVariable, so plain
+    # _is_state_variable/_is_caller_controlled checks below never match
+    # it at all, leaving core/sinks.py's fallback/receive-independent
+    # DELEGATION_SINK carve-out with no way to ever trust it.
+    if raw_type in ("delegatecall", "codecall") and _resolves_to_self(dest, f):
+        return True, True
+
+    if not auth_lookup:
+        return False, False
+
+    contract = getattr(f, "contract_declarer", None)
 
     # Direct storage variable destination
     if _is_state_variable(dest):

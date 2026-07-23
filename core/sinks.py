@@ -192,10 +192,21 @@ def _classify_node(node_id: str, node, edges: List[CallEdge], privileged_vars: O
     # every delegatecall/codecall in core/edges.py::_semantic_properties
     # regardless of destination trust — this check must use
     # governance_gated, not uncertain, which can never be False here.
+    # Not gated to fallback/receive names — the real criterion is
+    # behavioral (is every delegatecall/codecall destination proven
+    # safe), not what the function happens to be called. Found live
+    # this session against INIT Capital's real InitCore.sol (Blast):
+    # the real OpenZeppelin-style Multicall.multicall() batches calls
+    # via `address(this).delegatecall(_data[i])` — self-delegation,
+    # exactly as safe as a proxy fallback()'s governance-gated
+    # implementation slot (core/edges.py::_resolve_trust resolves a
+    # self-delegatecall destination to trusted=True,
+    # governance_gated=True unconditionally — the target IS this exact
+    # contract, definitionally, never attacker-redirectable) — but
+    # `multicall` isn't named fallback/receive, so this carve-out never
+    # applied to it before.
     delegation_edges = [e for e in edges if e.raw_type in ("delegatecall", "codecall")]
-    if node_name in ("fallback", "receive") and delegation_edges and all(
-        getattr(e, "governance_gated", False) for e in delegation_edges
-    ):
+    if delegation_edges and all(getattr(e, "governance_gated", False) for e in delegation_edges):
         return None
 
     # ── 1. Selfdestruct ──────────────────────────────────────────

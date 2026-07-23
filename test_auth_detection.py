@@ -745,6 +745,53 @@ def test_transparent_proxy_fallback_governance_gated_destination_excludes_delega
           "SafeUnitroller excluded, UnsafeProxy still", unsafe_findings[0].verdict)
 
 
+def test_self_delegatecall_multicall_excludes_delegation_sink():
+    """
+    Reproduces the real false positive found live this session against
+    INIT Capital's real InitCore.sol (Blast): the real OpenZeppelin-
+    style Multicall.multicall() batches calls via `address(this).
+    delegatecall(_data[i])` — a SELF-delegatecall, not a proxy
+    dispatching to a separate implementation. `address(this)` lowers to
+    a TypeConversion producing a TemporaryVariable, so it never matched
+    core/edges.py::_resolve_trust's state-variable trust path at all —
+    and core/sinks.py's carve-out was gated to functions literally
+    named "fallback"/"receive", which "multicall" isn't, so even a
+    perfectly-trusted self-delegatecall could never be excluded.
+
+    Also proves this doesn't weaken detection: UnsafeDelegateToParam.
+    batchCall() is structurally similar (a delegatecall inside a loop,
+    no fallback()/receive() name), but the destination is an
+    ATTACKER-SUPPLIED PARAMETER, not `address(this)` — must NOT be
+    misdetected as safe just because it superficially resembles a
+    multicall helper; must still fire ACCESS_CONTROL_GAP and classify
+    as DELEGATION_SINK.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("TransparentProxyDelegation.sol")
+
+    sinks = classify_sinks(nodes, graph_edges)
+    safe_id = "SelfMulticall.multicall(bytes[])"
+    unsafe_id = "UnsafeDelegateToParam.batchCall(address,bytes[])"
+    assert safe_id not in sinks, f"SelfMulticall.multicall()'s destination is address(this) — must not be a sink at all, got {sinks.get(safe_id)}"
+    assert unsafe_id in sinks and sinks[unsafe_id].category == "DELEGATION_SINK", (
+        f"UnsafeDelegateToParam.batchCall()'s destination is an attacker-supplied parameter — must still classify as DELEGATION_SINK, got {sinks.get(unsafe_id)}"
+    )
+
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible
+
+    safe_findings = [r for r in all_results if r.path.entry == safe_id and "ACCESS_CONTROL_GAP" in r.constraint_type]
+    assert not safe_findings, f"SelfMulticall.multicall() must not fire ACCESS_CONTROL_GAP, got {safe_findings}"
+
+    unsafe_findings = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == unsafe_id and "ACCESS_CONTROL_GAP" in r.constraint_type
+    ]
+    assert unsafe_findings, "UnsafeDelegateToParam.batchCall()'s destination is attacker-supplied — ACCESS_CONTROL_GAP must still fire"
+    print("test_self_delegatecall_multicall_excludes_delegation_sink: PASS —",
+          "SelfMulticall excluded, UnsafeDelegateToParam still", unsafe_findings[0].verdict)
+
+
 def test_external_view_return_verdict_auth_detected():
     """
     Reproduces the real Balancer/Berachain BEX Authorizer false positive
@@ -815,5 +862,6 @@ if __name__ == "__main__":
     test_self_scoped_getter_funds_asset_move()
     test_fresh_deployment_destination_excludes_cross_function_race()
     test_transparent_proxy_fallback_governance_gated_destination_excludes_delegation_sink()
+    test_self_delegatecall_multicall_excludes_delegation_sink()
     test_external_view_return_verdict_auth_detected()
     print("\nAll auth_detection tests passed.")
