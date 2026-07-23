@@ -248,6 +248,114 @@ def _external_view_comparison_in_node(node, f, known_msg_sender: frozenset = fro
     return _external_view_comparison_ir(node, f, known_msg_sender)
 
 
+def _is_fixed_call_destination(var, f, max_depth: int = 3) -> bool:
+    """
+    True if var resolves to a fixed (state variable / immutable) origin
+    directly, OR var is the return value of an internal call whose own
+    body does nothing but forward to (return) a HighLevelCall on a
+    view/pure function whose OWN destination is, recursively, fixed by
+    this same definition. The real Balancer/Berachain BEX shape, found
+    live against ProtocolFeesCollector.sol:
+        function _canPerform(...) internal view returns (bool) {
+            return _getAuthorizer().canPerform(...);
+        }
+        function _getAuthorizer() internal view returns (IAuthorizer) {
+            return vault.getAuthorizer();
+        }
+    where `vault` is `IVault public immutable`. Trust here rests on the
+    same basis _external_view_comparison_ir already relies on for a
+    single external hop (a view/pure call can't have side effects, and a
+    fixed destination can't be attacker-supplied) — this just lets that
+    trust cross an internal forwarding layer too, since the indirection
+    itself introduces no destination of its own to manipulate; it only
+    ever returns what a fixed-basis external view call reports.
+    """
+    origin, _ = resolve_variable_origin(var, f)
+    if origin in _FIXED_ORIGINS:
+        return True
+    if origin != DestinationOrigin.RETURN_VALUE or max_depth <= 0:
+        return False
+    defining_op = _find_defining_op(var, f)
+    if not isinstance(defining_op, InternalCall):
+        return False
+    callee = getattr(defining_op, "function", None)
+    if callee is None:
+        return False
+    try:
+        callee_nodes = list(getattr(callee, "nodes", []) or [])
+    except Exception:
+        return False
+    for node in callee_nodes:
+        for ir in node.irs:
+            if not isinstance(ir, Return):
+                continue
+            for v in (getattr(ir, "values", None) or []):
+                call_ir = _find_defining_op(v, callee)
+                if isinstance(call_ir, HighLevelCall):
+                    callee_fn = getattr(call_ir, "function", None)
+                    if not (getattr(callee_fn, "view", False) or getattr(callee_fn, "pure", False)):
+                        continue
+                    call_dest = getattr(call_ir, "destination", None)
+                    if call_dest is not None and _is_fixed_call_destination(call_dest, callee, max_depth - 1):
+                        return True
+                elif _is_fixed_call_destination(v, callee, max_depth - 1):
+                    return True
+    return False
+
+
+def _external_view_return_verdict_ir(node, f, known_msg_sender: frozenset = frozenset()) -> Optional[AuthFinding]:
+    """
+    A Return node whose value is directly (no `==`/`!=` comparison) the
+    boolean result of an external, read-only (view/pure) call whose
+    destination resolves to fixed origin (possibly through an internal
+    forwarding hop — see _is_fixed_call_destination) and whose ARGUMENTS
+    include a value proven msg.sender-bound. The real Balancer/
+    Berachain BEX Authorizer shape, found live against real
+    ProtocolFeesCollector.withdrawCollectedFees():
+        function _canPerform(bytes32 actionId, address account)
+            internal view override returns (bool)
+        {
+            return _getAuthorizer().canPerform(actionId, account, address(this));
+        }
+    _external_view_comparison_ir can't see this: there is no `==`/`!=`
+    anywhere — the callee's raw boolean return IS the verdict, forwarded
+    unchanged up through a revert-wrapper like `_require(...)`. A
+    fixed-destination, side-effect-free call that receives the caller's
+    own identity as an argument and reports a yes/no answer is
+    structurally identical to comparing msg.sender against a stored
+    allowlist — just phrased as a query instead of a comparison, and
+    without that a genuine on-chain, actively-used authorization pattern
+    (Balancer's real Authorizer/actionId permission model) would be
+    misclassified as unguarded.
+    """
+    for ir in node.irs:
+        if not isinstance(ir, Return):
+            continue
+        for val in (getattr(ir, "values", None) or []):
+            v = val
+            call_ir = _find_defining_op(v, f)
+            if isinstance(call_ir, TypeConversion):
+                v = call_ir.variable
+                call_ir = _find_defining_op(v, f)
+            if not isinstance(call_ir, HighLevelCall):
+                continue
+            callee = getattr(call_ir, "function", None)
+            if not (getattr(callee, "view", False) or getattr(callee, "pure", False)):
+                continue
+            if str(getattr(call_ir.lvalue, "type", None)) != "bool":
+                continue
+            dest = getattr(call_ir, "destination", None)
+            if dest is None or not _is_fixed_call_destination(dest, f):
+                continue
+            for arg in (getattr(call_ir, "arguments", None) or []):
+                arg_origin, _ = _resolve_operand(arg, f, known_msg_sender)
+                if _is_msg_sender_origin(arg_origin):
+                    return AuthFinding(
+                        score=3, evidence_type="external_view_return_verdict", matched_state_var=str(dest)
+                    )
+    return None
+
+
 def _resolve_mapping_base(var, f, max_depth: int = 6):
     """
     Backward-slice a mapping-lookup base (possibly through nested
@@ -462,6 +570,9 @@ def _evidence_anywhere_in_body(f, max_depth: int, _visited: set, known_msg_sende
         if finding is not None:
             return finding
         finding = _external_view_comparison_ir(node, f, known_msg_sender)
+        if finding is not None:
+            return finding
+        finding = _external_view_return_verdict_ir(node, f, known_msg_sender)
         if finding is not None:
             return finding
 

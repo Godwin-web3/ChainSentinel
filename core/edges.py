@@ -659,6 +659,47 @@ def _key_derives_from_struct(key, f, struct_param, max_depth: int = 6) -> bool:
     return False
 
 
+def _function_can_revert(fn, max_depth: int = 4, _visited: Optional[set] = None) -> bool:
+    """
+    True if fn's own body contains a real revert path: a require()/
+    assert()/revert(...) SolidityCall — including one Slither's assembly
+    IR decoder synthesizes for a raw `assembly { revert(...) }` block
+    (confirmed live against real Balancer/Berachain BEX's
+    `_revert(uint256)` helper: its entire body is inline assembly ending
+    in the EVM REVERT opcode, which Slither still lowers to a normal
+    `SolidityCall ... revert(uint256,uint256)(...)` IR op on the
+    EXPRESSION node between the ASSEMBLY/ENDASSEMBLY markers) — or a call
+    to ANOTHER internal function that itself can revert, bounded
+    recursion (the real Balancer pattern: `_require(cond, code) { if
+    (!cond) _revert(code); }` calling `_revert`, whose body is exactly
+    the assembly case above). Same "raw EVM opcode is unambiguous
+    ground truth" basis already used for `create2` detection in
+    core/invariants.py's `_fresh_deployment_destinations`.
+    """
+    if _visited is None:
+        _visited = set()
+    fid = id(fn)
+    if fid in _visited or max_depth < 0:
+        return False
+    _visited.add(fid)
+    try:
+        nodes = list(getattr(fn, "nodes", []) or [])
+    except Exception:
+        return False
+    for node in nodes:
+        for ir in node.irs:
+            if isinstance(ir, SolidityCall):
+                callee = getattr(ir, "function", None)
+                name = str(getattr(callee, "name", "") or "").lower()
+                if name.startswith("require") or name.startswith("assert") or name.startswith("revert"):
+                    return True
+            elif isinstance(ir, InternalCall) and max_depth > 0:
+                callee = getattr(ir, "function", None)
+                if callee is not None and _function_can_revert(callee, max_depth - 1, _visited):
+                    return True
+    return False
+
+
 def _node_can_revert(node) -> bool:
     """True if the node is a validation point that can revert on failure."""
     try:
@@ -675,6 +716,17 @@ def _node_can_revert(node) -> bool:
                 callee = getattr(ir, "function", None)
                 fname = str(getattr(callee, "name", "") or "").lower()
                 if fname.startswith("require") or fname.startswith("assert"):
+                    return True
+            # A call to a user-defined revert-wrapper function, e.g. real
+            # Balancer/Berachain BEX's free-function `_require(bool
+            # condition, uint256 errorCode) { if (!condition)
+            # _revert(errorCode); }` — structurally identical to a
+            # built-in require(), just one indirection through a custom
+            # helper (common wherever a codebase centralizes revert
+            # reasons/error codes instead of inlining every require()).
+            if isinstance(ir, InternalCall):
+                callee = getattr(ir, "function", None)
+                if callee is not None and _function_can_revert(callee):
                     return True
         # if (cond) revert  —  IF node with a reverting successor
         if getattr(node, "type", None) == getattr(NodeType, "IF", None):

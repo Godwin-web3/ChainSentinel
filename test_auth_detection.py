@@ -641,6 +641,55 @@ def test_fresh_deployment_destination_excludes_cross_function_race():
           "createPair suppressed, UnsafeFactory.createPair still", dangerous_race[0].verdict)
 
 
+def test_external_view_return_verdict_auth_detected():
+    """
+    Reproduces the real Balancer/Berachain BEX Authorizer false positive
+    found live this session against ProtocolFeesCollector.
+    withdrawCollectedFees() (deployed on Berachain at
+    0x4Be03f781C497A489E3cB0287833452cA9B9E80B): the auth verdict is the
+    RAW boolean return of a fixed-destination, view-only external call —
+    no `==`/`!=` comparison anywhere — gated by a free-function revert
+    wrapper (`_require`/`_revert`) whose actual revert happens via raw
+    inline assembly.
+
+    badAuthCallerSuppliedAuthorizer, badAuthNoCallerArgument,
+    badAuthMutatingCall, and fakeRequireNeverReverts prove this doesn't
+    weaken detection: an attacker-supplied call destination, a call
+    whose arguments never actually involve msg.sender, a call that
+    isn't provably view/pure, and a wrapper that looks like a revert
+    gate but never actually reverts, must NOT be treated as auth
+    evidence even though each superficially resembles the real shape.
+    """
+    nodes, *_ = _build("AuthorizerReturnVerdict.sol")
+
+    withdraw = nodes["AuthorizerReturnVerdict.withdrawCollectedFees(uint256)"]
+    assert withdraw.auth_score >= 3, f"expected external-view-return-verdict evidence, got {withdraw.auth_score}"
+    assert withdraw.auth_state == "AUTHENTICATED"
+    assert withdraw.structural_auth_var == "authorizer"
+
+    bad_caller_supplied = nodes["AuthorizerReturnVerdict.badAuthCallerSuppliedAuthorizer(IAuthorizer,uint256)"]
+    assert bad_caller_supplied.auth_score < 3, (
+        "the authorizer destination is an attacker-supplied parameter, not the fixed immutable — must not score as auth"
+    )
+
+    bad_no_caller_arg = nodes["AuthorizerReturnVerdict.badAuthNoCallerArgument(uint256)"]
+    assert bad_no_caller_arg.auth_score < 3, (
+        "msg.sender is never passed as an argument to the view call — must not score as auth"
+    )
+
+    bad_mutating = nodes["AuthorizerReturnVerdict.badAuthMutatingCall(uint256)"]
+    assert bad_mutating.auth_score < 3, (
+        "reportAndApprove() is not view/pure — must not be trusted as a side-effect-free auth check"
+    )
+
+    fake_wrapper = nodes["AuthorizerReturnVerdict.fakeRequireNeverReverts(uint256)"]
+    assert fake_wrapper.auth_score < 3, (
+        "_fakeRequire never actually reverts on failure — must not be treated as a real gate"
+    )
+    print("test_external_view_return_verdict_auth_detected: PASS —",
+          "withdrawCollectedFees", withdraw.auth_score, "| bad variants correctly unscored")
+
+
 if __name__ == "__main__":
     test_custom_named_auth_modifier_detected()
     test_real_access_control_struct_shape_detected()
@@ -660,4 +709,5 @@ if __name__ == "__main__":
     test_balance_invariant_suppresses_flashloan_window()
     test_self_scoped_getter_funds_asset_move()
     test_fresh_deployment_destination_excludes_cross_function_race()
+    test_external_view_return_verdict_auth_detected()
     print("\nAll auth_detection tests passed.")
