@@ -25,6 +25,7 @@ from core.auth_detection import (
 from core.vault_detection import find_unsafe_share_price_divisor
 from core.spot_price_detection import find_unsafe_spot_price_dependency
 from core.staleness_detection import find_unstaled_latest_round_data_dependency
+from core.initializer_detection import find_unprotected_initializer, has_one_time_latch_protection
 from slither.slithir.operations import (
     InternalCall, HighLevelCall, LowLevelCall, SolidityCall, LibraryCall
 )
@@ -197,6 +198,33 @@ class FunctionNode:
     # actual deployed ChainlinkOracle.sol (round-completeness checks
     # only, never elapsed real time).
     unstaled_latest_round_data_dependency: Optional[str] = None
+    # Non-None (the written state var name(s)) if this function is
+    # externally reachable, is not the real Solidity constructor,
+    # writes at least one state variable, and is protected by NEITHER
+    # an attached one-time-latch modifier (see core/
+    # initializer_detection.py::is_initializer_guard) NOR an inline
+    # equivalent in its own body. Deliberately does NOT itself decide
+    # which written variable is privileged — that proof already exists
+    # in core/sinks.py's own STORAGE_CORRUPTION sink classification
+    # (structural_auth_var-derived); the constraint check combines
+    # both. Real precedent: the Parity Multisig Wallet Library (Nov
+    # 2017) — its real initWallet() set `owner` with zero re-invocation
+    # guard, letting an attacker become owner of the shared library
+    # contract and selfdestruct it, permanently freezing ~$280M across
+    # 587 dependent wallets.
+    unprotected_initializer_write: Optional[str] = None
+    # True if this function (not a modifier) is protected by a one-time
+    # -latch mechanism — see core/initializer_detection.py::
+    # has_one_time_latch_protection — independent of whether it writes
+    # any privileged state. A first-time initializer legitimately has
+    # NO msg.sender-based auth check at all (there's no owner yet to
+    # compare against), so core/auth_detection.py's own auth-scoring
+    # machinery correctly scores it UNAUTHENTICATED; this is a
+    # DIFFERENT, equally real protective signal _check_access_control_
+    # gap needs to recognize separately to avoid flagging the OZ-
+    # recommended, correctly-guarded initializer pattern as a real
+    # access-control gap.
+    has_initializer_guard: bool = False
 
     # Layer 4 — graph edges (canonical IDs)
     internal_callees: List[str] = field(default_factory=list)
@@ -492,6 +520,8 @@ def build_graph(
                 unsafe_share_price_divisor = find_unsafe_share_price_divisor(f) if not is_modifier else None
                 unsafe_spot_price_dependency = find_unsafe_spot_price_dependency(f) if not is_modifier else None
                 unstaled_latest_round_data_dependency = find_unstaled_latest_round_data_dependency(f) if not is_modifier else None
+                unprotected_initializer_write = find_unprotected_initializer(f, structural_auth_score) if not is_modifier else None
+                init_guard = has_one_time_latch_protection(f) if not is_modifier else False
                 auth_state = (
                     "AUTHENTICATED" if structural_auth_score >= 3 else
                     "UNKNOWN" if structural_auth_score == 2 else
@@ -547,6 +577,8 @@ def build_graph(
                     unsafe_share_price_divisor=unsafe_share_price_divisor,
                     unsafe_spot_price_dependency=unsafe_spot_price_dependency,
                     unstaled_latest_round_data_dependency=unstaled_latest_round_data_dependency,
+                    unprotected_initializer_write=unprotected_initializer_write,
+                    has_initializer_guard=init_guard,
                     internal_callees=int_callees,
                     external_callees=ext_callees,
                     state_writes=state_writes,

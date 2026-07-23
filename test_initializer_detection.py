@@ -1,0 +1,179 @@
+"""
+Regression tests for core/initializer_detection.py — structural
+front-runnable/missing-initializer-protection detection.
+
+Real precedent: the Parity Multisig Wallet Library (Nov 2017) — its
+real initWallet() set `owner` with zero re-invocation guard. An
+attacker called it directly on the shared library contract, became its
+owner, then called the library's own kill() — selfdestructing it and
+permanently freezing ~513,774 ETH (~$280M) across 587 dependent
+wallets. The same root cause recurs constantly in modern proxy-based
+upgradeable contracts under "missing initializer modifier" /
+"front-runnable initialize()" — one of the most common real
+Code4rena/Sherlock findings for proxy-based protocols. Real precedent
+for the protected shape: OpenZeppelin's actual widely-deployed v4.9
+Initializable.sol, confirmed live via IR probe against the real
+reference source.
+"""
+import os
+
+from core.graph import build_graph
+from core.sinks import classify_sinks
+from core.paths import enumerate_paths
+from core.constraints import validate_paths
+
+FIXTURE_DIR = os.path.abspath("fixture/initializer_detection")
+
+
+def _build(filename):
+    entry = os.path.join(FIXTURE_DIR, filename)
+    return build_graph(
+        project_root=FIXTURE_DIR,
+        entry_file=entry,
+        solc_version="0.8.19",
+        enrichment={},
+    )
+
+
+def test_unguarded_owner_write_detected():
+    """
+    Reproduces the real Parity WalletLibrary shape: initWallet() sets
+    `owner` with zero guard against re-invocation. Must fire evidence.
+    """
+    nodes, *_ = _build("UnprotectedInit.sol")
+    fn = nodes["ParityStyleWallet.initWallet(address)"]
+    assert fn.unprotected_initializer_write is not None, "expected unprotected initializer evidence"
+    print("test_unguarded_owner_write_detected: PASS —",
+          "evidence:", fn.unprotected_initializer_write)
+
+
+def test_oz_initializer_modifier_suppresses_finding():
+    """
+    Reproduces the real, widely-deployed OZ v4.9 Initializable.sol
+    shape: a genuine one-time latch (_initialized, never reset). Must
+    NOT flag.
+    """
+    nodes, *_ = _build("UnprotectedInit.sol")
+    fn = nodes["ProtectedInitializable.initialize(address)"]
+    assert fn.unprotected_initializer_write is None, f"OZ-initializer-protected function must not flag, got {fn.unprotected_initializer_write}"
+    print("test_oz_initializer_modifier_suppresses_finding: PASS")
+
+
+def test_inline_self_referential_guard_suppresses_finding():
+    """
+    The common self-referential shape: require(owner == address(0))
+    immediately before setting owner. Must NOT flag.
+    """
+    nodes, *_ = _build("UnprotectedInit.sol")
+    fn = nodes["InlineGuardedInit.initialize(address)"]
+    assert fn.unprotected_initializer_write is None, f"self-referential-guarded function must not flag, got {fn.unprotected_initializer_write}"
+    print("test_inline_self_referential_guard_suppresses_finding: PASS")
+
+
+def test_reentrancy_guard_does_not_suppress_finding():
+    """
+    Critical adversarial regression: a real nonReentrant-style guard
+    only TOGGLES its flag (set before, reset after) — it protects
+    against reentrant calls DURING one transaction, not against being
+    called again in a SEPARATE later transaction. A reentrancy guard
+    is not a substitute for a one-time latch. Must still fire.
+    """
+    nodes, *_ = _build("UnprotectedInit.sol")
+    fn = nodes["NonReentrantIsNotAnInitializerGuard.initialize(address)"]
+    assert fn.unprotected_initializer_write is not None, "nonReentrant alone must not suppress the real finding"
+    print("test_reentrancy_guard_does_not_suppress_finding: PASS —",
+          "evidence:", fn.unprotected_initializer_write)
+
+
+def test_real_constructor_does_not_false_positive():
+    """
+    owner is set ONLY in the real Solidity constructor — EVM-enforced
+    single-invocation already. Must NOT flag.
+    """
+    nodes, *_ = _build("UnprotectedInit.sol")
+    fn = nodes["ConstructorOnly.constructor(address)"]
+    assert fn.unprotected_initializer_write is None, f"real constructor must not flag, got {fn.unprotected_initializer_write}"
+    print("test_real_constructor_does_not_false_positive: PASS")
+
+
+def test_internal_helper_does_not_false_positive():
+    """
+    The unprotected owner-setting logic lives in an INTERNAL helper,
+    never externally callable on its own. Must NOT flag.
+    """
+    nodes, *_ = _build("UnprotectedInit.sol")
+    fn = nodes["InternalHelperOnly._setupOwner(address)"]
+    assert fn.unprotected_initializer_write is None, f"internal-only helper must not flag, got {fn.unprotected_initializer_write}"
+    print("test_internal_helper_does_not_false_positive: PASS")
+
+
+def test_ownable2step_style_accept_does_not_false_positive():
+    """
+    Critical adversarial regression: the real OpenZeppelin Ownable2Step
+    shape. acceptOwnership() writes owner/pendingOwner with NO one-time
+    latch (by design — it's a repeatable acceptance step, not a
+    single-use initializer), but IS genuinely protected by a real
+    msg.sender comparison against pendingOwner, a value only the
+    current owner could have set. A one-time latch is not the only
+    valid protection — genuine msg.sender-based auth is equally valid.
+    Must NOT flag.
+    """
+    nodes, *_ = _build("UnprotectedInit.sol")
+    fn = nodes["Ownable2StepStyleAccept.acceptOwnership()"]
+    assert fn.unprotected_initializer_write is None, f"genuinely auth-gated acceptOwnership() must not flag, got {fn.unprotected_initializer_write}"
+    print("test_ownable2step_style_accept_does_not_false_positive: PASS")
+
+
+def test_unprotected_initializer_constraint_fires_only_on_real_vulnerable_contracts():
+    """
+    End-to-end: runs the full path-enumeration + constraint-validation
+    pipeline (not just the precomputed FunctionNode field) and checks
+    the actual UNPROTECTED_INITIALIZER finding fires CONFIRMED on both
+    genuinely vulnerable contracts and does not fire on any of the
+    three protected/decoy contracts. Also confirms the gate on
+    core/sinks.py's own STORAGE_CORRUPTION sink classification (not a
+    hand-rolled auth-var list) is what makes `owner` count as
+    privileged here — proven by the onlyOwner-gated withdraw()
+    function present in every contract.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("UnprotectedInit.sol")
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible
+
+    for vulnerable_entry in (
+        "ParityStyleWallet.initWallet(address)",
+        "NonReentrantIsNotAnInitializerGuard.initialize(address)",
+    ):
+        vulnerable_findings = [
+            r for r in report.confirmed
+            if "UNPROTECTED_INITIALIZER" in r.constraint_type and r.path.entry == vulnerable_entry
+        ]
+        assert vulnerable_findings, f"{vulnerable_entry} must fire UNPROTECTED_INITIALIZER CONFIRMED"
+
+    for safe_entry in (
+        "ProtectedInitializable.initialize(address)",
+        "InlineGuardedInit.initialize(address)",
+        "ConstructorOnly.constructor(address)",
+    ):
+        safe_findings = [
+            r for r in all_results
+            if "UNPROTECTED_INITIALIZER" in r.constraint_type and r.path.entry == safe_entry
+        ]
+        assert not safe_findings, f"{safe_entry} must not fire UNPROTECTED_INITIALIZER, got {safe_findings}"
+
+    print("test_unprotected_initializer_constraint_fires_only_on_real_vulnerable_contracts: PASS —",
+          "both vulnerable entries CONFIRMED, all three safe/decoy contracts correctly unflagged")
+
+
+if __name__ == "__main__":
+    test_unguarded_owner_write_detected()
+    test_oz_initializer_modifier_suppresses_finding()
+    test_inline_self_referential_guard_suppresses_finding()
+    test_reentrancy_guard_does_not_suppress_finding()
+    test_real_constructor_does_not_false_positive()
+    test_internal_helper_does_not_false_positive()
+    test_ownable2step_style_accept_does_not_false_positive()
+    test_unprotected_initializer_constraint_fires_only_on_real_vulnerable_contracts()
+    print("\nAll initializer_detection tests passed.")

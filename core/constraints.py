@@ -149,6 +149,7 @@ def _validate_path(
     results.append(_check_missing_health_check(path, nodes, graph_edges))
     results.append(_check_oracle_dependency(path, nodes, graph_edges))
     results.append(_check_stale_oracle(path, nodes, graph_edges))
+    results.append(_check_unprotected_initializer(path, nodes, graph_edges))
     results.append(_check_flashloan_window(path, nodes, graph_edges))
     results.append(_check_unchecked_return(path, nodes, graph_edges))
     results.append(_check_share_inflation(path, nodes, graph_edges))
@@ -382,6 +383,33 @@ def _check_access_control_gap(path, nodes, graph_edges) -> ConstraintResult:
 
     if _auth_check_in_subgraph(path.entry, nodes, graph_edges, depth=3):
         return _suppressed(path, "Auth enforced in call subgraph — not a real gap")
+
+    # One-time latch: a first-time initializer legitimately has NO
+    # msg.sender-based auth check at all — there's no owner yet to
+    # compare against — so AUTH_GAP correctly fires structurally, but
+    # that's not the same as being genuinely exploitable. A real
+    # one-time-latch guard (core/initializer_detection.py::
+    # has_one_time_latch_protection — the real, widely-deployed OZ
+    # v4.9 Initializable.sol `initializer` modifier shape, or an inline
+    # self-referential `require(owner == address(0))` equivalent)
+    # provides a DIFFERENT, equally valid protection: idempotency, not
+    # identity. Found live this session: without this exemption, EVERY
+    # correctly-guarded initializer — including the OZ-recommended
+    # pattern itself — false-positived ACCESS_CONTROL_GAP identically
+    # to a genuinely unprotected one (the real Parity WalletLibrary
+    # shape, core/initializer_detection.py's own primary target),
+    # because a reentrancy-style toggle guard was the only shape this
+    # check could ever recognize as protective.
+    if path.sink.category == STORAGE_CORRUPTION:
+        entry_node = nodes.get(path.entry)
+        if entry_node is not None and getattr(entry_node, "has_initializer_guard", False):
+            return _suppressed(
+                path,
+                "Entry is protected by a one-time-latch guard (e.g. the real OZ Initializable."
+                "initializer modifier shape, or an inline self-referential require check) — "
+                "it can only ever run once, which is the real protection an initializer needs, "
+                "not a msg.sender-based identity check"
+            )
 
     # Self-scoped write: the sink's privileged write is PROVABLY keyed by
     # the caller's own identity (core/auth_detection.py::
@@ -1017,6 +1045,78 @@ def _check_stale_oracle(path, nodes, graph_edges) -> ConstraintResult:
         ),
         immunefi_impact="Stale price feed manipulation / incorrect liquidation or valuation",
         final_score=_final_score(path, 80),
+    )
+
+
+def _check_unprotected_initializer(path, nodes, graph_edges) -> ConstraintResult:
+    """
+    Detect a front-runnable/missing-initializer-protection pattern via
+    core/initializer_detection.py::find_unprotected_initializer,
+    computed once from real Slither IR while building the graph (core/
+    graph.py). Gated on path.sink.category == STORAGE_CORRUPTION —
+    core/sinks.py's own structural proof (FunctionNode.
+    structural_auth_var-derived, not a hand-rolled name list) that the
+    write really is privileged — combined with the entry's own
+    precomputed evidence that it lacks a one-time-latch guard.
+
+    Real precedent: the Parity Multisig Wallet Library (Nov 2017) —
+    its real initWallet() set `owner` with zero re-invocation guard. An
+    attacker called it directly on the shared library contract (never
+    meant to be initialized on its own), became its owner, then called
+    the library's own kill() — selfdestructing it and permanently
+    freezing ~513,774 ETH (~$280M) across 587 dependent wallets. The
+    same root cause recurs constantly in modern proxy-based upgradeable
+    contracts under "missing initializer modifier" /
+    "front-runnable initialize()" — a proxy can't use a real Solidity
+    constructor (it only runs once, at the IMPLEMENTATION's own
+    deployment, never the proxy's), so initialization logic moves to a
+    plain external function; if nothing guards it, an attacker can
+    call it first and become owner/admin.
+
+    Distinct from ACCESS_CONTROL_GAP (which this constraint does NOT
+    replace or overlap with in practice — see core/initializer_
+    detection.py::has_one_time_latch_protection and its new exemption
+    in _check_access_control_gap above): AUTH_GAP fires on ANY
+    unauthenticated entry reaching a privileged sink, which is
+    structurally correct but overbroad for a first-time initializer
+    (there's legitimately no msg.sender to check yet) — that check now
+    exempts genuinely one-time-latch-guarded entries. THIS constraint
+    fires on the complementary, narrower claim: the entry has NO
+    protection of ANY kind (neither identity-based NOR latch-based)
+    against its privileged write.
+    """
+    if path.sink.category != STORAGE_CORRUPTION:
+        return _suppressed(path, "Not a storage-corruption path")
+
+    entry_node = nodes.get(path.entry)
+    evidence = getattr(entry_node, "unprotected_initializer_write", None) if entry_node else None
+    if evidence is None:
+        return _suppressed(
+            path,
+            "No unprotected initializer-shaped write found on this entry — either the entry "
+            "isn't externally reachable, writes no state, is the real constructor, or is "
+            "protected by a one-time-latch guard"
+        )
+
+    return ConstraintResult(
+        path=path,
+        verdict=CONFIRMED,
+        confidence=90,
+        constraint_type="UNPROTECTED_INITIALIZER",
+        reasoning=(
+            f"Entry {path.entry} writes privileged state ({evidence}) with NO guard against "
+            f"being invoked more than once, or by anyone — neither a one-time-latch modifier "
+            f"(the real OZ Initializable.initializer shape) nor an inline self-referential "
+            f"check. An attacker can call this function directly — front-running the "
+            f"deployer's own initialization transaction, or calling it on an un-initialized "
+            f"implementation/library contract directly — and become owner/admin. Sink: "
+            f"{path.sink.node_id}. Real precedent: the Parity Multisig Wallet Library (Nov "
+            f"2017) — an attacker became owner of the shared WalletLibrary via its "
+            f"unprotected initWallet(), then selfdestructed it, permanently freezing "
+            f"~513,774 ETH (~$280M) across 587 dependent wallets."
+        ),
+        immunefi_impact="Complete protocol takeover via unprotected initializer",
+        final_score=_final_score(path, 90),
     )
 
 
