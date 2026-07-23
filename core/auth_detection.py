@@ -946,6 +946,20 @@ def _outermost_index_key(index_ir, f, max_depth: int = 6):
     A Member hop (struct field access) anywhere in the chain bails
     (returns None) rather than guessing — outer/inner scoping doesn't
     have a well-defined meaning once a struct field is involved.
+
+    Checks `base` itself (unresolved) before ever calling
+    _follow_reference on it: for a nested Index chain, `base` (e.g.
+    REF_2 above) is itself a ReferenceVariable produced by the OUTER
+    Index op — and REF_2.points_to resolves straight past that op to
+    the ROOT state variable (`can`) in a single hop. Resolving it
+    first would make `_is_state_variable(resolved_base)` true one
+    level too early, short-circuiting the walk before it reaches the
+    true outermost key — confirmed live as a real regression the
+    moment core/edges.py::_follow_reference's stale import was fixed
+    (it had been a no-op, so this ordering issue never manifested
+    before). _follow_reference is still tried as a fallback, for a
+    genuine alias base (e.g. a storage-pointer local variable) that
+    _find_defining_op can't walk any further via Index.
     """
     current = index_ir
     seen: Set[int] = set()
@@ -953,16 +967,18 @@ def _outermost_index_key(index_ir, f, max_depth: int = 6):
         base = getattr(current, "variable_left", None)
         if base is None:
             return None
-        resolved_base = _follow_reference(base)
-        if _is_state_variable(resolved_base):
+        if _is_state_variable(base):
             return current.variable_right
-        if id(resolved_base) in seen:
+        if id(base) in seen:
             return None
-        seen.add(id(resolved_base))
+        seen.add(id(base))
         defining_op = _find_defining_op(base, f)
-        if not isinstance(defining_op, Index):
-            return None
-        current = defining_op
+        if isinstance(defining_op, Index):
+            current = defining_op
+            continue
+        if _is_state_variable(_follow_reference(base)):
+            return current.variable_right
+        return None
     return None
 
 

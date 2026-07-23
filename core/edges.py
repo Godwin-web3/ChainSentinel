@@ -378,28 +378,38 @@ def _is_caller_controlled(var) -> bool:
 def _follow_reference(var, max_depth: int = 5):
     """
     Follow ReferenceVariable.points_to chains to the underlying
-    variable.
+    variable — e.g. a Member/Index op's own lvalue (`REF -> p.field`,
+    `REF -> mapping[key]`) resolves through .points_to STRAIGHT to the
+    ROOT object being accessed (the base state variable or struct),
+    collapsing the ENTIRE chain in one hop regardless of nesting depth
+    — not one level per hop.
 
-    KNOWN ISSUE, deliberately NOT fixed here: the import below
-    (slither.core.variables.reference_variable) does not exist in the
-    currently installed slither-analyzer (0.11.5) — the real class
-    lives at slither.slithir.variables.reference.ReferenceVariable —
-    so this has been a silent no-op for every one of this function's
-    ~29 call sites across core/ for the entire time it's existed.
-    Found live while building core/governance_snapshot_detection.py.
-    Fixing the import changes real behavior at every call site
-    simultaneously (confirmed live: it flips test_auth_detection.py's
-    test_nested_mapping_outer_key_self_scoping, a real, correctly-
-    designed test matching MakerDAO's actual Vat.hope() shape, from
-    passing to failing) — every caller was written and verified
-    against the no-op behavior, so this needs its own dedicated,
-    call-site-by-call-site audit, not a fix bundled into an unrelated
-    new detector. core/governance_snapshot_detection.py works around
-    this locally instead (its own Member/Index pass-through unwrap)
-    rather than depending on this function resolving references.
+    FIXED this session: the import previously targeted slither.core.
+    variables.reference_variable, a module path that doesn't exist in
+    the installed slither-analyzer (0.11.5) — the real class lives at
+    slither.slithir.variables.reference.ReferenceVariable — so this
+    was a silent no-op across every one of this function's ~29 call
+    sites for the entire time it existed. Audited call-site-by-call-
+    site after fixing the import (session commit history has the
+    details): two real call sites depended on the OLD no-op behavior
+    and needed updating — core/auth_detection.py::_outermost_index_key
+    (walked a nested Index chain one level at a time via
+    _find_defining_op; now checks the UNRESOLVED base for "is this
+    already the root" before ever calling this function, since a
+    single-hop resolution short-circuits the per-level walk) and core/
+    governance_snapshot_detection.py::_traces_to_live_voting_power
+    (needed to inspect the Index op that PRODUCED a reference, not
+    the reference's ultimate root, to recognize a plain mapping read
+    as a live/uncheckpointed accessor). Every other call site either
+    doesn't operate on ReferenceVariable-typed values at the point
+    this is called (confirmed via type-hierarchy checks, e.g.
+    TupleVariable and LocalVariableInitFromTuple are NOT
+    ReferenceVariable subclasses) or only needs the ROOT regardless of
+    nesting depth (e.g. _resolve_mapping_base), for which single-hop
+    resolution is the correct, complete answer.
     """
     try:
-        from slither.core.variables.reference_variable import ReferenceVariable
+        from slither.slithir.variables.reference import ReferenceVariable
     except Exception:
         return var
     seen = set()

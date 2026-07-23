@@ -169,8 +169,19 @@ def _traces_to_live_voting_power(var, f, max_depth: int = 4) -> Optional[str]:
     """
     if max_depth < 0:
         return None
-    resolved = _follow_reference(var)
-    defining_op = _find_defining_op(resolved, f)
+    # Deliberately does NOT call _follow_reference(var) before this
+    # lookup: _find_defining_op already matches an Index/Member op
+    # whose OWN lvalue is var, by identity — no reference-following
+    # needed, and (now that _follow_reference genuinely resolves
+    # ReferenceVariable.points_to chains, unlike the no-op it used to
+    # be) pre-resolving here would jump PAST the very Index op this
+    # function needs to inspect (e.g. `stalk[msg.sender]`'s reference
+    # resolves straight to the base `stalk` mapping, destroying the
+    # "this came from a plain Index read" evidence). Confirmed live:
+    # this was a real regression caught by this module's own fixture
+    # the moment core/edges.py::_follow_reference's stale import was
+    # fixed.
+    defining_op = _find_defining_op(var, f)
     if defining_op is None:
         return None
     if _is_live_voting_power_accessor(defining_op, f):
