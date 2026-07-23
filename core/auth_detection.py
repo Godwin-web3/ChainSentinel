@@ -1535,7 +1535,7 @@ def is_reentrancy_guard(modifier_obj) -> bool:
     before = _expand_with_internal_calls(nodes[:placeholder_idx])
     after = _expand_with_internal_calls(nodes[placeholder_idx + 1:])
 
-    return _guard_shape_from_before_after(before, after)
+    return _guard_shape_from_before_after(before, after) or _counter_fence_guard_shape(before, after)
 
 
 def _guard_shape_from_before_after(before: list, after: list) -> bool:
@@ -1557,6 +1557,72 @@ def _guard_shape_from_before_after(before: list, after: list) -> bool:
     guarded_before = any(_node_can_revert(n) for n in before)
 
     return bool(candidates & read_before) and guarded_before
+
+
+def _counter_fence_guard_shape(before: list, after: list) -> bool:
+    """
+    Alternate reentrancy-guard structural signature: a monotonic
+    counter fence instead of a boolean lock. Some state variable is
+    incremented in `before`, its post-increment value snapshotted into
+    a LOCAL variable, and a revert-capable node in `after` requires
+    that snapshot still equals the state variable's current value. If
+    a reentrant call re-enters through the SAME modifier during the
+    placeholder, it also increments the counter, so the post-call
+    comparison fails and reverts — exactly the same protective
+    guarantee as a boolean lock's set-before/reset-after, just
+    detecting the reentrant mutation directly instead of a sentinel
+    flag, and on the OTHER side of the placeholder from where
+    _guard_shape_from_before_after looks for its revert-capable check.
+
+    Found live this session against Mento Protocol's real Broker
+    (Celo, 0x1B78f6acD05e7BcB00f74863bfd8a7C264143e37): its
+    ReentrancyGuard.sol is OpenZeppelin's own v2.x-era guard (before
+    the boolean `_status` sentinel that later replaced it):
+        modifier nonReentrant() {
+            _guardCounter += 1;
+            uint256 localCounter = _guardCounter;
+            _;
+            require(localCounter == _guardCounter, "reentrant call");
+        }
+    _guard_shape_from_before_after requires the SAME variable written
+    on BOTH sides of the placeholder (the boolean lock's set/reset
+    idiom) — _guardCounter is written only in `before`, never in
+    `after`, so `candidates` was always empty and this guard scored
+    is_reentrancy_guard=False, false-positiving REENTRANCY_CEI +
+    FLASHLOAN_WINDOW on every nonReentrant-protected function
+    (swapIn/swapOut).
+    """
+    written_before = _state_vars_written(before)
+    if not written_before:
+        return False
+
+    # Local variables in `before` assigned directly from one of
+    # written_before's state variables — the post-increment snapshot.
+    snapshots: Dict[int, str] = {}
+    for node in before:
+        for ir in node.irs:
+            if not isinstance(ir, Assignment):
+                continue
+            rvalue = _follow_reference(ir.rvalue)
+            if _is_state_variable(rvalue) and str(rvalue) in written_before:
+                snapshots[id(ir.lvalue)] = str(rvalue)
+
+    if not snapshots:
+        return False
+
+    for node in after:
+        if not _node_can_revert(node):
+            continue
+        for ir in node.irs:
+            if not isinstance(ir, Binary) or ir.type not in (BinaryType.EQUAL, BinaryType.NOT_EQUAL):
+                continue
+            for snap_side, other_side in ((ir.variable_left, ir.variable_right), (ir.variable_right, ir.variable_left)):
+                if id(snap_side) not in snapshots:
+                    continue
+                other_resolved = _follow_reference(other_side)
+                if _is_state_variable(other_resolved) and str(other_resolved) == snapshots[id(snap_side)]:
+                    return True
+    return False
 
 
 def has_inline_reentrancy_guard(func_obj) -> bool:

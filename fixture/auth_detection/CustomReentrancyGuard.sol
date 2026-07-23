@@ -92,4 +92,52 @@ contract CustomReentrancyGuard {
     function notReallyGuardedDelegated() external fakeDelegatedGuard {
         target = msg.sender;
     }
+
+    uint256 private _guardCounter = 1;
+
+    // Reproduces OpenZeppelin's own v2.x-era ReentrancyGuard shape
+    // (before the boolean `_status` sentinel that later replaced it),
+    // found live this session in real, currently-deployed Mento
+    // Protocol's Broker on Celo: a monotonic counter fence instead of
+    // a boolean lock — the guard variable is written ONLY before the
+    // placeholder (incremented), never reset after it; the "already
+    // entered" check instead lives AFTER the placeholder, comparing a
+    // pre-call snapshot against the counter's current value. A
+    // reentrant call would also increment the counter, breaking the
+    // equality and reverting. _guard_shape_from_before_after requires
+    // the SAME variable written on BOTH sides of the placeholder (the
+    // boolean lock's set/reset idiom) and its revert-capable check
+    // BEFORE the placeholder — neither holds here, so this scored
+    // is_reentrancy_guard=False before the fix.
+    modifier counterFenceGuard() {
+        _guardCounter += 1;
+        uint256 localCounter = _guardCounter;
+        _;
+        require(localCounter == _guardCounter, "reentrant call");
+    }
+
+    // Negative control: ALSO increments a counter before the
+    // placeholder and snapshots it into a local — same shape at a
+    // glance — but the after-side check compares the snapshot against
+    // an UNRELATED variable, not the counter itself, so a reentrant
+    // call that only mutates _guardCounter (not counter) would sail
+    // right through. Must NOT be misdetected as a guard.
+    modifier fakeCounterFenceGuard() {
+        counter += 1;
+        uint256 localCounter = counter;
+        _;
+        require(localCounter == _guardCounter, "not actually checking the right variable");
+    }
+
+    function withdrawCounterFenced() external counterFenceGuard {
+        (bool ok, ) = msg.sender.call{value: 0}("");
+        require(ok, "call failed");
+        target = msg.sender;
+    }
+
+    function notReallyGuardedCounterFence() external fakeCounterFenceGuard {
+        (bool ok, ) = msg.sender.call{value: 0}("");
+        require(ok, "call failed");
+        target = msg.sender;
+    }
 }

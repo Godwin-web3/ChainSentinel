@@ -170,6 +170,63 @@ def test_delegated_reentrancy_guard_detected():
           "0 REENTRANCY_CEI findings on withdrawDelegated()")
 
 
+def test_counter_fence_reentrancy_guard_detected():
+    """
+    Reproduces the real false positive found live this session against
+    Mento Protocol's Broker (Celo, 0x1B78f6acD05e7BcB00f74863bfd8a7C264143e37):
+    its ReentrancyGuard.sol is OpenZeppelin's own v2.x-era guard shape
+    (before the boolean `_status` sentinel that later replaced it) — a
+    monotonic counter fence instead of a boolean lock:
+        modifier nonReentrant() {
+            _guardCounter += 1;
+            uint256 localCounter = _guardCounter;
+            _;
+            require(localCounter == _guardCounter, "reentrant call");
+        }
+    _guard_shape_from_before_after requires the SAME variable written
+    on BOTH sides of the placeholder (the boolean lock's set/reset
+    idiom) and its revert-capable check BEFORE the placeholder — the
+    counter is written only in `before`, and its check lives AFTER —
+    so this scored is_reentrancy_guard=False, false-positiving
+    REENTRANCY_CEI + FLASHLOAN_WINDOW on every real
+    nonReentrant-protected Broker function (swapIn, swapOut).
+
+    fakeCounterFenceGuard proves this doesn't weaken detection: it
+    ALSO increments a counter before the placeholder and snapshots it
+    into a local (same shape at a glance), but the after-side check
+    compares the snapshot against an UNRELATED variable, not the
+    counter itself — must NOT be misdetected as a guard.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("CustomReentrancyGuard.sol")
+
+    real_guard = nodes["CustomReentrancyGuard.counterFenceGuard()"]
+    fake_guard = nodes["CustomReentrancyGuard.fakeCounterFenceGuard()"]
+    assert real_guard.is_reentrancy_guard is True, "counterFenceGuard() has the real Mento/OZ v2.x guard shape — should be detected"
+    assert fake_guard.is_reentrancy_guard is False, (
+        "fakeCounterFenceGuard()'s after-check compares the wrong variable — must not false-positive"
+    )
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+
+    guarded_findings = [
+        r for r in (report.confirmed + report.likely + report.possible)
+        if "REENTRANCY_CEI" in r.constraint_type and r.path.entry == "CustomReentrancyGuard.withdrawCounterFenced()"
+    ]
+    assert not guarded_findings, (
+        f"withdrawCounterFenced() is protected by counterFenceGuard — REENTRANCY_CEI should not fire, got {guarded_findings}"
+    )
+
+    unguarded_findings = [
+        r for r in (report.confirmed + report.likely)
+        if "REENTRANCY_CEI" in r.constraint_type and r.path.entry == "CustomReentrancyGuard.notReallyGuardedCounterFence()"
+    ]
+    assert unguarded_findings, "notReallyGuardedCounterFence() is NOT really guarded — REENTRANCY_CEI must still fire"
+    print("test_counter_fence_reentrancy_guard_detected: PASS — counterFenceGuard=True, fakeCounterFenceGuard=False, "
+          "0 REENTRANCY_CEI on withdrawCounterFenced(), still", unguarded_findings[0].verdict, "on notReallyGuardedCounterFence()")
+
+
 def test_self_scoped_write_suppressed_without_weakening():
     """
     Reproduces the real renounceRole() false positive found live against
@@ -745,6 +802,7 @@ if __name__ == "__main__":
     test_custom_named_reentrancy_guard_detected()
     test_reentrancy_cei_suppressed_by_custom_guard()
     test_delegated_reentrancy_guard_detected()
+    test_counter_fence_reentrancy_guard_detected()
     test_self_scoped_write_suppressed_without_weakening()
     test_nested_mapping_outer_key_self_scoping()
     test_self_scoped_asset_move_replaces_economic_interfaces_list()
