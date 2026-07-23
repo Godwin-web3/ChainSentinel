@@ -63,22 +63,35 @@ CHAINS = {
         name="BNB Smart Chain",
         chain_id=56,
         rpc_url="https://bsc-dataseed1.binance.org",
-        explorer_api="https://api.bscscan.com/api",
-        explorer_api_key=os.getenv("BSCSCAN_API_KEY", ""),
+        # Etherscan V2's unified /v2/api endpoint covers BSC under the
+        # same ETHERSCAN_KEY as mainnet/arbitrum/optimism/base/polygon
+        # (confirmed live: chainid=56 returns real verified source with
+        # this exact key) — no separate BSCSCAN_API_KEY needed. Legacy
+        # per-chain domains (bscscan.com/api) still work as a fallback
+        # but require their own key, which most deployments don't have.
+        explorer_api="https://api.etherscan.io/v2/api",
+        explorer_api_key=ETHERSCAN_KEY,
         native_symbol="BNB"
     ),
     "avalanche": Chain(
         name="Avalanche C-Chain",
         chain_id=43114,
         rpc_url="https://api.avax.network/ext/bc/C/rpc",
-        explorer_api="https://api.snowtrace.io/api",
-        explorer_api_key=os.getenv("SNOWTRACE_API_KEY", ""),
+        # Same unification as bsc above — confirmed live: chainid=43114
+        # returns real verified source with the shared ETHERSCAN_KEY.
+        explorer_api="https://api.etherscan.io/v2/api",
+        explorer_api_key=ETHERSCAN_KEY,
         native_symbol="AVAX"
     ),
     "fantom": Chain(
         name="Fantom",
         chain_id=250,
         rpc_url="https://rpc.ftm.tools",
+        # NOT covered by Etherscan V2 (confirmed live: chainid=250 is
+        # absent from https://api.etherscan.io/v2/chainlist entirely,
+        # unlike bsc/avalanche above which ARE listed) — Fantom
+        # genuinely needs its own FTMScan key, there's no unified
+        # substitute for this one chain.
         explorer_api="https://api.ftmscan.com/api",
         explorer_api_key=os.getenv("FTMSCAN_API_KEY", ""),
         native_symbol="FTM"
