@@ -113,3 +113,91 @@ contract NameDecoyOnly {
         paymentToken.transferFrom(msg.sender, address(this), sharePrice);
     }
 }
+
+// DANGEROUS: faithful minimal reproduction of the REAL, currently-
+// deployed Cally.sol cross-function shape, confirmed live via direct
+// verification against the actual fetched source
+// (code-423n4/2022-05-cally, contracts/src/Cally.sol) — this module's
+// own primary real-world grounding case, which false-negatived before
+// this cross-function bridge existed. The division-then-multiply
+// (getDutchAuctionStrike()-equivalent) lives in a pure/view HELPER
+// with no state write of its own; the actual critical write
+// (`_vaults[vaultId] = vault;` — the real buyOption() shape) happens
+// in the CALLER, one struct-field assignment (`vault.currentStrike =
+// ...`) and one whole-struct copy later. Must fire evidence.
+contract VulnerableVaultStrike {
+    uint256 public constant AUCTION_DURATION = 1 days;
+
+    struct Vault {
+        uint256 currentStrike;
+        uint32 currentExpiration;
+    }
+    mapping(uint256 => Vault) public vaults;
+    IERC20 public paymentToken;
+
+    function getDutchAuctionStrike(uint256 startingStrike, uint32 auctionEndTimestamp) public view returns (uint256 strike) {
+        uint256 delta = auctionEndTimestamp > block.timestamp ? auctionEndTimestamp - block.timestamp : 0;
+        uint256 progress = (1e18 * delta) / AUCTION_DURATION;
+        strike = (progress * progress * startingStrike) / (1e18 * 1e18);
+    }
+
+    function buyOption(uint256 vaultId, uint256 startingStrike, uint256 premium) external {
+        Vault memory vault = vaults[vaultId];
+        vault.currentStrike = getDutchAuctionStrike(startingStrike, vault.currentExpiration);
+        vaults[vaultId] = vault;
+        paymentToken.transferFrom(msg.sender, address(this), premium);
+    }
+
+    function exercise(uint256 vaultId) external {
+        Vault memory vault = vaults[vaultId];
+        paymentToken.transferFrom(msg.sender, address(this), vault.currentStrike);
+    }
+}
+
+// Negative control: the SAME cross-function division-then-multiply
+// helper, but the caller only ever assigns the returned value to a
+// purely INFORMATIONAL local variable — never written back into any
+// state at all. Proves the cross-function bridge doesn't just
+// blanket-trust "this callee returns a multiplied division" — the
+// caller's OWN write must still be a genuine, traced dataflow link to
+// critical state. Must NOT fire.
+contract InformationalReturnDoesNotFalsePositive {
+    uint256 public constant AUCTION_DURATION = 1 days;
+    IERC20 public paymentToken;
+
+    function getDutchAuctionStrike(uint256 startingStrike, uint32 auctionEndTimestamp) public view returns (uint256 strike) {
+        uint256 delta = auctionEndTimestamp > block.timestamp ? auctionEndTimestamp - block.timestamp : 0;
+        uint256 progress = (1e18 * delta) / AUCTION_DURATION;
+        strike = (progress * progress * startingStrike) / (1e18 * 1e18);
+    }
+
+    function previewStrike(uint256 startingStrike, uint32 auctionEndTimestamp) external view returns (uint256) {
+        uint256 quoted = getDutchAuctionStrike(startingStrike, auctionEndTimestamp);
+        return quoted;
+    }
+}
+
+// Negative control: the SAME cross-function shape, but the helper's
+// own division is never followed by a multiplication at all — a
+// genuinely safe ratio, just handed back across a function boundary.
+// Proves the cross-function bridge still requires the real
+// division-THEN-multiply signature, not merely "any division exists
+// in a callee that returns a value written to critical state". Must
+// NOT fire.
+contract NoMultiplyAfterDivisionAcrossCallDoesNotFalsePositive {
+    struct Vault {
+        uint256 currentStrike;
+    }
+    mapping(uint256 => Vault) public vaults;
+
+    function getLinearStrike(uint256 startingStrike, uint256 elapsed, uint256 duration) public pure returns (uint256) {
+        uint256 progress = (elapsed * 1e18) / duration;
+        return progress;
+    }
+
+    function buyOption(uint256 vaultId, uint256 startingStrike, uint256 elapsed, uint256 duration) external {
+        Vault memory vault = vaults[vaultId];
+        vault.currentStrike = getLinearStrike(startingStrike, elapsed, duration);
+        vaults[vaultId] = vault;
+    }
+}

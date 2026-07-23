@@ -1277,13 +1277,26 @@ def _check_divide_before_multiply(path, nodes, graph_edges) -> ConstraintResult:
     produces a visible Binary DIVISION op at the caller's level at
     all).
 
-    Gated on path.sink.category == ASSET_DRAIN, matching the sibling
-    ORACLE_DEPENDENCY/FEE_ON_TRANSFER_ACCOUNTING checks' convention: an
-    entry whose own computation feeds a payment/transfer amount
-    naturally reaches its own asset-moving sink.
+    Gated on path.sink.category in (ASSET_DRAIN, STORAGE_CORRUPTION) —
+    ASSET_DRAIN matches the sibling ORACLE_DEPENDENCY/
+    FEE_ON_TRANSFER_ACCOUNTING checks' convention (an entry whose own
+    computation feeds a payment/transfer amount naturally reaches its
+    own asset-moving sink); STORAGE_CORRUPTION was added after live-
+    verifying against the actual, currently-deployed Cally.sol source:
+    the real buyOption() doesn't move any value itself — it corrupts
+    `_vaults[vaultId].currentStrike` in STORAGE, and the real asset
+    drain only happens in a SEPARATE later transaction (exercise(),
+    reading that already-corrupted price back out of storage to decide
+    how much ETH must be paid). That cross-transaction hop is outside
+    what any single-call IR trace can follow, but the corrupted write
+    itself is squarely a STORAGE_CORRUPTION-shaped consequence within
+    buyOption() — the same "corrupts accounting state now, consequence
+    lands later" reasoning core/constraints.py's own
+    _check_unprotected_initializer already gates on STORAGE_CORRUPTION
+    for.
     """
-    if path.sink.category != ASSET_DRAIN:
-        return _suppressed(path, "Not an asset drain path")
+    if path.sink.category not in (ASSET_DRAIN, STORAGE_CORRUPTION):
+        return _suppressed(path, "Not an asset-drain or storage-corruption path")
 
     entry_node = nodes.get(path.entry)
     evidence = getattr(entry_node, "unsafe_divide_before_multiply", None) if entry_node else None

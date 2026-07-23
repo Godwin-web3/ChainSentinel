@@ -99,6 +99,55 @@ def test_name_decoy_does_not_false_positive():
     print("test_name_decoy_does_not_false_positive: PASS")
 
 
+def test_cross_function_division_reaching_caller_write_detected():
+    """
+    Live-verification regression: found via direct re-check against
+    the real, currently-deployed Cally.sol source
+    (code-423n4/2022-05-cally-findings#280) — this module's own
+    primary real-world grounding case, which false-negatived before
+    this fix. The real getDutchAuctionStrike() is a pure/view helper
+    with no state write of its own; the real buyOption() assigns its
+    return value into a struct FIELD (`vault.currentStrike = ...`),
+    then writes the WHOLE STRUCT back to storage
+    (`_vaults[vaultId] = vault;`) — two hops removed from the division
+    itself, and across a function boundary. Must fire evidence.
+    """
+    nodes, *_ = _build("DivideBeforeMultiply.sol")
+    fn = nodes["VulnerableVaultStrike.buyOption(uint256,uint256,uint256)"]
+    assert fn.unsafe_divide_before_multiply is not None, "expected cross-function divide-before-multiply evidence"
+    print("test_cross_function_division_reaching_caller_write_detected: PASS —",
+          "evidence:", fn.unsafe_divide_before_multiply)
+
+
+def test_informational_cross_function_return_does_not_false_positive():
+    """
+    Critical adversarial regression: the same cross-function
+    division-then-multiply helper, but the caller only ever assigns
+    the returned value to a purely informational local — never written
+    back into any state. Proves the cross-function bridge requires a
+    genuine, traced dataflow link to critical state, not just "this
+    callee returns a multiplied division". Must NOT flag.
+    """
+    nodes, *_ = _build("DivideBeforeMultiply.sol")
+    fn = nodes["InformationalReturnDoesNotFalsePositive.previewStrike(uint256,uint32)"]
+    assert fn.unsafe_divide_before_multiply is None, f"informational-only cross-function return must not flag, got {fn.unsafe_divide_before_multiply}"
+    print("test_informational_cross_function_return_does_not_false_positive: PASS")
+
+
+def test_no_multiply_after_division_across_call_does_not_false_positive():
+    """
+    Critical adversarial regression: the same cross-function shape, but
+    the helper's own division is never followed by a multiplication at
+    all — a genuinely safe ratio, just handed back across a function
+    boundary. Proves the cross-function bridge still requires the real
+    division-THEN-multiply signature. Must NOT flag.
+    """
+    nodes, *_ = _build("DivideBeforeMultiply.sol")
+    fn = nodes["NoMultiplyAfterDivisionAcrossCallDoesNotFalsePositive.buyOption(uint256,uint256,uint256,uint256)"]
+    assert fn.unsafe_divide_before_multiply is None, f"no-multiply-after-division cross-function shape must not flag, got {fn.unsafe_divide_before_multiply}"
+    print("test_no_multiply_after_division_across_call_does_not_false_positive: PASS")
+
+
 def test_precision_loss_constraint_fires_only_on_real_vulnerable_contracts():
     """
     End-to-end: runs the full path-enumeration + constraint-validation
@@ -113,17 +162,23 @@ def test_precision_loss_constraint_fires_only_on_real_vulnerable_contracts():
     report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
     all_results = report.confirmed + report.likely + report.possible
 
-    vulnerable_findings = [
-        r for r in report.confirmed
-        if "DIVIDE_BEFORE_MULTIPLY" in r.constraint_type and r.path.entry == "VulnerableAuction.exercise(uint256,uint256,uint256)"
-    ]
-    assert vulnerable_findings, "VulnerableAuction.exercise() must fire DIVIDE_BEFORE_MULTIPLY CONFIRMED"
+    for vulnerable_entry in (
+        "VulnerableAuction.exercise(uint256,uint256,uint256)",
+        "VulnerableVaultStrike.buyOption(uint256,uint256,uint256)",
+    ):
+        vulnerable_findings = [
+            r for r in report.confirmed
+            if "DIVIDE_BEFORE_MULTIPLY" in r.constraint_type and r.path.entry == vulnerable_entry
+        ]
+        assert vulnerable_findings, f"{vulnerable_entry} must fire DIVIDE_BEFORE_MULTIPLY CONFIRMED"
 
     for safe_entry in (
         "ProtectedAuction.exercise(uint256,uint256,uint256)",
         "ProtectedMulDivLibrary.exercise(uint256,uint256,uint256)",
         "UnrelatedDivisionAndMultiplicationDoNotFalsePositive.exercise(uint256,uint256,uint256)",
         "NameDecoyOnly.exercise(uint256)",
+        "InformationalReturnDoesNotFalsePositive.previewStrike(uint256,uint32)",
+        "NoMultiplyAfterDivisionAcrossCallDoesNotFalsePositive.buyOption(uint256,uint256,uint256,uint256)",
     ):
         safe_findings = [
             r for r in all_results
@@ -132,7 +187,7 @@ def test_precision_loss_constraint_fires_only_on_real_vulnerable_contracts():
         assert not safe_findings, f"{safe_entry} must not fire DIVIDE_BEFORE_MULTIPLY, got {safe_findings}"
 
     print("test_precision_loss_constraint_fires_only_on_real_vulnerable_contracts: PASS —",
-          "VulnerableAuction CONFIRMED, all four safe/decoy contracts correctly unflagged")
+          "both vulnerable entries CONFIRMED, all six safe/decoy contracts correctly unflagged")
 
 
 if __name__ == "__main__":
@@ -141,5 +196,8 @@ if __name__ == "__main__":
     test_muldiv_library_call_suppresses_finding()
     test_unrelated_division_and_multiplication_do_not_false_positive()
     test_name_decoy_does_not_false_positive()
+    test_cross_function_division_reaching_caller_write_detected()
+    test_informational_cross_function_return_does_not_false_positive()
+    test_no_multiply_after_division_across_call_does_not_false_positive()
     test_precision_loss_constraint_fires_only_on_real_vulnerable_contracts()
     print("\nAll precision_loss_detection tests passed.")
