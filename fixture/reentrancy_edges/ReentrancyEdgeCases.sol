@@ -49,11 +49,39 @@ pragma solidity ^0.8.19;
 //    core/auth_detection.py::has_state_write_after_external_call: is a
 //    state-write node CFG-reachable FROM the external call, not merely
 //    present somewhere in the same function.
+//
+// 6. core/edges.py::_semantic_properties gave every "highlevel" call
+//    (Foo(addr).bar()-style Solidity call syntax) is_state_crossing=
+//    True unconditionally, regardless of whether bar() itself is
+//    declared view/pure — even though a view/pure call compiles to
+//    STATICCALL under the hood, the exact same EVM guarantee already
+//    carved out for an explicit .staticcall(...) above. Found live
+//    against real Velodrome's setName(), whose only external
+//    interaction is `IVoter(_voter).emergencyCouncil()` (a view call):
+//    REENTRANCY_CEI and FLASHLOAN_WINDOW both fired purely because the
+//    call was external and non-static-syntax, never checking the
+//    resolved callee's own mutability.
+interface IVoterLike {
+    function emergencyCouncil() external view returns (address);
+    function notifyRewardAmount(uint256 amount) external;
+}
+
 contract ReentrancyEdgeCases {
     uint256 public balance;
     address public token0;
     bool public locked;
     uint256 public counter;
+    address public voter;
+    string public name_;
+
+    // Unguarded on purpose: makes `voter` structurally untrusted
+    // (core/edges.py's trust resolution — a state var written by an
+    // unauthenticated function is never treated as a fixed, trusted
+    // destination), so the edges below are evaluated purely on
+    // is_state_crossing, the actual property this fixture tests.
+    function setVoter(address _voter) external {
+        voter = _voter;
+    }
 
     // DANGEROUS: entry IS its own sink — a direct, unguarded low-level
     // call with a state write in the SAME function, no intermediate
@@ -125,5 +153,27 @@ contract ReentrancyEdgeCases {
         balance = 0;
         (bool ok, ) = msg.sender.call{value: 0}("");
         require(ok, "call failed");
+    }
+
+    // Safe: the real Velodrome setName() shape — a state write with
+    // an external call right next to it, but that call
+    // (emergencyCouncil()) is view-only. STATICCALL semantics make it
+    // structurally impossible for this call to reenter or mutate
+    // state, regardless of write order or the absence of a lock. Must
+    // NOT fire REENTRANCY_CEI or FLASHLOAN_WINDOW.
+    function setNameLikeVelodrome(string calldata newName) external {
+        require(msg.sender == IVoterLike(voter).emergencyCouncil(), "not council");
+        name_ = newName;
+    }
+
+    // DANGEROUS: structurally identical to setNameLikeVelodrome() —
+    // same auth-check shape, same state write — except the external
+    // call is to a NON-view function (notifyRewardAmount is a real
+    // state-mutating call on the callee side). A naive "any highlevel
+    // call is safe" fix would wrongly suppress this too. Must still
+    // fire REENTRANCY_CEI/FLASHLOAN_WINDOW.
+    function setNameViaMutatingCall(string calldata newName) external {
+        IVoterLike(voter).notifyRewardAmount(0);
+        name_ = newName;
     }
 }

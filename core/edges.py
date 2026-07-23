@@ -152,12 +152,27 @@ def _raw_type_from_ir(ir) -> str:
 
 # ── Layer 2: Semantic inference ───────────────────────────────────
 
-def _semantic_properties(raw_type: str) -> dict:
+def _semantic_properties(raw_type: str, ir=None) -> dict:
     """
     Derive semantic flags from raw type.
     These are attacker-relevant properties, not IR labels.
+
+    A "highlevel" call whose resolved callee is declared view/pure
+    compiles to STATICCALL under the hood — the EVM itself then
+    prevents any state mutation during the call, exactly the same
+    guarantee already carved out for an explicit `.staticcall(...)`
+    (raw_type "staticcall") below. Slither's raw_type only reflects
+    the literal call SYNTAX used (`Foo(addr).bar()` is "highlevel"
+    regardless of `bar()`'s own mutability), so this is real semantic
+    inference belonging here in Layer 2, not a raw-type distinction.
+    Found live this session: real Velodrome's setName() makes exactly
+    one external call, `IVoter(_voter).emergencyCouncil()` (a view
+    function) — REENTRANCY_CEI/FLASHLOAN_WINDOW both flagged it as a
+    genuine callback-capable interaction purely because "highlevel"
+    unconditionally set is_state_crossing=True, with no reference to
+    the callee's own declared mutability at all.
     """
-    return {
+    props = {
         "internal": dict(
             is_delegation=False,
             is_external=False,
@@ -262,6 +277,13 @@ def _semantic_properties(raw_type: str) -> dict:
         uncertain=True,
         exploration_required=True,
     ))
+
+    if raw_type == "highlevel" and ir is not None:
+        fn = getattr(ir, "function", None)
+        if fn is not None and (getattr(fn, "view", False) or getattr(fn, "pure", False)):
+            props["is_state_crossing"] = False
+
+    return props
 
 
 # ── Layer 2.5: Trust resolution (data flow only, no name lists) ────
@@ -1129,7 +1151,7 @@ def extract_edges(src_id: str, f, auth_lookup: Optional[dict] = None, slither=No
                 dst_id, fname, dest_str, trusted, governance_gated = _resolve_dst(
                     ir, src_id, raw_type, f, auth_lookup, node, slither, unresolved_deps
                 )
-                props = _semantic_properties(raw_type)
+                props = _semantic_properties(raw_type, ir)
 
                 edges.append(CallEdge(
                     src=src_id,

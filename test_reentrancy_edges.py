@@ -307,6 +307,47 @@ def test_health_check_recognizes_trusted_external_dependency():
           "withdraw suppressed, withdrawUnsafe still", unsafe_findings[0].verdict)
 
 
+def test_view_call_not_misclassified_as_reentrancy_or_flashloan_vector():
+    """
+    Reproduces the real false positive found live this session against
+    Velodrome's Pool.setName(): its only external interaction,
+    `IVoter(_voter).emergencyCouncil()`, is a view function — compiles
+    to STATICCALL under the hood, the same EVM guarantee already
+    carved out for an explicit .staticcall(...). core/edges.py::
+    _semantic_properties gave every "highlevel" call is_state_crossing
+    =True unconditionally, with no reference to the resolved callee's
+    own declared mutability, so REENTRANCY_CEI and FLASHLOAN_WINDOW
+    both fired on a call structurally incapable of reentering.
+
+    Also proves this doesn't weaken detection:
+    setNameViaMutatingCall() is structurally identical (same auth-check
+    shape, same state write) except its external call is to a real
+    non-view function — must still fire.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("ReentrancyEdgeCases.sol")
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible + report.suppressed
+
+    safe_id = "ReentrancyEdgeCases.setNameLikeVelodrome(string)"
+    safe_findings = [
+        r for r in all_results
+        if r.path.entry == safe_id and ("REENTRANCY_CEI" in r.constraint_type or "FLASHLOAN_WINDOW" in r.constraint_type)
+    ]
+    assert not safe_findings, f"setNameLikeVelodrome()'s only external call is view-only — must not fire, got {safe_findings}"
+
+    dangerous_id = "ReentrancyEdgeCases.setNameViaMutatingCall(string)"
+    dangerous_findings = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == dangerous_id and ("REENTRANCY_CEI" in r.constraint_type or "FLASHLOAN_WINDOW" in r.constraint_type)
+    ]
+    assert dangerous_findings, "setNameViaMutatingCall()'s external call is a real state-mutating function — must still fire"
+    print("test_view_call_not_misclassified_as_reentrancy_or_flashloan_vector: PASS —",
+          "setNameLikeVelodrome suppressed, setNameViaMutatingCall still", dangerous_findings[0].verdict)
+
+
 if __name__ == "__main__":
     test_entry_level_cei_violation_detected()
     test_staticcall_not_misclassified_as_asset_drain_or_callback()
@@ -315,4 +356,5 @@ if __name__ == "__main__":
     test_trusted_interface_cast_destination_excludes_callback_sink()
     test_cei_check_is_order_aware_not_co_occurrence()
     test_health_check_recognizes_trusted_external_dependency()
+    test_view_call_not_misclassified_as_reentrancy_or_flashloan_vector()
     print("\nAll reentrancy_edges tests passed.")

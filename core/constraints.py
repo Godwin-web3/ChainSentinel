@@ -212,6 +212,37 @@ def _validate_path(
 
 # ── Constraint 1: Reentrancy / CEI violation ─────────────────────
 
+def _has_state_crossing_external_call(path, nodes, graph_edges) -> bool:
+    """
+    True if at least one external call reachable on this path can
+    actually mutate state during the call — core/edges.py::CallEdge.
+    is_state_crossing, NOT the coarser is_external. A "highlevel" call
+    to a view/pure function (e.g. real Velodrome's setName() calling
+    `IVoter(_voter).emergencyCouncil()`) IS external — it does leave
+    this contract — but compiles to STATICCALL under the hood, so the
+    EVM itself guarantees it can never write state or re-enter, making
+    it structurally incapable of being a reentrancy/callback vector
+    regardless of what state this function writes around it.
+
+    Deliberately narrower than the path's own coarse EXTERNAL_CALL
+    flag (core/paths.py), which several OTHER constraints (
+    ORACLE_DEPENDENCY, general asset-flow tracing) correctly still key
+    off "crosses a trust boundary at all" — reading a price from a
+    view call is exactly what THOSE checks care about. Only
+    REENTRANCY_CEI and FLASHLOAN_WINDOW specifically need "can this
+    call loop back and touch our own state," so only they call this.
+
+    Checks both the entry's own outgoing edges and every edge in the
+    path's own edge_chain — a 0-hop path (the vulnerable function is
+    both entry and sink, e.g. setName()) only has entry-level edges;
+    a multi-hop path's relevant call may be on an intermediate edge.
+    """
+    entry_edges = graph_edges.get(path.entry, [])
+    if any(e.is_external and e.is_state_crossing for e in entry_edges):
+        return True
+    return any(e.is_external and e.is_state_crossing for e in path.edge_chain)
+
+
 def _check_reentrancy_cei(path, nodes, graph_edges) -> ConstraintResult:
     """
     Detect checks-effects-interactions violation.
@@ -223,6 +254,13 @@ def _check_reentrancy_cei(path, nodes, graph_edges) -> ConstraintResult:
 
     if "STATE_BEFORE_CALL" not in flags or "EXTERNAL_CALL" not in flags:
         return _suppressed(path, "No CEI violation signal")
+
+    if not _has_state_crossing_external_call(path, nodes, graph_edges):
+        return _suppressed(
+            path,
+            "Every external call on this path is view/pure (STATICCALL under "
+            "the hood) — structurally incapable of reentering or mutating state"
+        )
 
     # Check for a structurally-real reentrancy guard (core/auth_detection.py
     # ::is_reentrancy_guard — a modifier that reads/checks a status
@@ -926,6 +964,13 @@ def _check_flashloan_window(path, nodes, graph_edges) -> ConstraintResult:
 
     if not structural_match:
         return _suppressed(path, "No flash loan window pattern — no state+external signal")
+
+    if not _has_state_crossing_external_call(path, nodes, graph_edges):
+        return _suppressed(
+            path,
+            "Every external call on this path is view/pure (STATICCALL under "
+            "the hood) — no callback window exists, nothing can execute during it"
+        )
 
     # The "no invariant enforced after" half of this check's own
     # docstring, which the structural signal above never actually
