@@ -717,28 +717,94 @@ def _params_proven_msg_sender(f) -> frozenset:
     return frozenset(out)
 
 
+def _member_base_and_field(var, f):
+    """
+    If var is a ReferenceVariable produced by a Member() operation whose
+    base resolves to one of f's own parameters, return
+    (base_parameter, field_name_str) — a field-precise identity distinct
+    from every other field of the same struct parameter. Returns None if
+    var isn't a Member-produced reference on a parameter (the caller
+    should fall back to var's own coarse whole-object identity in that
+    case).
+
+    Necessary because core/destination_origin.py's ReferenceVariable
+    resolution follows `var.points_to` straight to the BASE object,
+    collapsing every field of a struct parameter — e.g. the real Morpho
+    Blue Authorization struct's .authorizer and .authorized — to the
+    identical base `authorization` param identity. Left unfixed, a naive
+    fix that just added that coarse resolved object to known_signer
+    would be unsound: a signer-proof on ONE field (.authorizer) would
+    look like a signer-proof on EVERY field (.authorized too).
+    """
+    if not isinstance(var, ReferenceVariable):
+        return None
+    defining_op = _find_defining_op(var, f)
+    if not isinstance(defining_op, Member):
+        return None
+    base = getattr(defining_op, "variable_left", None)
+    field = getattr(defining_op, "variable_right", None)
+    if base is None or field is None:
+        return None
+    field_name = str(field)
+    base_origin, base_resolved = resolve_variable_origin(base, f)
+    if base_origin != DestinationOrigin.PARAMETER:
+        return None
+    return (base_resolved, field_name)
+
+
+def _signer_bound(raw_var, resolved_var, f, known_signer: frozenset) -> bool:
+    """
+    True if raw_var/resolved_var matches an entry recorded in
+    known_signer by _params_proven_ecrecover_signer. Entries are either
+    a bare parameter object (whole-parameter match, e.g. Dai.permit()'s
+    plain `holder`) or a (base_parameter, field_name) tuple (field-
+    precise match — see _member_base_and_field, e.g. Morpho Blue's
+    `authorization.authorizer`). Matching is done against RAW_var's own
+    Member chain, never against the already-coarsened resolved_var, so
+    that two different fields of the same struct parameter can never be
+    conflated.
+    """
+    member = _member_base_and_field(raw_var, f)
+    for p in known_signer:
+        if isinstance(p, tuple):
+            if member is not None and member[0] is p[0] and member[1] == p[1]:
+                return True
+        elif resolved_var is p:
+            return True
+    return False
+
+
 def _params_proven_ecrecover_signer(f) -> frozenset:
     """
     Scan f's own body (revert-gated nodes only, same basis as
     _params_proven_msg_sender) for a Binary EQUAL/NOT_EQUAL between one
-    of f's own parameters and the return value of a genuine ecrecover(
-    ...) SolidityCall — the real EIP-2612 permit() shape found live
-    against MakerDAO's Dai.sol:
+    of f's own parameters (or a struct field of one) and the return
+    value of a genuine ecrecover(...) SolidityCall — either the fully-
+    inlined EIP-2612 permit() shape found live against MakerDAO's
+    Dai.sol:
         require(holder == ecrecover(digest, v, r, s), "invalid-permit");
         ...
         allowance[holder][spender] = wad;
+    or the equally common single-hop local-variable idiom found live
+    against Morpho Blue's real, currently-deployed
+    setAuthorizationWithSig():
+        address signatory = ecrecover(digest, v, r, s);
+        require(authorization.authorizer == signatory, "...");
+        ...
+        isAuthorized[authorization.authorizer][authorization.authorized] = ...;
 
     An attacker cannot forge a valid ECDSA signature recovering to an
-    arbitrary address: `holder` isn't caller-chosen the way an ordinary
-    parameter is — the signature determines it. A storage write keyed
-    by such a parameter is therefore exactly as safe as one keyed by
-    msg.sender itself, just authenticated by a signature instead of the
-    transaction sender. Same role as _params_proven_msg_sender: this
-    proves nothing about general access control on its own (permit() is
-    deliberately callable by anyone — that's the whole point of a
-    gasless meta-transaction) — it only tells find_self_scoped_writes
-    which parameter is safe to treat as a caller-equivalent identity for
-    the outer/inner-key self-scoping checks below.
+    arbitrary address: `holder`/`authorization.authorizer` isn't caller-
+    chosen the way an ordinary parameter is — the signature determines
+    it. A storage write keyed by such a parameter (or struct field) is
+    therefore exactly as safe as one keyed by msg.sender itself, just
+    authenticated by a signature instead of the transaction sender. Same
+    role as _params_proven_msg_sender: this proves nothing about general
+    access control on its own (permit() is deliberately callable by
+    anyone — that's the whole point of a gasless meta-transaction) — it
+    only tells find_self_scoped_writes which parameter (or field) is
+    safe to treat as a caller-equivalent identity for the outer/inner-
+    key self-scoping checks below.
     """
     try:
         nodes = list(getattr(f, "nodes", []) or [])
@@ -753,6 +819,12 @@ def _params_proven_ecrecover_signer(f) -> frozenset:
                 continue
             for candidate, other in ((ir.variable_left, ir.variable_right), (ir.variable_right, ir.variable_left)):
                 defining_op = _find_defining_op(other, f)
+                # Unwrap a single-hop local-variable pass-through
+                # (`address signatory = ecrecover(...);` then compared
+                # later) — the real Morpho Blue idiom, as opposed to the
+                # fully-inlined `require(x == ecrecover(...))` form.
+                if isinstance(defining_op, Assignment):
+                    defining_op = _find_defining_op(defining_op.rvalue, f)
                 if not isinstance(defining_op, SolidityCall):
                     continue
                 callee = getattr(defining_op, "function", None)
@@ -760,8 +832,10 @@ def _params_proven_ecrecover_signer(f) -> frozenset:
                 if name != "ecrecover":
                     continue
                 origin, resolved = resolve_variable_origin(candidate, f)
-                if origin == DestinationOrigin.PARAMETER:
-                    out.add(resolved)
+                if origin != DestinationOrigin.PARAMETER:
+                    continue
+                member = _member_base_and_field(candidate, f)
+                out.add(member if member is not None else resolved)
     return frozenset(out)
 
 
@@ -769,10 +843,12 @@ def _signer_params_for_call(call_ir, caller_f, caller_known_signer: frozenset, c
     """
     For an InternalCall, mirrors _msg_sender_params_for_call but for
     ecrecover-proven signer parameters: if the caller passes one of its
-    own known_signer parameters straight through as an argument, the
+    own known_signer parameters (or struct fields — see
+    _member_base_and_field) straight through as an argument, the
     corresponding callee parameter is equally signer-proven — the real
     shape of a permit() that factors its actual write into a shared
-    internal _approve(holder, spender, wad) helper.
+    internal _approve(holder, spender, wad) helper, or Morpho-style a
+    setAuthorization(authorization.authorizer, ...) helper call.
     """
     try:
         args = list(getattr(call_ir, "arguments", None) or [])
@@ -781,7 +857,8 @@ def _signer_params_for_call(call_ir, caller_f, caller_known_signer: frozenset, c
         return frozenset()
     out = set()
     for param, arg in zip(params, args):
-        if any(arg is p for p in caller_known_signer):
+        origin, resolved = resolve_variable_origin(arg, caller_f)
+        if _signer_bound(arg, resolved, caller_f, caller_known_signer):
             out.add(param)
     return frozenset(out)
 
@@ -906,7 +983,7 @@ def _self_scoped_and_unsafe_writes(
                 unsafe.add(write_key)
                 continue
             key_origin, key_var = _resolve_operand(defining_index.variable_right, f, known_msg_sender)
-            if _is_msg_sender_origin(key_origin) or any(key_var is p for p in known_signer):
+            if _is_msg_sender_origin(key_origin) or _signer_bound(defining_index.variable_right, key_var, f, known_signer):
                 self_scoped.add(write_key)
                 continue
             # The innermost key isn't msg.sender, but for a NESTED
@@ -928,7 +1005,7 @@ def _self_scoped_and_unsafe_writes(
             outer_key = _outermost_index_key(defining_index, f)
             if outer_key is not None:
                 outer_origin, outer_var = _resolve_operand(outer_key, f, known_msg_sender)
-                if _is_msg_sender_origin(outer_origin) or any(outer_var is p for p in known_signer):
+                if _is_msg_sender_origin(outer_origin) or _signer_bound(outer_key, outer_var, f, known_signer):
                     self_scoped.add(write_key)
                     continue
             unsafe.add(write_key)

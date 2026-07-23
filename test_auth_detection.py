@@ -570,6 +570,61 @@ def test_ecrecover_signer_self_scoping_detected():
           "permit suppressed, corruptViaUnrelatedSignature still", dangerous_gap[0].verdict)
 
 
+def test_morpho_style_local_variable_signatory_self_scoping_detected():
+    """
+    Reproduces the real Morpho Blue setAuthorizationWithSig() false
+    positive found live this session against Morpho Blue's real,
+    currently-deployed code: the ecrecover-recovered signer is named in
+    a LOCAL VARIABLE first (`address signatory = ecrecover(...);` then
+    `require(authorization.authorizer == signatory)`), not compared
+    inline the way permit() above does — and the value proven signer-
+    bound is a STRUCT FIELD, not a bare parameter.
+    _params_proven_ecrecover_signer previously only matched the fully-
+    inlined `require(x == ecrecover(...))` shape (one hop from the
+    comparison to the SolidityCall); the local-variable indirection made
+    it miss the ecrecover call entirely, so known_signer stayed empty
+    and this exact real Morpho function false-positived
+    MISSING_HEALTH_CHECK ("modifies debt/collateral state without a
+    downstream health check").
+
+    Also proves this doesn't weaken detection via over-generalization:
+    corruptViaWrongStructField() reuses the SAME struct type and the
+    SAME local-variable-signatory idiom to prove authorization.authorizer
+    is signer-bound, but keys its write SOLELY by authorization.authorized
+    — a different, unconstrained field of the same struct parameter. A
+    field-blind fix (one that resolved any Member access on
+    `authorization` to the same coarse base-object identity, which is
+    exactly what core/destination_origin.py's ReferenceVariable
+    resolution does on its own) would wrongly suppress this too. Must
+    still fire.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("EcrecoverPermit.sol")
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible + report.suppressed
+
+    safe_id = "EcrecoverPermit.setAuthorizationWithSig(EcrecoverPermit.Authorization,uint8,bytes32,bytes32)"
+    safe_findings = [r for r in all_results if r.path.entry == safe_id and r.constraint_type != "NONE"]
+    assert not safe_findings, (
+        f"setAuthorizationWithSig()'s write is provably keyed by the ecrecover-proven "
+        f"authorization.authorizer field — no constraint should fire, got {safe_findings}"
+    )
+
+    dangerous_id = "EcrecoverPermit.corruptViaWrongStructField(EcrecoverPermit.Authorization,uint8,bytes32,bytes32)"
+    dangerous_gap = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == dangerous_id and "ACCESS_CONTROL_GAP" in r.constraint_type
+    ]
+    assert dangerous_gap, (
+        "corruptViaWrongStructField()'s write is keyed by an unrelated struct field never "
+        "proven signer-bound — ACCESS_CONTROL_GAP must still fire"
+    )
+    print("test_morpho_style_local_variable_signatory_self_scoping_detected: PASS —",
+          "setAuthorizationWithSig suppressed, corruptViaWrongStructField still", dangerous_gap[0].verdict)
+
+
 def test_balance_invariant_suppresses_flashloan_window():
     """
     Reproduces the real false positive found live this session against
@@ -903,6 +958,7 @@ if __name__ == "__main__":
     test_ownable2step_accept_ownership_suppressed()
     test_numeric_equality_constant_role_flag_detected()
     test_ecrecover_signer_self_scoping_detected()
+    test_morpho_style_local_variable_signatory_self_scoping_detected()
     test_balance_invariant_suppresses_flashloan_window()
     test_self_scoped_getter_funds_asset_move()
     test_fresh_deployment_destination_excludes_cross_function_race()
