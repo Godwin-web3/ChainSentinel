@@ -121,6 +121,8 @@ def enumerate_paths(
             accumulated_flags=set(),
             state_written=False,
             external_seen=False,
+            self_bound_params=frozenset(),
+            trusted_bound_params=frozenset(),
         )
 
     return sorted(paths, key=lambda p: p.path_score, reverse=True)
@@ -139,6 +141,8 @@ def _dfs(
     accumulated_flags: Set[str],
     state_written: bool,
     external_seen: bool,
+    self_bound_params: Set[str],
+    trusted_bound_params: Set[str],
 ):
     if depth > MAX_DEPTH:
         return
@@ -237,17 +241,65 @@ def _dfs(
     if node_unauthenticated:
         accumulated_flags = accumulated_flags | {AUTH_GAP}
 
+    # self_bound_params/trusted_bound_params (function parameters,
+    # accumulated as DFS state) are already exactly "which of
+    # current_id's OWN parameters were proven self/trusted by the
+    # specific call chain that reached it" — composed transitively
+    # hop-by-hop below, not just from the single last edge, because a
+    # proof can cross MULTIPLE internal/library calls before landing on
+    # the parameter that actually gates something. Real shape found
+    # live this session against Flaunch's PositionManager (Base):
+    # beforeSwap passes its own `poolManager` immutable into
+    # _internalSwap's `_poolManager` parameter, and _internalSwap
+    # passes THAT parameter into CurrencySettler.settle's `manager`
+    # parameter two hops later — proving `manager` trusted requires
+    # chaining both hops, not just looking at settle's own direct
+    # caller.
+
     # Walk edges
     for edge in graph_edges.get(current_id, []):
+        # Prune an edge whose underlying node is only reachable via a
+        # branch requiring one of THIS function's own parameters to
+        # NOT equal address(this), when the call chain that got us into
+        # this function PROVED that parameter was literally
+        # address(this) — see core/edges.py's module docstring above
+        # _self_gated_branches for the real Flaunch CurrencySettler.
+        # settle() false positive this fixes. Only prunes on a PROVEN
+        # contradiction (requires_self=False + proven self-bound);
+        # never prunes on missing/unknown information.
+        if edge.param_gate_requirements and any(
+            (not requires_self) and (pname in self_bound_params)
+            for pname, requires_self in edge.param_gate_requirements
+        ):
+            continue
+
         new_flags = set(accumulated_flags)
 
         if edge.is_external:
             new_flags.add(EXTERNAL_CALL)
             new_state_written = node_has_state
             new_external_seen = True
+            # A different contract's own parameters/`this` share
+            # nothing with the caller's — reset both accumulators.
+            new_self_bound_params = frozenset()
+            new_trusted_bound_params = frozenset()
         else:
             new_state_written = state_written or node_has_state
             new_external_seen = external_seen
+            # Internal/library call: compose the callee's own
+            # standalone proofs with transitively-propagated ones —
+            # a passthrough param is proven only if the caller_param
+            # it names was ITSELF already proven at this hop.
+            new_self_bound_params = edge.self_bound_params | frozenset(
+                callee_param
+                for callee_param, caller_param in edge.self_passthrough_params.items()
+                if caller_param in self_bound_params
+            )
+            new_trusted_bound_params = edge.trusted_bound_params | frozenset(
+                callee_param
+                for callee_param, caller_param in edge.trusted_passthrough_params.items()
+                if caller_param in trusted_bound_params
+            )
 
         if edge.is_delegation:
             new_flags.add(DELEGATION)
@@ -258,8 +310,30 @@ def _dfs(
         # External unresolved destinations are terminal — don't recurse
         dst = edge.dst
         if dst.startswith("external.") or dst.startswith("lowlevel.") or dst.startswith("eth."):
-            # Terminal external call — check if it's a sink pattern
-            if edge.is_value_transfer or edge.is_token_transfer:
+            # Terminal external call — check if it's a sink pattern.
+            # A transfer to a PROVEN-trusted destination (immutable/
+            # constant/auth-gated, exactly the same bar CALLBACK_SINK
+            # already requires elsewhere in this file) is not "direct
+            # theft of user funds" — the classic ASSET_DRAIN exploit
+            # pattern is an attacker REDIRECTING where funds go, which
+            # is structurally impossible when the destination can never
+            # vary. edge.trusted covers the direct case (destination is
+            # this function's own state variable/immutable); the
+            # dest_param_name + trusted_bound_params check covers a
+            # shared library function whose destination is one of ITS
+            # OWN parameters, proven fixed only by the specific call
+            # chain that reached it (see core/edges.py's module
+            # docstring above _destination_param_name for the real
+            # Flaunch CurrencySettler.settle false positive this
+            # fixes). Amount-correctness (was the right AMOUNT sent,
+            # not just to the right place) is a different question,
+            # covered by the dedicated precision-loss/fee-on-transfer/
+            # vault-share-inflation detectors — not weakened here.
+            dest_trusted = edge.trusted or (
+                edge.dest_param_name is not None
+                and edge.dest_param_name in trusted_bound_params
+            )
+            if (edge.is_value_transfer or edge.is_token_transfer) and not dest_trusted:
                 # Synthesize a terminal asset drain path
                 # Inherit state_writes from the calling node so the
                 # structural health-check overlap test in constraints.py
@@ -295,6 +369,8 @@ def _dfs(
             accumulated_flags=new_flags,
             state_written=new_state_written,
             external_seen=new_external_seen,
+            self_bound_params=new_self_bound_params,
+            trusted_bound_params=new_trusted_bound_params,
         )
 
 

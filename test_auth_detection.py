@@ -1183,6 +1183,53 @@ def test_fresh_clone_deployment_self_scoping_detected():
           "requestAction suppressed, corruptCloneOwner still", dangerous_gap[0].verdict)
 
 
+def test_self_scoped_balance_read_funds_asset_move():
+    """
+    Reproduces the real ACCESS_CONTROL_GAP false positive found live
+    this session against Flaunch's real, currently-deployed
+    FeeEscrow.withdrawFees() and ReferralEscrow.claimTokens(): amount
+    is read directly from the caller's own msg.sender-keyed balance
+    (single-level or nested), then that slot is zeroed, then the value
+    is sent to a caller-CHOSEN recipient (not necessarily msg.sender
+    itself). The caller can never move out more than what was already
+    accounted to their own slot — no auth gate needed, regardless of
+    where the funds are delivered.
+
+    withdrawTo()/withdrawTokenTo() (single-level and nested mapping)
+    must NOT fire ACCESS_CONTROL_GAP. withdrawArbitrary() (amount is a
+    free parameter, never read from any balance) and
+    withdrawFromAccount() (amount IS an Index read, but keyed by an
+    arbitrary account parameter, not msg.sender) prove the fix doesn't
+    over-suppress — both must still fire.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("SelfScopedBalanceWithdraw.sol")
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible + report.suppressed
+
+    for safe_id in (
+        "SelfScopedBalanceWithdraw.withdrawTo(address)",
+        "SelfScopedBalanceWithdraw.withdrawTokenTo(address,address)",
+    ):
+        safe_gap = [r for r in all_results if r.path.entry == safe_id and "ACCESS_CONTROL_GAP" in r.constraint_type]
+        assert not safe_gap, f"{safe_id}'s amount is provably read from the caller's own balance — ACCESS_CONTROL_GAP should not fire, got {safe_gap}"
+
+    for dangerous_id in (
+        "SelfScopedBalanceWithdraw.withdrawArbitrary(address,uint256)",
+        "SelfScopedBalanceWithdraw.withdrawFromAccount(address,address)",
+    ):
+        dangerous_gap = [
+            r for r in (report.confirmed + report.likely)
+            if r.path.entry == dangerous_id and "ACCESS_CONTROL_GAP" in r.constraint_type
+        ]
+        assert dangerous_gap, f"{dangerous_id} must still fire ACCESS_CONTROL_GAP, got none"
+
+    print("test_self_scoped_balance_read_funds_asset_move: PASS —",
+          "withdrawTo/withdrawTokenTo suppressed, withdrawArbitrary/withdrawFromAccount still flagged")
+
+
 if __name__ == "__main__":
     test_custom_named_auth_modifier_detected()
     test_real_access_control_struct_shape_detected()
@@ -1212,4 +1259,5 @@ if __name__ == "__main__":
     test_ecdsa_library_recover_signer_comparison_auth_detected()
     test_fresh_key_existence_check_self_scoping_detected()
     test_fresh_clone_deployment_self_scoping_detected()
+    test_self_scoped_balance_read_funds_asset_move()
     print("\nAll auth_detection tests passed.")

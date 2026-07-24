@@ -1789,6 +1789,60 @@ def _is_self_scoped_getter_ref(var, f, known_msg_sender: frozenset) -> bool:
     return False
 
 
+def _amount_is_self_scoped_balance_read(amount_var, f, known_msg_sender: frozenset) -> bool:
+    """
+    True if amount_var is assigned directly from an Index read of a
+    state-variable mapping whose innermost OR outermost key resolves
+    to msg.sender — `amount = balances[msg.sender]`, or a nested one,
+    `amount = allocations[msg.sender][token]` (same inner/outer bar
+    _outermost_index_key already establishes for a WRITE's key,
+    applied here to a READ instead). The plain-mapping counterpart to
+    _amount_is_self_funded_decrement's getter-function shape (Uniswap
+    V3's collect()): there the transferred amount is bounded by a
+    `position.tokensOwed0 -= amount0` decrement because the caller can
+    request an arbitrary partial amount up to what's owed; here the
+    read alone already bounds it, because `amount` IS the account's
+    entire balance, not a capped partial request.
+
+    Real shape found live this session against Flaunch's real,
+    currently-deployed ReferralEscrow.claimTokens()/claimAndSwap() and
+    FeeEscrow.withdrawFees():
+        uint amount = allocations[msg.sender][token];
+        allocations[msg.sender][token] = 0;
+        recipient.call{value: amount}('');
+    The caller can never move out more than what was already
+    accounted to their OWN slot at the moment of this read — no auth
+    gate is needed, regardless of where `recipient` sends it.
+    """
+    defining_op = _find_defining_op(amount_var, f)
+    if not isinstance(defining_op, Assignment):
+        return False
+    rvalue = defining_op.rvalue
+    if not isinstance(rvalue, ReferenceVariable):
+        return False
+
+    defining_index = None
+    for node in getattr(f, "nodes", None) or []:
+        for cand in node.irs:
+            if isinstance(cand, Index) and cand.lvalue is rvalue:
+                defining_index = cand
+                break
+        if defining_index is not None:
+            break
+    if defining_index is None:
+        return False
+
+    key_origin, _ = _resolve_operand(defining_index.variable_right, f, known_msg_sender)
+    if _is_msg_sender_origin(key_origin):
+        return True
+    outer_key = _outermost_index_key(defining_index, f)
+    if outer_key is not None:
+        outer_origin, _ = _resolve_operand(outer_key, f, known_msg_sender)
+        if _is_msg_sender_origin(outer_origin):
+            return True
+    return False
+
+
 def _amount_is_self_funded_decrement(amount_var, f, known_msg_sender: frozenset) -> bool:
     """
     True if, anywhere in f's own body, there is a compound decrement
@@ -1919,23 +1973,41 @@ def _self_scoped_and_unsafe_asset_moves(f, max_depth: int, _visited: set, known_
                 origin, _ = _resolve_operand(args[idx], f, known_msg_sender)
                 is_safe = _is_msg_sender_origin(origin)
                 # transfer(to, amount)-shaped with an unproven `to`:
-                # try the OTHER safety basis — a self-funded amount
-                # (real Uniswap V3 collect() shape). Only meaningful
-                # for the 2-arg transfer/safeTransfer shape (amount is
-                # always the argument right after `to`), not
-                # transferFrom (a 3-arg pull with a different safety
-                # story already covered above).
+                # try the OTHER safety bases — a self-funded amount,
+                # either a decrement (real Uniswap V3 collect() shape)
+                # or a direct msg.sender-keyed balance read (real
+                # ReferralEscrow.claimTokens()/claimAndSwap() shape,
+                # found live this session). Only meaningful for the
+                # 2-arg transfer/safeTransfer shape (amount is always
+                # the argument right after `to`), not transferFrom (a
+                # 3-arg pull with a different safety story already
+                # covered above).
                 if not is_safe and sig in _TRANSFER_TO_ARG_INDEX:
                     amount_idx = idx + 1
                     if amount_idx < len(args):
-                        is_safe = _amount_is_self_funded_decrement(args[amount_idx], f, known_msg_sender)
+                        is_safe = (
+                            _amount_is_self_funded_decrement(args[amount_idx], f, known_msg_sender)
+                            or _amount_is_self_scoped_balance_read(args[amount_idx], f, known_msg_sender)
+                        )
                 _record(is_safe)
             elif isinstance(ir, (LowLevelCall, Send, Transfer)):
                 dest = getattr(ir, "destination", None)
                 if dest is None:
                     continue
                 origin, _ = _resolve_operand(dest, f, known_msg_sender)
-                _record(_is_msg_sender_origin(origin))
+                is_safe = _is_msg_sender_origin(origin)
+                # Same fallback as above for a raw ETH send/call{value}
+                # to an unproven destination: real FeeEscrow.
+                # withdrawFees() shape — `_recipient` is a caller-
+                # chosen delivery address (not necessarily msg.sender
+                # itself), but `amount` is read directly from the
+                # caller's own msg.sender-keyed balance immediately
+                # before the send.
+                if not is_safe:
+                    call_value = getattr(ir, "call_value", None)
+                    if call_value is not None:
+                        is_safe = _amount_is_self_scoped_balance_read(call_value, f, known_msg_sender)
+                _record(is_safe)
 
     if max_depth > 0:
         for node in nodes:
@@ -2368,7 +2440,36 @@ def has_state_write_after_external_call(f, max_depth: int = 30) -> bool:
         visited.add(id(node))
         if getattr(node, "state_variables_written", None):
             return True
+        node_dominators = getattr(node, "dominators", None) or frozenset()
         for son in getattr(node, "sons", []) or []:
+            # Skip loop back-edges: if `son` DOMINATES `node` (every
+            # path from function entry to `node` already passed
+            # through `son`), following this edge doesn't reach new
+            # code that could run during reentrancy of the external
+            # call we started from — it only replays statements that
+            # already ran earlier in THIS SAME call (a for-loop's
+            # condition/body re-executing in the NEXT iteration, after
+            # the call already returned normally). A naive forward
+            # walk crosses this back-edge and finds the loop body's
+            # OWN pre-call state write again, misreporting it as
+            # "write follows call". Found live this session against
+            # Flaunch's real, currently-deployed ReferralEscrow.sol
+            # (Base): `claimTokens` zeroes `allocations[msg.sender]
+            # [token]` BEFORE its `_recipient.call{value:...}` in every
+            # loop iteration (the source even comments "Update
+            # allocation before transferring to prevent reentrancy
+            # attacks") — correct CEI — but the walk from the call node
+            # reached that exact write node again only by crossing the
+            # `++i; -> IFLOOP` back-edge, flagging a 99%-confidence
+            # "direct theft of user funds" REENTRANCY_CEI finding on
+            # fully CEI-compliant code. Confirmed live: node 12 (the
+            # write) is a genuine dominator of node 16 (the call) in
+            # Slither's own dominance analysis for this exact function.
+            # Detected structurally via Slither's real dominator-tree
+            # data (node.dominators), not a node_id/position heuristic,
+            # so it holds for nested or irregular loop shapes too.
+            if son in node_dominators:
+                continue
             if _reaches_state_write(son, depth - 1, visited):
                 return True
         return False

@@ -412,7 +412,63 @@ def run_slither(resolved: dict) -> dict:
 
     alias_targets: dict = {}
     alias_best_diff: dict = {}
+
+    # A name-matched alias target may not be the real package ROOT —
+    # some vendoring tools nest the fetched package one level deeper
+    # inside a version folder. Found live this session against INIT
+    # Capital's real InitCore.sol (Blast): Hardhat's dependency-compiler
+    # cache lays out `contracts/.cache/OpenZeppelin/v4.9.3/token/ERC20/
+    # IERC20.sol`, not `contracts/.cache/OpenZeppelin/token/ERC20/
+    # IERC20.sol` — the name match correctly finds `.../OpenZeppelin/`,
+    # but the import's own remainder path (`token/ERC20/IERC20.sol`)
+    # doesn't exist directly under it, only one level further in.
+    # Validate each matched target against a REAL bare import under
+    # that exact segment (join the import's own remainder onto the
+    # candidate and check the file actually exists); if it doesn't,
+    # descend one level into each of the candidate's own subdirectories
+    # and keep whichever one actually resolves a real file.
+    def _deepen_aliases() -> None:
+        for seg in list(alias_targets.keys()):
+            candidate = alias_targets[seg]
+            seg_prefix = seg + "/"
+            remainders = [p[len(seg_prefix):] for p in bare_import_paths if p.startswith(seg_prefix)]
+            if not remainders:
+                continue
+
+            def _validates(root: str) -> bool:
+                return any(os.path.isfile(os.path.join(root, r)) for r in remainders)
+
+            if _validates(candidate):
+                continue
+            try:
+                for entry in sorted(os.listdir(candidate)):
+                    sub = os.path.join(candidate, entry)
+                    if os.path.isdir(sub) and _validates(sub):
+                        alias_targets[seg] = sub
+                        break
+            except Exception:
+                pass
+
     _alias_match_pass(alias_simple, strict=False)
+
+    # Deepen the SIMPLE (1-segment, e.g. `@openzeppelin`) aliases
+    # BEFORE Tier 0 below joins a second segment onto them — Tier 0's
+    # own os.path.isdir() check needs the real, final package root
+    # (e.g. `.../openzeppelin-contracts/contracts`, not the one-level-
+    # too-shallow `.../openzeppelin-contracts`) to correctly find a
+    # subdirectory like `utils`. Found live this session against
+    # Robinhood Chain's real, currently-deployed Doppler Airlock.sol:
+    # `@openzeppelin/utils/math/Math.sol` bare-imports through the
+    # SAME `@openzeppelin` scope as `@openzeppelin/access/Ownable.sol`
+    # (already correctly resolved to `openzeppelin-contracts/contracts`
+    # elsewhere), but Tier 0 ran against the un-deepened, one-level-too-
+    # shallow scope directory, found no `utils` subdirectory there, and
+    # silently fell through to the fallback tier — which then matched
+    # the bare basename "utils" against a COMPLETELY UNRELATED
+    # vendored package's own `utils/` folder (solmate's), overriding
+    # the correct base `@openzeppelin/` remap with a wrong, more-
+    # specific one that solc's longest-prefix-wins resolution prefers.
+    _deepen_aliases()
 
     # Tier 0 (tried before the combined-token / fallback tiers below):
     # if the bare SCOPE (parts[0], e.g. `@openzeppelin`) already resolved
@@ -454,40 +510,11 @@ def run_slither(resolved: dict) -> dict:
     if unmatched:
         _alias_match_pass({k: v for k, v in alias_fallback.items() if k in unmatched}, strict=False)
 
-    # A name-matched alias target may not be the real package ROOT —
-    # some vendoring tools nest the fetched package one level deeper
-    # inside a version folder. Found live this session against INIT
-    # Capital's real InitCore.sol (Blast): Hardhat's dependency-compiler
-    # cache lays out `contracts/.cache/OpenZeppelin/v4.9.3/token/ERC20/
-    # IERC20.sol`, not `contracts/.cache/OpenZeppelin/token/ERC20/
-    # IERC20.sol` — the name match correctly finds `.../OpenZeppelin/`,
-    # but the import's own remainder path (`token/ERC20/IERC20.sol`)
-    # doesn't exist directly under it, only one level further in.
-    # Validate each matched target against a REAL bare import under
-    # that exact segment (join the import's own remainder onto the
-    # candidate and check the file actually exists); if it doesn't,
-    # descend one level into each of the candidate's own subdirectories
-    # and keep whichever one actually resolves a real file.
-    for seg in list(alias_targets.keys()):
-        candidate = alias_targets[seg]
-        seg_prefix = seg + "/"
-        remainders = [p[len(seg_prefix):] for p in bare_import_paths if p.startswith(seg_prefix)]
-        if not remainders:
-            continue
-
-        def _validates(root: str) -> bool:
-            return any(os.path.isfile(os.path.join(root, r)) for r in remainders)
-
-        if _validates(candidate):
-            continue
-        try:
-            for entry in sorted(os.listdir(candidate)):
-                sub = os.path.join(candidate, entry)
-                if os.path.isdir(sub) and _validates(sub):
-                    alias_targets[seg] = sub
-                    break
-        except Exception:
-            pass
+    # Deepen again, now covering the 2-segment (`@scope/package`)
+    # entries Tier 0 / the combined / fallback tiers above may have
+    # just added — idempotent for anything already correct (its own
+    # _validates(candidate) check short-circuits immediately).
+    _deepen_aliases()
 
     remappings = []
     for seg, full in alias_targets.items():
@@ -541,6 +568,44 @@ def run_slither(resolved: dict) -> dict:
     priority = [r for r in remappings if any(p in r for p in PRIORITY_PACKAGES)]
     rest = [r for r in remappings if r not in priority]
     remappings = priority + rest
+
+    # Prefer the AUTHORITATIVE remappings Etherscan embeds in
+    # standard-json-verified sources (settings.remappings — the exact
+    # list solc was invoked with at deploy-time compilation) over the
+    # heuristic derivation above, when available. The heuristic exists
+    # only to approximate this for verification formats that don't
+    # carry it (flattened single-file sources, older non-standard-json
+    # bundles) — for a project that DOES carry it, ground truth beats
+    # any approximation. Confirmed live against Flaunch's real, currently-
+    # deployed PositionManager2 (Base, 0xB4512b...): the heuristic maps
+    # `@optimism/interfaces/` and `@optimism/src/` onto the wrong
+    # subdirectories (there is no directory literally named "interfaces"
+    # or "src" inside the vendored optimism package at those depths) and
+    # has no rule that could ever invent `@flaunch/=src/contracts/` for a
+    # bare `@flaunch/PositionManager.sol` DIRECT-FILE import (no
+    # subdirectory segment to key off of at all) — Slither silently
+    # exits 1 with empty stdout/stderr on a fully verified, actively-
+    # used, ~$1.5M-TVL launchpad contract, and run_slither's "no output"
+    # catch-all swallows the real crytic-compile error entirely. The
+    # authoritative RHS values are relative to the project root in
+    # exactly the same way the `sources` dict keys written to disk by
+    # write_source_files are (both come from the same standard-json
+    # `sources` object), so join verbatim onto project_root — no
+    # translation needed.
+    authoritative_remaps = source_data.get("remappings") or []
+    if authoritative_remaps:
+        resolved_remaps = []
+        for entry in authoritative_remaps:
+            lhs, _, rhs = entry.partition("=")
+            lhs = lhs.strip()
+            if not lhs:
+                continue
+            rhs = rhs.strip()
+            full = os.path.join(project_root, rhs) if rhs else project_root
+            resolved_remaps.append(f"{lhs}={full.rstrip('/')}/")
+        if resolved_remaps:
+            remappings = list(dict.fromkeys(resolved_remaps))
+            log.debug(f"Using {len(remappings)} authoritative remappings from verified source metadata")
 
     log.debug(f"Remappings: {remappings[:5]}")
 

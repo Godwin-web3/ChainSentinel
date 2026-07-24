@@ -36,6 +36,16 @@ class DestinationOrigin(Enum):
     CONSTANT = "constant"
     LOCAL_VARIABLE = "local_variable"
     RETURN_VALUE = "return_value"
+    # `address(this)` (Slither: SolidityVariable named "this", usually
+    # wrapped in a TypeConversion to address) — the executing contract's
+    # own address. NOT included in auth_detection.py's _FIXED_ORIGINS:
+    # unlike a state variable/immutable/constant, "this" means a
+    # DIFFERENT concrete address depending on which contract is
+    # currently executing, so it is only meaningful for comparing two
+    # `address(this)` expressions evaluated in the SAME execution
+    # context (e.g. a library/internal call sharing the caller's own
+    # context) — never as a general access-control trust anchor.
+    SELF = "self"
     UNKNOWN = "unknown"
 
 
@@ -97,6 +107,8 @@ def _resolve_variable(var, function, seen: set) -> Tuple[DestinationOrigin, obje
         return DestinationOrigin.UNKNOWN, var
 
     if isinstance(var, SolidityVariable):
+        if str(var) == "this":
+            return DestinationOrigin.SELF, var
         return DestinationOrigin.UNKNOWN, var
 
     if isinstance(var, Constant):
