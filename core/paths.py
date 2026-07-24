@@ -237,8 +237,30 @@ def _dfs(
     if node_unauthenticated:
         accumulated_flags = accumulated_flags | {AUTH_GAP}
 
+    # Which of the callee's own parameters (current_id's parameters)
+    # did the call site that got us HERE prove were passed literally
+    # `address(this)` — see core/edges.py::_self_bound_call_args. Only
+    # the LAST edge in the chain is relevant: it's the one that actually
+    # invoked current_id.
+    incoming_self_bound = edge_chain[-1].self_bound_params if edge_chain else frozenset()
+
     # Walk edges
     for edge in graph_edges.get(current_id, []):
+        # Prune an edge whose underlying node is only reachable via a
+        # branch requiring one of THIS function's own parameters to
+        # NOT equal address(this), when the call site that got us into
+        # this function PROVED that parameter was literally
+        # address(this) — see core/edges.py's module docstring above
+        # _self_gated_branches for the real Flaunch CurrencySettler.
+        # settle() false positive this fixes. Only prunes on a PROVEN
+        # contradiction (requires_self=False + proven self-bound);
+        # never prunes on missing/unknown information.
+        if edge.param_gate_requirements and any(
+            (not requires_self) and (pname in incoming_self_bound)
+            for pname, requires_self in edge.param_gate_requirements
+        ):
+            continue
+
         new_flags = set(accumulated_flags)
 
         if edge.is_external:

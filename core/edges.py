@@ -42,8 +42,11 @@ from slither.slithir.operations import (
     Transfer,
     NewContract,
     SolidityCall,
+    Binary,
 )
+from slither.slithir.operations.binary import BinaryType
 from slither.slithir.operations.unpack import Unpack
+from slither.core.cfg.node import NodeType
 
 
 # ── Data model ────────────────────────────────────────────────────
@@ -105,6 +108,37 @@ class CallEdge:
     # (its default) for every other raw_type, where it carries no
     # meaning at all.
     return_checked: bool = False
+
+    # Call-site-specific branch reachability — see
+    # _self_gated_branches/_dominating_gate_requirements/
+    # _self_bound_call_args below. Fixes a real false positive found
+    # live against Flaunch's real, currently-deployed PositionManager
+    # (Base): a shared library function (CurrencySettler.settle) has
+    # `if (payer != address(this)) { transferFrom(...) } else {
+    # transfer(...) }` — every real call site in the project passes
+    # `payer = address(this)` literally, so the transferFrom branch is
+    # dead code there, but the old flat, branch-unaware edge list
+    # walked into it anyway and reported it as a live ASSET_DRAIN sink.
+    #
+    # param_gate_requirements: for an edge whose underlying IR node
+    # lives INSIDE this function's own body, the (parameter_name,
+    # requires_self) pairs that must ALL hold — about THIS function's
+    # OWN parameters — for that specific node to be reachable at all.
+    # requires_self=True means the branch is only reached when that
+    # parameter equals address(this); False means only when it does
+    # NOT. Empty when the node isn't dominated by any such gate.
+    param_gate_requirements: tuple = ()
+
+    # self_bound_params: only meaningful for raw_type in
+    # ("internal", "library") — the NAMES of the CALLEE's own
+    # parameters that this specific call site passed the literal
+    # expression `address(this)` for (proven via
+    # core.destination_origin's SELF origin, evaluated in the
+    # CALLER's own context — sound because an internal/library call
+    # shares execution context with its caller, so `address(this)` in
+    # both the call-site argument and the callee's own body refer to
+    # the identical address).
+    self_bound_params: frozenset = field(default_factory=frozenset)
 
 
 # ── Layer 1: IR normalization ─────────────────────────────────────
@@ -1373,6 +1407,119 @@ def _is_token_transfer_call(ir) -> bool:
         return False
 
 
+# ── Call-site-specific branch reachability ────────────────────────
+#
+# A shared internal/library function's OWN body can branch on one of
+# its OWN parameters (`if (payer != address(this)) {...} else {...}`).
+# The rest of this module extracts edges per-function, once, with no
+# notion of which specific call site produced them — so a branch that
+# is genuinely dead code for EVERY real call site in the project (every
+# caller happens to pass the same fixed argument) still shows up as a
+# live sink. These two helpers let extract_edges tag each edge with
+# (a) which of ITS OWN function's parameter-vs-self gates dominate the
+# node it came from, and (b) for an internal/library call TO another
+# function, which of THAT callee's parameters this specific call site
+# proved were passed literally `address(this)` — core/paths.py's DFS
+# then prunes an edge whose gate is directly contradicted by the
+# binding that got it there.
+
+def _self_gated_branches(f) -> list:
+    """
+    Find every IF node in f whose condition compares one of f's OWN
+    parameters against `address(this)` (DestinationOrigin.SELF). For
+    each branch (son_true / son_false), returns
+    (parameter_name, requires_self_to_reach_this_branch, branch_node).
+
+    Deliberately narrow: only recognizes a direct parameter vs SELF
+    comparison, mirroring the exact real shape found live (Flaunch's
+    CurrencySettler.settle: `payer != address(this)`) — no attempt at
+    general constant propagation beyond that one proven need.
+    """
+    from core.destination_origin import resolve_variable_origin, DestinationOrigin
+
+    gates = []
+    for node in getattr(f, "nodes", None) or []:
+        if getattr(node, "type", None) != NodeType.IF:
+            continue
+        for ir in node.irs:
+            if not isinstance(ir, Binary) or ir.type not in (BinaryType.EQUAL, BinaryType.NOT_EQUAL):
+                continue
+            for param_side, other_side in ((ir.variable_left, ir.variable_right), (ir.variable_right, ir.variable_left)):
+                try:
+                    param_origin, param_var = resolve_variable_origin(param_side, f)
+                    if param_origin != DestinationOrigin.PARAMETER:
+                        continue
+                    other_origin, _ = resolve_variable_origin(other_side, f)
+                    if other_origin != DestinationOrigin.SELF:
+                        continue
+                except Exception:
+                    continue
+
+                param_name = str(getattr(param_var, "name", "") or "")
+                if not param_name:
+                    continue
+
+                son_true = getattr(node, "son_true", None)
+                son_false = getattr(node, "son_false", None)
+                if son_true is not None:
+                    gates.append((param_name, ir.type == BinaryType.EQUAL, son_true))
+                if son_false is not None:
+                    gates.append((param_name, ir.type == BinaryType.NOT_EQUAL, son_false))
+    return gates
+
+
+def _dominating_gate_requirements(node, gates: list) -> tuple:
+    """
+    For a specific node, which of the (param, requires_self, branch)
+    gates found by _self_gated_branches actually govern reachability
+    of this node — i.e. `branch` is a genuine dominator of `node`
+    (every path from the function's entry to `node` passes through
+    that specific branch). Same dominance technique verified live for
+    the loop-back-edge reentrancy fix (son in node.dominators).
+    """
+    if not gates:
+        return ()
+    node_dominators = getattr(node, "dominators", None) or frozenset()
+    reqs = tuple(
+        (param_name, requires_self)
+        for param_name, requires_self, branch in gates
+        if branch in node_dominators
+    )
+    return reqs
+
+
+def _self_bound_call_args(ir, caller_f) -> frozenset:
+    """
+    For an InternalCall/LibraryCall ir, resolve each argument in the
+    CALLER's own context (caller_f) and return the NAMES of the
+    callee's own formal parameters (ir.function.parameters, positional)
+    that this specific call site passed the literal expression
+    `address(this)` for. Sound because an internal/library call shares
+    execution context with its caller — `this` means the identical
+    address on both sides.
+    """
+    from core.destination_origin import resolve_variable_origin, DestinationOrigin
+
+    try:
+        callee = ir.function
+        params = list(getattr(callee, "parameters", None) or [])
+        args = list(getattr(ir, "arguments", None) or [])
+    except Exception:
+        return frozenset()
+
+    bound = set()
+    for param, arg in zip(params, args):
+        try:
+            origin, _ = resolve_variable_origin(arg, caller_f)
+        except Exception:
+            continue
+        if origin == DestinationOrigin.SELF:
+            name = str(getattr(param, "name", "") or "")
+            if name:
+                bound.add(name)
+    return frozenset(bound)
+
+
 # ── Public API ────────────────────────────────────────────────────
 
 def extract_edges(src_id: str, f, auth_lookup: Optional[dict] = None, slither=None, unresolved_deps=None) -> list[CallEdge]:
@@ -1392,7 +1539,17 @@ def extract_edges(src_id: str, f, auth_lookup: Optional[dict] = None, slither=No
     """
     edges = []
 
+    try:
+        self_gates = _self_gated_branches(f)
+    except Exception:
+        self_gates = []
+
     for node in f.nodes:
+        try:
+            node_gate_reqs = _dominating_gate_requirements(node, self_gates) if self_gates else ()
+        except Exception:
+            node_gate_reqs = ()
+
         for ir in node.irs:
             try:
                 raw_type = _raw_type_from_ir(ir)
@@ -1403,6 +1560,12 @@ def extract_edges(src_id: str, f, auth_lookup: Optional[dict] = None, slither=No
                     ir, src_id, raw_type, f, auth_lookup, node, slither, unresolved_deps
                 )
                 props = _semantic_properties(raw_type, ir)
+
+                self_bound = (
+                    _self_bound_call_args(ir, f)
+                    if raw_type in ("internal", "library")
+                    else frozenset()
+                )
 
                 edges.append(CallEdge(
                     src=src_id,
@@ -1418,6 +1581,8 @@ def extract_edges(src_id: str, f, auth_lookup: Optional[dict] = None, slither=No
                         if raw_type in ("lowlevel_call", "delegatecall", "codecall", "staticcall")
                         else False
                     ),
+                    param_gate_requirements=node_gate_reqs,
+                    self_bound_params=self_bound,
                     **props,
                 ))
 
