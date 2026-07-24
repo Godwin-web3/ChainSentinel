@@ -2368,7 +2368,36 @@ def has_state_write_after_external_call(f, max_depth: int = 30) -> bool:
         visited.add(id(node))
         if getattr(node, "state_variables_written", None):
             return True
+        node_dominators = getattr(node, "dominators", None) or frozenset()
         for son in getattr(node, "sons", []) or []:
+            # Skip loop back-edges: if `son` DOMINATES `node` (every
+            # path from function entry to `node` already passed
+            # through `son`), following this edge doesn't reach new
+            # code that could run during reentrancy of the external
+            # call we started from — it only replays statements that
+            # already ran earlier in THIS SAME call (a for-loop's
+            # condition/body re-executing in the NEXT iteration, after
+            # the call already returned normally). A naive forward
+            # walk crosses this back-edge and finds the loop body's
+            # OWN pre-call state write again, misreporting it as
+            # "write follows call". Found live this session against
+            # Flaunch's real, currently-deployed ReferralEscrow.sol
+            # (Base): `claimTokens` zeroes `allocations[msg.sender]
+            # [token]` BEFORE its `_recipient.call{value:...}` in every
+            # loop iteration (the source even comments "Update
+            # allocation before transferring to prevent reentrancy
+            # attacks") — correct CEI — but the walk from the call node
+            # reached that exact write node again only by crossing the
+            # `++i; -> IFLOOP` back-edge, flagging a 99%-confidence
+            # "direct theft of user funds" REENTRANCY_CEI finding on
+            # fully CEI-compliant code. Confirmed live: node 12 (the
+            # write) is a genuine dominator of node 16 (the call) in
+            # Slither's own dominance analysis for this exact function.
+            # Detected structurally via Slither's real dominator-tree
+            # data (node.dominators), not a node_id/position heuristic,
+            # so it holds for nested or irregular loop shapes too.
+            if son in node_dominators:
+                continue
             if _reaches_state_write(son, depth - 1, visited):
                 return True
         return False

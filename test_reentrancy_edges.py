@@ -446,6 +446,53 @@ def test_local_cache_guard_read_detected_without_coincidental_match():
           "swapLikeUniswapV3 suppressed, flashLikeUniswapV3WithoutRealGuard still", coincidental_findings[0].verdict)
 
 
+def test_loop_back_edge_not_misclassified_as_write_after_call():
+    """
+    Reproduces the real REENTRANCY_CEI false positive found live this
+    session against Flaunch's real, currently-deployed
+    ReferralEscrow.sol (Base, PositionManager2's referral-fee escrow,
+    ~$1.5M TVL): claimTokens() zeroes the caller's allocation BEFORE
+    its external transfer on every loop iteration (real, deliberate
+    CEI), but a forward CFG walk from the call reached that same write
+    node again only by crossing the loop's own back-edge, misreporting
+    a 99%-confidence "direct theft of user funds" finding.
+
+    claimTokensUnsafe() proves the back-edge fix (skip an edge whose
+    target dominates the source node) doesn't blanket-suppress every
+    loop: its write happens after the call via an ordinary forward
+    edge within the SAME iteration — must still fire.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("LoopBackEdgeCEI.sol")
+
+    safe = nodes["LoopBackEdgeCEI.claimTokens(address[],address)"]
+    unsafe = nodes["LoopBackEdgeCEI.claimTokensUnsafe(address[],address)"]
+    assert safe.state_write_follows_external_call is False, (
+        "claimTokens() only reaches its pre-call write again via the loop's back-edge — must not be flagged as order-violating"
+    )
+    assert unsafe.state_write_follows_external_call is True, (
+        "claimTokensUnsafe() writes its allocation AFTER the call via an ordinary forward edge — must be flagged"
+    )
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible
+
+    safe_findings = [
+        r for r in all_results
+        if r.path.entry == "LoopBackEdgeCEI.claimTokens(address[],address)" and "REENTRANCY_CEI" in r.constraint_type
+    ]
+    assert not safe_findings, f"claimTokens() zeroes state before every external call — must not fire, got {safe_findings}"
+
+    unsafe_findings = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == "LoopBackEdgeCEI.claimTokensUnsafe(address[],address)" and "REENTRANCY_CEI" in r.constraint_type
+    ]
+    assert unsafe_findings, "claimTokensUnsafe() writes state after its external call — REENTRANCY_CEI must still fire"
+    print("test_loop_back_edge_not_misclassified_as_write_after_call: PASS —",
+          "claimTokens suppressed, claimTokensUnsafe still", unsafe_findings[0].verdict)
+
+
 if __name__ == "__main__":
     test_entry_level_cei_violation_detected()
     test_staticcall_not_misclassified_as_asset_drain_or_callback()
@@ -457,4 +504,5 @@ if __name__ == "__main__":
     test_view_call_not_misclassified_as_reentrancy_or_flashloan_vector()
     test_constant_variable_getter_not_misclassified_as_reentrancy_vector()
     test_local_cache_guard_read_detected_without_coincidental_match()
+    test_loop_back_edge_not_misclassified_as_write_after_call()
     print("\nAll reentrancy_edges tests passed.")
