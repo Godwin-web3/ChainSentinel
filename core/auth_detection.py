@@ -55,6 +55,7 @@ from slither.slithir.operations import (
 from slither.slithir.operations.binary import BinaryType
 from slither.slithir.variables.reference import ReferenceVariable
 from slither.slithir.variables.temporary import TemporaryVariable
+from slither.slithir.variables.constant import Constant
 from slither.core.cfg.node import NodeType
 
 from core.destination_origin import resolve_variable_origin, DestinationOrigin
@@ -78,6 +79,46 @@ from core.edges import (
 # an ERC-7201 namespaced-storage slot locator (see
 # _resolve_operand's docstring on OpenZeppelin v5.x's Ownable shape).
 _FIXED_ORIGINS = (DestinationOrigin.STATE_VARIABLE, DestinationOrigin.IMMUTABLE, DestinationOrigin.CONSTANT)
+
+
+def _is_meaningful_constant(var) -> bool:
+    """
+    False if var is a literal ZERO-value sentinel (address(0), 0,
+    empty bytes32/string, false/0x0) — comparing a value against a
+    literal zero is a defensive null/sanity check
+    (`require(signer != address(0))`, almost always written right next
+    to a REAL identity check), never itself evidence of a genuine
+    trust anchor. Found live this session against EcrecoverPermit's
+    own adversarial corruptViaWrongStructField() fixture: once CONSTANT
+    was added to _FIXED_ORIGINS, `signatory != address(0)` alone
+    started scoring as real signer-comparison evidence for the whole
+    function, even though the write it guards is keyed by a completely
+    different, unproven struct field — exactly the over-generalization
+    the fixture exists to catch.
+
+    Only literal Constant IR objects are checked; a `constant`-declared
+    STATE VARIABLE (e.g. `address constant ADMIN = 0x...`) is trusted
+    as-is — no real contract declares its actual admin/authority
+    constant as the zero address, and Slither doesn't expose that
+    value the same simple way a literal does.
+    """
+    if not isinstance(var, Constant):
+        return True
+    value = getattr(var, "value", None)
+    if isinstance(value, bool):
+        return value is not False
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip("0") not in ("", "x")
+    return True
+
+
+def _is_fixed_origin(origin, var) -> bool:
+    """origin in _FIXED_ORIGINS, plus the zero-constant exclusion above."""
+    if origin == DestinationOrigin.CONSTANT:
+        return _is_meaningful_constant(var)
+    return origin in _FIXED_ORIGINS
 
 
 @dataclass
@@ -225,9 +266,9 @@ def _direct_comparison_ir(node, f, known_msg_sender: frozenset = frozenset()) ->
             continue
         left_origin, left_var = _resolve_operand(ir.variable_left, f, known_msg_sender)
         right_origin, right_var = _resolve_operand(ir.variable_right, f, known_msg_sender)
-        if _is_msg_sender_origin(left_origin) and right_origin in _FIXED_ORIGINS:
+        if _is_msg_sender_origin(left_origin) and _is_fixed_origin(right_origin, right_var):
             return AuthFinding(score=3, evidence_type="direct_comparison", matched_state_var=str(right_var))
-        if _is_msg_sender_origin(right_origin) and left_origin in _FIXED_ORIGINS:
+        if _is_msg_sender_origin(right_origin) and _is_fixed_origin(left_origin, left_var):
             return AuthFinding(score=3, evidence_type="direct_comparison", matched_state_var=str(left_var))
     return None
 
@@ -243,6 +284,114 @@ def _direct_comparison_in_node(node, f, known_msg_sender: frozenset = frozenset(
     if not (node.type == NodeType.IF or _node_can_revert(node)):
         return None
     return _direct_comparison_ir(node, f, known_msg_sender)
+
+
+def _is_ecrecover_derived_call(op, max_depth: int = 4, _seen: frozenset = frozenset()) -> bool:
+    """
+    True if op is a genuine ecrecover-derived call: either a direct
+    ecrecover(...) SolidityCall, or a LibraryCall/InternalCall whose
+    callee body reaches a direct ecrecover(...) SolidityCall, possibly
+    through further nested internal/library calls — the real
+    OpenZeppelin ECDSA.recover() shape, found live this session against
+    set.wtf's real, currently-deployed LiquidityPool:
+        address signer = ethSignedMessageHash.recover(ownerSig);
+        require(signer == owner, "invalid signature");
+    `.recover(...)` (via `using ECDSA for bytes32`) compiles to a
+    LibraryCall, not a direct ecrecover(...) SolidityCall — the
+    existing direct-call check this session already built for the
+    self-scoping case (_params_proven_ecrecover_signer) never saw past
+    it. A single-hop check isn't enough either: OpenZeppelin's actual
+    recover(bytes32,bytes) doesn't call ecrecover itself — it forwards
+    through tryRecover(hash, signature) -> tryRecover(hash, v, r, s) ->
+    ecrecover(...), three internal-call hops deep (verified directly
+    against the real, currently-deployed @openzeppelin/contracts v4.9
+    ECDSA.sol pulled for set.wtf's own dependency tree). Recurses
+    through the real call graph (bounded depth, cycle-guarded via
+    _seen) rather than assuming any fixed hop count, so it holds for
+    other OZ versions and other library shapes with a different number
+    of forwarding hops. Verified structurally, by inspecting each
+    callee's own real body for a genuine ecrecover(...) call — never by
+    name-matching "ECDSA" — so any library/internal helper that
+    genuinely forwards to ecrecover is recognized the same way,
+    regardless of what it's named.
+    """
+    if isinstance(op, SolidityCall):
+        name = (getattr(getattr(op, "function", None), "name", "") or "").split("(")[0]
+        return name == "ecrecover"
+    if isinstance(op, (LibraryCall, InternalCall)):
+        if max_depth <= 0:
+            return False
+        callee = getattr(op, "function", None)
+        if callee is None or id(callee) in _seen:
+            return False
+        try:
+            callee_nodes = list(getattr(callee, "nodes", []) or [])
+        except Exception:
+            return False
+        seen = _seen | {id(callee)}
+        for node in callee_nodes:
+            for ir in node.irs:
+                if isinstance(ir, (SolidityCall, LibraryCall, InternalCall)) and _is_ecrecover_derived_call(ir, max_depth - 1, seen):
+                    return True
+        return False
+    return False
+
+
+def _resolve_through_assignment(var, f):
+    """
+    Returns the IR op that defines var, unwrapping a single-hop local-
+    variable pass-through (`address signatory = ecrecover(...);` /
+    `address signer = x.recover(sig);`) so callers reach the REAL
+    producing call (a direct ecrecover(...) SolidityCall or a
+    LibraryCall/InternalCall) rather than the Assignment that merely
+    names it — the real Morpho Blue / set.wtf local-variable idiom,
+    as opposed to inline `require(x == ecrecover(...))` /
+    `require(x == y.recover(sig))` forms.
+    """
+    defining_op = _find_defining_op(var, f)
+    if isinstance(defining_op, Assignment):
+        defining_op = _find_defining_op(defining_op.rvalue, f)
+    return defining_op
+
+
+def _signer_comparison_ir(node, f, known_msg_sender: frozenset = frozenset()) -> Optional[AuthFinding]:
+    """
+    Real access-control evidence via a signature-recovered identity: a
+    Binary EQUAL/NOT_EQUAL comparing an ecrecover-derived signer
+    (direct ecrecover(...), or OpenZeppelin's ECDSA.recover() —
+    see _is_ecrecover_derived_call) against a fixed origin (state
+    variable/immutable/constant) — the real set.wtf shape:
+        address signer = ethSignedMessageHash.recover(ownerSig);
+        require(signer == owner, "invalid signature");
+    An attacker cannot forge a valid ECDSA signature recovering to an
+    arbitrary address, so a recovered-signer comparison against a
+    fixed, trusted value is exactly as strong a access-control
+    guarantee as a direct msg.sender comparison — just authenticated
+    by an off-chain-produced signature instead of the transaction
+    sender. Distinct from _params_proven_ecrecover_signer (which
+    proves a PARAMETER is signer-bound, for find_self_scoped_writes'
+    narrower self-scoping question) — this proves the FUNCTION ITSELF
+    is access-controlled, the same role _direct_comparison_ir plays
+    for msg.sender.
+    """
+    for ir in node.irs:
+        if not isinstance(ir, Binary) or ir.type not in (BinaryType.EQUAL, BinaryType.NOT_EQUAL):
+            continue
+        for candidate, other in ((ir.variable_left, ir.variable_right), (ir.variable_right, ir.variable_left)):
+            defining_op = _resolve_through_assignment(candidate, f)
+            if not _is_ecrecover_derived_call(defining_op):
+                continue
+            other_origin, other_var = _resolve_operand(other, f, known_msg_sender)
+            if _is_fixed_origin(other_origin, other_var):
+                return AuthFinding(score=3, evidence_type="signer_comparison", matched_state_var=str(other_var))
+    return None
+
+
+def _signer_comparison_in_node(node, f, known_msg_sender: frozenset = frozenset()) -> Optional[AuthFinding]:
+    """Same node-level gating as _direct_comparison_in_node."""
+    if not (node.type == NodeType.IF or _node_can_revert(node)):
+        return None
+    return _signer_comparison_ir(node, f, known_msg_sender)
 
 
 def _external_view_comparison_ir(node, f, known_msg_sender: frozenset = frozenset()) -> Optional[AuthFinding]:
@@ -289,7 +438,7 @@ def _external_view_comparison_ir(node, f, known_msg_sender: frozenset = frozense
         if dest is None:
             continue
         dest_origin, dest_var = resolve_variable_origin(dest, f)
-        if dest_origin in _FIXED_ORIGINS:
+        if _is_fixed_origin(dest_origin, dest_var):
             return AuthFinding(score=3, evidence_type="external_view_comparison", matched_state_var=str(dest_var))
     return None
 
@@ -322,8 +471,8 @@ def _is_fixed_call_destination(var, f, max_depth: int = 3) -> bool:
     itself introduces no destination of its own to manipulate; it only
     ever returns what a fixed-basis external view call reports.
     """
-    origin, _ = resolve_variable_origin(var, f)
-    if origin in _FIXED_ORIGINS:
+    origin, resolved = resolve_variable_origin(var, f)
+    if _is_fixed_origin(origin, resolved):
         return True
     if origin != DestinationOrigin.RETURN_VALUE or max_depth <= 0:
         return False
@@ -674,6 +823,9 @@ def compute_own_auth(
         finding = _external_view_comparison_in_node(node, f, known_msg_sender)
         if finding is not None:
             return finding
+        finding = _signer_comparison_in_node(node, f, known_msg_sender)
+        if finding is not None:
+            return finding
 
     if max_depth <= 0:
         return _NONE
@@ -837,6 +989,10 @@ def _params_proven_ecrecover_signer(f) -> frozenset:
     only tells find_self_scoped_writes which parameter (or field) is
     safe to treat as a caller-equivalent identity for the outer/inner-
     key self-scoping checks below.
+
+    Also recognizes OpenZeppelin's ECDSA.recover() library-call shape
+    (see _is_ecrecover_derived_call) — not just a direct ecrecover(...)
+    call — the equally common real-world idiom.
     """
     try:
         nodes = list(getattr(f, "nodes", []) or [])
@@ -850,18 +1006,12 @@ def _params_proven_ecrecover_signer(f) -> frozenset:
             if not isinstance(ir, Binary) or ir.type not in (BinaryType.EQUAL, BinaryType.NOT_EQUAL):
                 continue
             for candidate, other in ((ir.variable_left, ir.variable_right), (ir.variable_right, ir.variable_left)):
-                defining_op = _find_defining_op(other, f)
                 # Unwrap a single-hop local-variable pass-through
                 # (`address signatory = ecrecover(...);` then compared
                 # later) — the real Morpho Blue idiom, as opposed to the
                 # fully-inlined `require(x == ecrecover(...))` form.
-                if isinstance(defining_op, Assignment):
-                    defining_op = _find_defining_op(defining_op.rvalue, f)
-                if not isinstance(defining_op, SolidityCall):
-                    continue
-                callee = getattr(defining_op, "function", None)
-                name = (getattr(callee, "name", "") or "").split("(")[0]
-                if name != "ecrecover":
+                defining_op = _resolve_through_assignment(other, f)
+                if not _is_ecrecover_derived_call(defining_op):
                     continue
                 origin, resolved = resolve_variable_origin(candidate, f)
                 if origin != DestinationOrigin.PARAMETER:

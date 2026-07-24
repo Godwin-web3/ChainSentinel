@@ -1000,6 +1000,68 @@ def test_ownable_v5_namespaced_storage_auth_detected():
           "| HardcodedConstantAdmin.withdraw", const_admin.auth_score)
 
 
+def test_ecdsa_library_recover_signer_comparison_auth_detected():
+    """
+    Live-verification finding against set.wtf's real, currently-deployed
+    LiquidityPool (0x2506CB864df6336d93A87C4af2b644fd61cF4d81):
+        address signer1 = ethSignedMessageHash.recover(ownerSig);
+        require(signer1 == owner() && signer2 == secondOwner, "Invalid signatures");
+    (inside a separate internal _validateBatchSignatures() helper,
+    delegated to from batchProcessWithdrawals()). OpenZeppelin's
+    ECDSA.recover() (via `using ECDSA for bytes32`) compiles to a
+    LibraryCall, not a direct ecrecover(...) SolidityCall — invisible to
+    both the msg.sender-only _direct_comparison_ir and the direct-
+    SolidityCall-only _params_proven_ecrecover_signer. Fixed by
+    _is_ecrecover_derived_call plus the new _signer_comparison_ir, which
+    treats a recovered-signer comparison against a fixed origin as
+    exactly as strong evidence as a direct msg.sender comparison.
+
+    A first version of this fix checked only ONE call hop below
+    recover() for a direct ecrecover(...) SolidityCall and passed a
+    simplified single-hop fixture — but still false-positived on the
+    REAL contract: OpenZeppelin's actual recover(bytes32,bytes) never
+    calls ecrecover itself, it forwards through
+    tryRecover(hash, signature) -> tryRecover(hash, v, r, s) ->
+    ecrecover(...), three internal-call hops deep (verified directly
+    against @openzeppelin/contracts v4.9.x ECDSA.sol, pulled live as
+    part of set.wtf's own dependency tree). The library in this fixture
+    reproduces that real depth, and _is_ecrecover_derived_call was
+    fixed to recurse through the real call graph instead of assuming a
+    fixed hop count.
+
+    batchProcessWithdrawalsUnsafe and batchProcessWithdrawalsZeroCheckOnly
+    prove this doesn't over-generalize: no check at all, and the common
+    `signer != address(0)` defensive null-check alone (which ANY
+    attacker-forged-but-internally-valid signature trivially passes —
+    the exact zero-constant regression this fix also closed in
+    _direct_comparison_ir/_signer_comparison_ir/_external_view_
+    comparison_ir/_is_fixed_call_destination, found via the pre-existing
+    corruptViaWrongStructField adversarial fixture in EcrecoverPermit.sol
+    once DestinationOrigin.CONSTANT was added to _FIXED_ORIGINS earlier
+    this session), must NOT be treated as auth evidence.
+    """
+    nodes, *_ = _build("ECDSALibraryRecover.sol")
+
+    validate = nodes["LiquidityPool._validateBatchSignatures(address[],bytes,bytes)"]
+    assert validate.auth_score >= 3, f"expected ECDSA.recover()-signer comparison to score as real auth evidence, got {validate.auth_score}"
+    assert validate.auth_state == "AUTHENTICATED"
+    assert validate.structural_auth_var == "owner_"
+
+    safe = nodes["LiquidityPool.batchProcessWithdrawals(address[],uint256[],bytes,bytes)"]
+    assert safe.auth_score >= 3, f"expected delegated signer-comparison evidence to score via internal_call_delegated, got {safe.auth_score}"
+    assert safe.auth_state == "AUTHENTICATED"
+
+    unsafe = nodes["LiquidityPool.batchProcessWithdrawalsUnsafe(address[],uint256[])"]
+    assert unsafe.auth_score == 0, f"unguarded function must not score, got {unsafe.auth_score}"
+
+    zero_check_only = nodes["LiquidityPool.batchProcessWithdrawalsZeroCheckOnly(address[],uint256[],bytes)"]
+    assert zero_check_only.auth_score == 0, (
+        f"signer != address(0) alone is a null-check, not a real trust-anchor comparison — must not score as auth, got {zero_check_only.auth_score}"
+    )
+    print("test_ecdsa_library_recover_signer_comparison_auth_detected: PASS —",
+          "batchProcessWithdrawals", safe.auth_score, "| Unsafe/ZeroCheckOnly correctly unscored")
+
+
 if __name__ == "__main__":
     test_custom_named_auth_modifier_detected()
     test_real_access_control_struct_shape_detected()
@@ -1026,4 +1088,5 @@ if __name__ == "__main__":
     test_external_view_return_verdict_auth_detected()
     test_ownable_internal_getter_comparison_auth_detected()
     test_ownable_v5_namespaced_storage_auth_detected()
+    test_ecdsa_library_recover_signer_comparison_auth_detected()
     print("\nAll auth_detection tests passed.")
