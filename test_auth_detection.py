@@ -1062,6 +1062,127 @@ def test_ecdsa_library_recover_signer_comparison_auth_detected():
           "batchProcessWithdrawals", safe.auth_score, "| Unsafe/ZeroCheckOnly correctly unscored")
 
 
+def test_fresh_key_existence_check_self_scoping_detected():
+    """
+    Reproduces the real ACCESS_CONTROL_GAP + UNPROTECTED_INITIALIZER
+    false positive found live this session against Asymmetry USDaf's
+    real, currently-deployed BorrowerOperations.sol (a Liquity V2
+    fork):
+        troveId = keccak256(msg.sender, owner, ownerIndex);
+        _requireTroveDoesNotExists(troveManager, troveId);  // reverts if it exists
+        ...
+        _setAddManager(troveId, addManager);  // addManagerOf[troveId] = addManager
+    `troveId` is neither msg.sender nor a fresh CREATE2/clone address —
+    a plain computed key — but the explicit revert-gated existence
+    check proves no prior write could have touched it, exactly the
+    same "nothing else could have a claim on this yet" guarantee
+    msg.sender-keying already gets credit for. The check
+    (_requireTroveDoesNotExists) and the write (_setAddManager) are two
+    DIFFERENT internal calls made from the SAME entry function, not a
+    direct caller/callee relationship — previously invisible to
+    find_self_scoped_writes.
+
+    corruptExistingManager (writes with an id never checked anywhere)
+    and updateExistingManager (the critical adversarial regression case
+    — its check proves the record DOES exist, the OPPOSITE claim of
+    freshness) prove this doesn't over-generalize: both must NOT be
+    self-scoped — ACCESS_CONTROL_GAP must still fire.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("FreshKeySelfScope.sol")
+
+    safe = nodes["FreshKeySelfScope.openPosition(address,uint256,address,address,address)"]
+    assert safe.self_scoped_write_keys == {
+        ("addManagerOf", ()),
+        ("removeManagerReceiverOf", ("manager",)),
+        ("removeManagerReceiverOf", ("receiver",)),
+    }, f"expected all three writes self-scoped via the freshness proof, got {safe.self_scoped_write_keys}"
+
+    corrupt = nodes["FreshKeySelfScope.corruptExistingManager(uint256,address)"]
+    assert corrupt.self_scoped_write_keys == set(), (
+        "id is never checked for freshness anywhere — must NOT be self-scoped"
+    )
+
+    update = nodes["FreshKeySelfScope.updateExistingManager(uint256,address)"]
+    assert update.self_scoped_write_keys == set(), (
+        "the check here proves the record ALREADY EXISTS (opposite polarity) — must NOT be treated as a freshness proof"
+    )
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible + report.suppressed
+
+    safe_gap = [r for r in all_results if r.path.entry == safe.id and "ACCESS_CONTROL_GAP" in r.constraint_type]
+    assert not safe_gap, f"openPosition should be suppressed, got {safe_gap}"
+
+    corrupt_gap = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == corrupt.id and "ACCESS_CONTROL_GAP" in r.constraint_type
+    ]
+    assert corrupt_gap, "corruptExistingManager must still fire ACCESS_CONTROL_GAP"
+
+    update_gap = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == update.id and "ACCESS_CONTROL_GAP" in r.constraint_type
+    ]
+    assert update_gap, "updateExistingManager (opposite-polarity check) must still fire ACCESS_CONTROL_GAP"
+
+    print("test_fresh_key_existence_check_self_scoping_detected: PASS —",
+          "openPosition suppressed, corruptExistingManager/updateExistingManager still",
+          corrupt_gap[0].verdict)
+
+
+def test_fresh_clone_deployment_self_scoping_detected():
+    """
+    Reproduces the real ACCESS_CONTROL_GAP + UNPROTECTED_INITIALIZER +
+    MISSING_HEALTH_CHECK false positive found live this session against
+    NUVA's real, currently-deployed DedicatedVaultRouter.sol:
+        address redemptionProxyAddress = Clones.clone(redemptionProxyImplementation);
+        ...
+        redemptionProxyToFunds[redemptionProxyAddress] = UserFunds({user: msg.sender, ...});
+    A mapping key that IS the address of a contract just deployed this
+    same transaction can't have any prior owner. The library in this
+    fixture reproduces the REAL OpenZeppelin Clones.sol shape (the
+    real two-hop clone(address) -> clone(address,uint256) forwarding
+    and the real inline-assembly `create` opcode) — a first version of
+    this fix checked only the opaque-inline-asm-text shape and missed
+    the real, structured-IR form this exact solc/via-ir build actually
+    produces, so this fixture reproduces the real depth deliberately.
+
+    corruptCloneOwner (writes keyed by a caller-supplied address, never
+    a freshly deployed clone) proves this doesn't over-generalize: must
+    NOT be self-scoped — ACCESS_CONTROL_GAP must still fire.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("FreshCloneSelfScope.sol")
+
+    safe = nodes["FreshCloneSelfScope.requestAction()"]
+    assert safe.self_scoped_write_keys == {("cloneToOwner", ())}, (
+        f"expected cloneToOwner write self-scoped via the fresh-clone proof, got {safe.self_scoped_write_keys}"
+    )
+
+    dangerous = nodes["FreshCloneSelfScope.corruptCloneOwner(address,address)"]
+    assert dangerous.self_scoped_write_keys == set(), (
+        "instance is caller-supplied, never a freshly deployed clone — must NOT be self-scoped"
+    )
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible + report.suppressed
+
+    safe_gap = [r for r in all_results if r.path.entry == safe.id and "ACCESS_CONTROL_GAP" in r.constraint_type]
+    assert not safe_gap, f"requestAction should be suppressed, got {safe_gap}"
+
+    dangerous_gap = [
+        r for r in (report.confirmed + report.likely)
+        if r.path.entry == dangerous.id and "ACCESS_CONTROL_GAP" in r.constraint_type
+    ]
+    assert dangerous_gap, "corruptCloneOwner must still fire ACCESS_CONTROL_GAP"
+
+    print("test_fresh_clone_deployment_self_scoping_detected: PASS —",
+          "requestAction suppressed, corruptCloneOwner still", dangerous_gap[0].verdict)
+
+
 if __name__ == "__main__":
     test_custom_named_auth_modifier_detected()
     test_real_access_control_struct_shape_detected()
@@ -1089,4 +1210,6 @@ if __name__ == "__main__":
     test_ownable_internal_getter_comparison_auth_detected()
     test_ownable_v5_namespaced_storage_auth_detected()
     test_ecdsa_library_recover_signer_comparison_auth_detected()
+    test_fresh_key_existence_check_self_scoping_detected()
+    test_fresh_clone_deployment_self_scoping_detected()
     print("\nAll auth_detection tests passed.")

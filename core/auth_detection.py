@@ -45,6 +45,7 @@ session), not in analysis/enricher.py's separate subprocess+text-parsing
 pipeline, which never has real IR to inspect.
 """
 
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -904,21 +905,39 @@ def _params_proven_msg_sender(f) -> frozenset:
 def _member_base_and_field(var, f):
     """
     If var is a ReferenceVariable produced by a Member() operation whose
-    base resolves to one of f's own parameters, return
-    (base_parameter, field_name_str) — a field-precise identity distinct
-    from every other field of the same struct parameter. Returns None if
-    var isn't a Member-produced reference on a parameter (the caller
+    base resolves to one of f's own parameters OR local variables,
+    return (base, field_name_str) — a field-precise identity distinct
+    from every other field of the same struct. Returns None if var
+    isn't a Member-produced reference on a parameter/local (the caller
     should fall back to var's own coarse whole-object identity in that
     case).
 
     Necessary because core/destination_origin.py's ReferenceVariable
     resolution follows `var.points_to` straight to the BASE object,
-    collapsing every field of a struct parameter — e.g. the real Morpho
-    Blue Authorization struct's .authorizer and .authorized — to the
+    collapsing every field of a struct — e.g. the real Morpho Blue
+    Authorization struct's .authorizer and .authorized — to the
     identical base `authorization` param identity. Left unfixed, a naive
     fix that just added that coarse resolved object to known_signer
     would be unsound: a signer-proof on ONE field (.authorizer) would
     look like a signer-proof on EVERY field (.authorized too).
+
+    LOCAL_VARIABLE bases (originally excluded — this helper only
+    accepted PARAMETER) are needed for the real Liquity V2 shape found
+    live this session against Asymmetry USDaf's real
+    BorrowerOperations.sol: `vars.troveId`, a field of a LOCAL struct
+    (`LocalVariables_openTrove memory vars;`) computed inside
+    _openTrove itself, not passed in as a parameter — each READ of
+    `vars.troveId` produces a fresh Member op and fresh
+    ReferenceVariable object, so without resolving through to the
+    stable underlying `vars` local (never itself reassigned, so
+    resolve_variable_origin's own fallback returns it unchanged) two
+    different reads of the same conceptual value would never compare
+    equal. Safe to relax for the existing known_signer path too: what
+    actually gets stored into known_signer is still gated by
+    _params_proven_ecrecover_signer's own explicit PARAMETER-only
+    check at the point of storage — this only affects the matching
+    side, and known_signer can never contain a LOCAL_VARIABLE-based
+    tuple in the first place, so no new match becomes possible there.
     """
     if not isinstance(var, ReferenceVariable):
         return None
@@ -931,7 +950,7 @@ def _member_base_and_field(var, f):
         return None
     field_name = str(field)
     base_origin, base_resolved = resolve_variable_origin(base, f)
-    if base_origin != DestinationOrigin.PARAMETER:
+    if base_origin not in (DestinationOrigin.PARAMETER, DestinationOrigin.LOCAL_VARIABLE):
         return None
     return (base_resolved, field_name)
 
@@ -1045,9 +1064,295 @@ def _signer_params_for_call(call_ir, caller_f, caller_known_signer: frozenset, c
     return frozenset(out)
 
 
+def _is_default_enum_member(var, f) -> bool:
+    """
+    True if var is produced by a Member() operation reading a member of
+    an ENUM TYPE (not an enum instance) whose declared position is
+    index 0 — Solidity's own default/zero value for that enum, the
+    natural "unset/empty/nonexistent" sentinel, exactly analogous to
+    comparing an address against address(0) or a bool against false.
+    Structural (checked against the enum's own declared `.values` list
+    order), never by name-matching a string like "nonExistent" —
+    different codebases name this member differently (nonExistent,
+    None, Unset, Uninitialized, ...); what's invariant is that it's
+    declared first.
+    """
+    defining_op = _find_defining_op(var, f)
+    if not isinstance(defining_op, Member):
+        return False
+    enum_type = getattr(defining_op, "variable_left", None)
+    values = getattr(enum_type, "values", None)
+    if not values:
+        return False
+    member_var = getattr(defining_op, "variable_right", None)
+    member_name = getattr(member_var, "name", None) or str(member_var)
+    return values[0] == member_name
+
+
+def _branch_reverts(node) -> bool:
+    """
+    True if `node` (a single IF-son, not both) directly contains a
+    revert-shaped SolidityCall in its OWN irs — require(...)/assert(...)
+    /revert(...). Deliberately narrower than core.edges._node_can_revert
+    (which checks whether EITHER son of an IF can revert, useful for
+    "is this comparison a real guard at all" but not for "which
+    SPECIFIC branch reverts", which is exactly what distinguishes a
+    freshness proof (`if (exists) revert;` — passing proves NOT
+    existing) from its opposite (`if (!exists) revert;` — passing
+    proves existing, the opposite claim).
+    """
+    try:
+        for ir in getattr(node, "irs", None) or []:
+            if isinstance(ir, SolidityCall):
+                name = str(getattr(ir.function, "name", "") or "").lower()
+                if name.startswith("require") or name.startswith("assert") or name.startswith("revert"):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _params_proven_fresh_key(f, max_depth: int = 3, _visited: Optional[set] = None) -> frozenset:
+    """
+    Scan f's own body (revert-gated nodes only, same basis as
+    _params_proven_msg_sender/_params_proven_ecrecover_signer) for the
+    real Liquity V2 "does not exist yet" shape, found live this session
+    against Asymmetry USDaf's real, currently-deployed
+    BorrowerOperations.sol:
+        Status status = troveManager.getTroveStatus(_troveId);
+        if (status != Status.nonExistent) revert TroveExists();
+        ...
+        _setAddManager(_troveId, _addManager);   // addManagerOf[_troveId] = _addManager
+    `_troveId` here isn't msg.sender-bound and isn't itself a fresh
+    CREATE2/clone deployment — it's a plain computed uint256 — but the
+    explicit revert-gated existence check, structurally identical in
+    spirit to a one-time-latch (core/initializer_detection.py) except
+    keyed by an arbitrary value instead of a single boolean flag, PROVES
+    no prior write could have touched whatever this key indexes. A
+    write keyed by such a value is exactly as safe as one keyed by
+    msg.sender itself — nothing else in existence can have any prior
+    claim on a slot proven, in the same call, not to exist yet.
+
+    Recognizes EITHER polarity: `status != DEFAULT` gated by a
+    true-branch revert, or `status == DEFAULT` gated by a false-branch
+    revert — both prove status ends up equal to the enum's default
+    ("unset") member for execution to continue. The OPPOSITE polarity
+    (proving the record DOES already exist) is never matched — that's
+    a completely different claim.
+
+    Proves freshness for a CALL ARGUMENT that resolves to either one of
+    f's own parameters or one of f's own LOCAL variables — deliberately
+    broader than _params_proven_ecrecover_signer's parameter-only
+    restriction, because the real shape above splits the check and the
+    write across two DIFFERENT internal calls made from the SAME
+    caller (_openTrove calls _requireTroveDoesNotExists, then
+    separately calls _setAddManager) rather than one function
+    delegating straight into the next: `vars.troveId` is a LOCAL
+    variable of _openTrove, not a parameter of it, and it's exactly
+    that local variable's freshness — proven via a call _openTrove
+    itself makes — that needs to reach the SIBLING call's argument.
+    Recurses (bounded, cycle-guarded) into f's own internal calls for
+    exactly this reason: if a callee's own body proves ONE OF ITS OWN
+    PARAMETERS fresh, the caller's corresponding ARGUMENT at that call
+    site is equally proven, in the caller's own scope — the same
+    "does the callee prove something about what I passed it"
+    propagation _resolve_operand's RETURN_VALUE unwrap already uses for
+    msg.sender, just for a different fact and in the opposite
+    (interprocedural, not just intra-function) direction
+    find_self_scoped_writes' own downward known_fresh threading uses.
+    """
+    try:
+        nodes = list(getattr(f, "nodes", []) or [])
+    except Exception:
+        return frozenset()
+    if _visited is None:
+        _visited = set()
+    fid = id(f)
+    if fid in _visited:
+        return frozenset()
+    _visited = _visited | {fid}
+
+    out = set()
+    for node in nodes:
+        if getattr(node, "type", None) != NodeType.IF:
+            continue
+        for ir in node.irs:
+            if not isinstance(ir, Binary) or ir.type not in (BinaryType.EQUAL, BinaryType.NOT_EQUAL):
+                continue
+            for status_side, sentinel_side in ((ir.variable_left, ir.variable_right), (ir.variable_right, ir.variable_left)):
+                if not _is_default_enum_member(sentinel_side, f):
+                    continue
+                true_reverts = _branch_reverts(node.son_true) if getattr(node, "son_true", None) is not None else False
+                false_reverts = _branch_reverts(node.son_false) if getattr(node, "son_false", None) is not None else False
+                proves_fresh = (
+                    (ir.type == BinaryType.NOT_EQUAL and true_reverts) or
+                    (ir.type == BinaryType.EQUAL and false_reverts)
+                )
+                if not proves_fresh:
+                    continue
+                defining_op = _resolve_through_assignment(status_side, f)
+                if not isinstance(defining_op, (HighLevelCall, InternalCall, LibraryCall)):
+                    continue
+                for arg in list(getattr(defining_op, "arguments", None) or []):
+                    # Store the RAW argument identity, not
+                    # resolve_variable_origin's resolved form —
+                    # resolution deliberately walks THROUGH a local
+                    # variable's own assignment chain to find its
+                    # ultimate source (the real Liquity V2 shape:
+                    # `troveId = keccak256(msg.sender, owner,
+                    # ownerIndex)` resolves past `troveId` itself,
+                    # landing on the hash computation, not something
+                    # comparable to a later bare reference to
+                    # `troveId`). Confirmed live: Slither represents a
+                    # plain LocalVariable with ONE stable object
+                    # identity across every read of it within the same
+                    # function — msg.sender/known_signer's PARAMETER-
+                    # only restriction doesn't apply here since a
+                    # freshness proof is about THIS SPECIFIC value,
+                    # never about "is this a caller-supplied identity"
+                    # the way signer/msg.sender-binding is.
+                    member = _member_base_and_field(arg, f)
+                    out.add(member if member is not None else arg)
+
+    if max_depth > 0:
+        for node in nodes:
+            for ir in node.irs:
+                if not (isinstance(ir, InternalCall) and getattr(ir, "function", None) is not None):
+                    continue
+                callee = ir.function
+                callee_fresh = _params_proven_fresh_key(callee, max_depth - 1, _visited)
+                if not callee_fresh:
+                    continue
+                callee_params = list(getattr(callee, "parameters", None) or [])
+                args = list(getattr(ir, "arguments", None) or [])
+                for idx, param in enumerate(callee_params):
+                    if param not in callee_fresh or idx >= len(args):
+                        continue
+                    arg = args[idx]
+                    member = _member_base_and_field(arg, f)
+                    out.add(member if member is not None else arg)
+    return frozenset(out)
+
+
+def _fresh_bound(raw_var, resolved_var, f, known_fresh: frozenset) -> bool:
+    """
+    Same shape as _signer_bound, but matches against RAW variable
+    identity (in addition to the resolved form) — known_fresh entries
+    are stored as raw arguments (see _params_proven_fresh_key), since
+    resolve_variable_origin's resolution deliberately walks THROUGH a
+    computed local variable's own assignment chain to its ultimate
+    source, past the very identity that needs to be recognized again
+    at each later use site.
+    """
+    member = _member_base_and_field(raw_var, f)
+    for p in known_fresh:
+        if isinstance(p, tuple):
+            if member is not None and member[0] is p[0] and member[1] == p[1]:
+                return True
+        elif raw_var is p or resolved_var is p:
+            return True
+    return False
+
+
+def _fresh_params_for_call(call_ir, caller_f, caller_known_fresh: frozenset, callee) -> frozenset:
+    """Mirrors _signer_params_for_call, for freshness-proven parameters."""
+    try:
+        args = list(getattr(call_ir, "arguments", None) or [])
+        params = list(getattr(callee, "parameters", None) or [])
+    except Exception:
+        return frozenset()
+    out = set()
+    for param, arg in zip(params, args):
+        origin, resolved = resolve_variable_origin(arg, caller_f)
+        if _fresh_bound(arg, resolved, caller_f, caller_known_fresh):
+            out.add(param)
+    return frozenset(out)
+
+
+def _is_fresh_clone_call(op, max_depth: int = 4, _seen: frozenset = frozenset()) -> bool:
+    """
+    True if op is a call whose callee's own body (possibly through
+    further nested internal/library calls, recursed the same way
+    _is_ecrecover_derived_call already does) deploys a genuine fresh
+    EIP-1167 minimal-proxy clone via a real `create`/`create2` opcode
+    inside an inline-assembly block, assigning the callee's OWN return
+    variable — the real OpenZeppelin Clones.clone()/cloneDeterministic()
+    shape, found live this session against NUVA's real, currently-
+    deployed DedicatedVaultRouter.sol:
+        address redemptionProxyAddress = Clones.clone(redemptionProxyImplementation);
+        ...
+        redemptionProxyToFunds[redemptionProxyAddress] = UserFunds({user: msg.sender, ...});
+    `Clones.clone(address)` forwards one hop to
+    `clone(address,uint256)`, whose real body is
+    `assembly { instance := create(value, 0x09, 0x37) }` — verified
+    directly against the real, currently-vendored
+    @openzeppelin/contracts v5.4.0 Clones.sol pulled as part of NUVA's
+    own dependency tree, not by name-matching "Clones". A mapping key
+    that IS the address of a contract just deployed this same
+    transaction can't have any prior owner — exactly the same "nothing
+    else could have a claim on this yet" guarantee
+    core.invariants._fresh_deployment_destinations already relies on
+    for the raw create2-factory pattern, extended here to the
+    library-wrapped minimal-proxy case that pattern doesn't cover (no
+    type(X).creationCode is ever referenced — Clones hardcodes the
+    EIP-1167 bytecode directly).
+
+    Two real IR shapes for the SAME assembly block, both confirmed
+    live: this exact solc/via-ir build decomposes it into STRUCTURED
+    IR — a `SolidityCall create(uint256,uint256,uint256)` whose own
+    lvalue is a fresh TEMPORARY, immediately assigned (via a separate
+    Assignment in the SAME node) into the real named return variable
+    (`instance`) — the ASSEMBLY node itself carries no `inline_asm`
+    text at all in this shape. Older/different solc builds instead
+    leave the block fully opaque (an ASSEMBLY node with real
+    `inline_asm` text and no structured children) — the same two-shape
+    split core.invariants._fresh_deployment_destinations already
+    documents for the raw create2-factory pattern; both are checked
+    here for the same reason.
+    """
+    if isinstance(op, (HighLevelCall, InternalCall, LibraryCall)):
+        if max_depth <= 0:
+            return False
+        callee = getattr(op, "function", None)
+        if callee is None or id(callee) in _seen:
+            return False
+        seen = _seen | {id(callee)}
+        try:
+            callee_nodes = list(getattr(callee, "nodes", []) or [])
+            returns = list(getattr(callee, "returns", None) or [])
+        except Exception:
+            return False
+        return_names = {getattr(r, "name", None) for r in returns if getattr(r, "name", None)}
+        for node in callee_nodes:
+            if str(getattr(node, "type", "")) == "NodeType.ASSEMBLY":
+                asm_text = getattr(node, "inline_asm", "") or ""
+                for m in re.finditer(r'\b([A-Za-z_$][A-Za-z0-9_$]*)\s*:=\s*create2?\s*\(', asm_text):
+                    if m.group(1) in return_names:
+                        return True
+            for ir in node.irs:
+                if isinstance(ir, SolidityCall):
+                    name = str(getattr(ir.function, "name", "") or "")
+                    if name.startswith("create2(") or name.startswith("create("):
+                        for other in node.irs:
+                            if isinstance(other, Assignment) and other.rvalue is ir.lvalue:
+                                if getattr(other.lvalue, "name", None) in return_names:
+                                    return True
+                if isinstance(ir, (HighLevelCall, InternalCall, LibraryCall)) and _is_fresh_clone_call(ir, max_depth - 1, seen):
+                    return True
+    return False
+
+
+def _is_fresh_clone_key(var, f) -> bool:
+    """True if var's defining call (possibly through one Assignment
+    hop, the real `address x = Clones.clone(...)` idiom) is a genuine
+    fresh-clone deployment — see _is_fresh_clone_call."""
+    return _is_fresh_clone_call(_resolve_through_assignment(var, f))
+
+
 def find_self_scoped_writes(
     f, max_depth: int = 3, _visited: Optional[set] = None,
     known_msg_sender: frozenset = frozenset(), known_signer: frozenset = frozenset(),
+    known_fresh: frozenset = frozenset(),
 ) -> Set[tuple]:
     """
     Walk f's own body and (bounded, parameter-binding-aware) recursion
@@ -1077,17 +1382,27 @@ def find_self_scoped_writes(
     as self-scoped. This is what keeps the check sink-specific instead
     of degrading into "any msg.sender comparison anywhere counts."
 
+    Also, since this session, a write keyed by a value PROVEN fresh —
+    either a parameter an explicit revert-gated existence check has
+    shown cannot yet have any record (known_fresh, the real Liquity V2
+    troveId shape — see _params_proven_fresh_key), or the address of an
+    EIP-1167 minimal-proxy clone deployed this same call (see
+    _is_fresh_clone_key) — is exactly as safe as one keyed by
+    msg.sender: nothing else in existence could have any prior claim on
+    either.
+
     Public entry point — does the conservative subtraction described in
     _self_scoped_and_unsafe_writes below.
     """
     self_scoped, unsafe = _self_scoped_and_unsafe_writes(
-        f, max_depth, _visited if _visited is not None else set(), known_msg_sender, known_signer
+        f, max_depth, _visited if _visited is not None else set(), known_msg_sender, known_signer, known_fresh
     )
     return self_scoped - unsafe
 
 
 def _self_scoped_and_unsafe_writes(
     f, max_depth: int, _visited: set, known_msg_sender: frozenset, known_signer: frozenset = frozenset(),
+    known_fresh: frozenset = frozenset(),
 ):
     """
     Returns (self_scoped_keys, unsafe_keys). Two Sink.privileged_writes-
@@ -1129,6 +1444,11 @@ def _self_scoped_and_unsafe_writes(
     # Same idea for a parameter proven bound to an ecrecover(...)-
     # recovered signer — the real Dai.permit() shape.
     known_signer = known_signer | _params_proven_ecrecover_signer(f)
+    # Same idea again for a parameter an explicit revert-gated
+    # existence check has proven fresh — the real Liquity V2 troveId
+    # shape (_openTrove's own _requireTroveDoesNotExists call, whose
+    # fact must reach _setAddManager one internal call further down).
+    known_fresh = known_fresh | _params_proven_fresh_key(f)
 
     self_scoped: Set[tuple] = set()
     unsafe: Set[tuple] = set()
@@ -1159,13 +1479,37 @@ def _self_scoped_and_unsafe_writes(
                     defining_index = cand
                     break
             if defining_index is None:
+                # The write's lvalue may be reached through ONE Member
+                # hop after the Index instead of directly — a struct-
+                # field write on an indexed mapping entry, e.g.
+                # `removeManagerReceiverOf[_troveId].manager = _manager`
+                # — the real Liquity V2 AddRemoveManagers shape, found
+                # live this session against Asymmetry USDaf's real,
+                # currently-deployed BorrowerOperations.sol. Walk back
+                # through the SAME node's own Member op producing
+                # ir.lvalue to find the Index it's based on — still the
+                # SAME single node, just one more hop in the chain.
+                for cand in node.irs:
+                    if isinstance(cand, Member) and cand.lvalue is ir.lvalue:
+                        base = cand.variable_left
+                        for cand2 in node.irs:
+                            if isinstance(cand2, Index) and cand2.lvalue is base:
+                                defining_index = cand2
+                                break
+                        break
+            if defining_index is None:
                 # A write we can't identify the key material for at all
                 # (e.g. a plain struct field, no index) — conservatively
                 # not self-scopable, never suppress on its account.
                 unsafe.add(write_key)
                 continue
             key_origin, key_var = _resolve_operand(defining_index.variable_right, f, known_msg_sender)
-            if _is_msg_sender_origin(key_origin) or _signer_bound(defining_index.variable_right, key_var, f, known_signer):
+            if (
+                _is_msg_sender_origin(key_origin)
+                or _signer_bound(defining_index.variable_right, key_var, f, known_signer)
+                or _fresh_bound(defining_index.variable_right, key_var, f, known_fresh)
+                or _is_fresh_clone_key(defining_index.variable_right, f)
+            ):
                 self_scoped.add(write_key)
                 continue
             # The innermost key isn't msg.sender, but for a NESTED
@@ -1187,7 +1531,12 @@ def _self_scoped_and_unsafe_writes(
             outer_key = _outermost_index_key(defining_index, f)
             if outer_key is not None:
                 outer_origin, outer_var = _resolve_operand(outer_key, f, known_msg_sender)
-                if _is_msg_sender_origin(outer_origin) or _signer_bound(outer_key, outer_var, f, known_signer):
+                if (
+                    _is_msg_sender_origin(outer_origin)
+                    or _signer_bound(outer_key, outer_var, f, known_signer)
+                    or _fresh_bound(outer_key, outer_var, f, known_fresh)
+                    or _is_fresh_clone_key(outer_key, f)
+                ):
                     self_scoped.add(write_key)
                     continue
             unsafe.add(write_key)
@@ -1198,8 +1547,9 @@ def _self_scoped_and_unsafe_writes(
                 if isinstance(ir, InternalCall) and getattr(ir, "function", None) is not None:
                     callee_known = _msg_sender_params_for_call(ir, f, known_msg_sender, ir.function)
                     callee_known_signer = _signer_params_for_call(ir, f, known_signer, ir.function)
+                    callee_known_fresh = _fresh_params_for_call(ir, f, known_fresh, ir.function)
                     nested_scoped, nested_unsafe = _self_scoped_and_unsafe_writes(
-                        ir.function, max_depth - 1, _visited, callee_known, callee_known_signer
+                        ir.function, max_depth - 1, _visited, callee_known, callee_known_signer, callee_known_fresh
                     )
                     self_scoped |= nested_scoped
                     unsafe |= nested_unsafe
