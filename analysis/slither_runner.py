@@ -413,7 +413,43 @@ def run_slither(resolved: dict) -> dict:
     alias_targets: dict = {}
     alias_best_diff: dict = {}
     _alias_match_pass(alias_simple, strict=False)
-    _alias_match_pass(alias_combined, strict=True)
+
+    # Tier 0 (tried before the combined-token / fallback tiers below):
+    # if the bare SCOPE (parts[0], e.g. `@openzeppelin`) already resolved
+    # to a real directory above, and that directory literally CONTAINS a
+    # subdirectory named exactly `parts[1]` (e.g. `contracts`), that's an
+    # unambiguous, direct answer — no fuzzy matching needed at all. This
+    # is the common shape for BOTH an npm/node_modules-style scoped
+    # package (`node_modules/@openzeppelin/contracts/`, a genuine nested
+    # scope-dir/package-dir pair) and a Foundry-vendored flat package
+    # (`lib/openzeppelin-contracts/contracts/`, where the scope alone
+    # already fuzzy-resolved to the package root one level up).
+    #
+    # Found live this session against HLP0's real, currently-deployed
+    # HLP0.sol (Arbitrum): the project vendors BOTH `@openzeppelin/...`
+    # AND `@layerzerolabs/oapp-evm/...` under `node_modules/`, and
+    # `@layerzerolabs/oapp-evm/` happens to ALSO have its own `contracts/`
+    # subfolder. The fallback tier (package-name-alone, "contracts")
+    # can't tell these apart — "contracts" substring-matches EITHER
+    # package's subfolder — and picked the wrong one, sending
+    # `@openzeppelin/contracts/...` imports into LayerZero's tree
+    # instead. Resolving through the already-validated scope directory
+    # first sidesteps the ambiguity entirely: only ONE directory named
+    # `@openzeppelin` exists, and only its OWN `contracts/` subdirectory
+    # can ever be the join target.
+    for combined_lhs, package_seg in list(alias_fallback.items()):
+        scope = combined_lhs.rsplit("/", 1)[0]
+        scope_dir = alias_targets.get(scope)
+        if not scope_dir:
+            continue
+        candidate = os.path.join(scope_dir, package_seg)
+        if os.path.isdir(candidate):
+            alias_targets[combined_lhs] = candidate
+            alias_best_diff[combined_lhs] = 0
+
+    remaining_combined = {k: v for k, v in alias_combined.items() if k not in alias_targets}
+    if remaining_combined:
+        _alias_match_pass(remaining_combined, strict=True)
     unmatched = set(alias_fallback) - set(alias_targets)
     if unmatched:
         _alias_match_pass({k: v for k, v in alias_fallback.items() if k in unmatched}, strict=False)
