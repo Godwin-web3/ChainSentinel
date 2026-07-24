@@ -93,6 +93,99 @@ def test_call_site_argument_prunes_dead_branch_without_weakening_reachable_one()
     )
 
 
+def test_destination_trust_suppresses_only_when_recipient_is_provably_fixed():
+    """
+    Second real false positive fixed the same session: even once the
+    dead transferFrom branch is pruned, the surviving `.transfer`
+    branch's own RECIPIENT (settle's `manager` parameter — the actual
+    "to" argument of transfer/transferFrom, not the call's own
+    destination, which is the token contract) was never checked for
+    trust. Confirmed live against Flaunch's real PositionManager:
+    CurrencySettler.settle's `manager` is always PositionManager's own
+    `poolManager` immutable — a fixed settlement layer, not a real
+    theft target.
+
+    Single-hop case (manager passed directly): TrustedDestinationSettler
+    (manager = this contract's own immutable) must NOT fire.
+    UntrustedDestinationSettler (manager = a genuine caller parameter)
+    must still fire — proves the trust check doesn't blanket-suppress
+    every transfer branch regardless of the actual recipient.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("CallSitePruning.sol")
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible
+
+    def transfer_findings(entry):
+        return [
+            r for r in all_results
+            if r.path.entry == entry and "transfer" in r.path.sink.node_id and "transferFrom" not in r.path.sink.node_id
+        ]
+
+    trusted_findings = transfer_findings("TrustedDestinationSettler.settleOwnFunds(uint256)")
+    assert not trusted_findings, (
+        f"manager is this contract's own immutable — a fixed, non-redirectable recipient — must not fire, got {trusted_findings}"
+    )
+
+    untrusted_findings = transfer_findings("UntrustedDestinationSettler.settleToArbitraryManager(address,uint256)")
+    assert untrusted_findings, (
+        "manager here is a genuine caller-supplied parameter — the recipient IS attacker-redirectable, must still fire"
+    )
+    print(
+        "test_destination_trust_suppresses_only_when_recipient_is_provably_fixed: PASS — "
+        "TrustedDestinationSettler suppressed, UntrustedDestinationSettler still",
+        untrusted_findings[0].verdict,
+    )
+
+
+def test_destination_trust_propagates_transitively_across_two_hops():
+    """
+    Same real Flaunch shape as above, but through the ACTUAL two-hop
+    chain that motivated transitive propagation: beforeSwap passes its
+    own poolManager immutable into _internalSwap's own PARAMETER, and
+    _internalSwap passes THAT parameter into settle's manager parameter
+    two hops later — a single-hop-only check (only looking at settle's
+    direct caller) cannot see through this.
+
+    TransitiveTrustSettler reproduces the real chain and must NOT fire.
+    TransitiveUntrustedSettler reproduces the identical two-hop shape
+    with a genuinely caller-controlled value at the top of the chain —
+    must still fire, proving the transitive propagation doesn't
+    over-suppress either.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("CallSitePruning.sol")
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible
+
+    def transfer_findings(entry):
+        return [
+            r for r in all_results
+            if r.path.entry == entry and "transfer" in r.path.sink.node_id and "transferFrom" not in r.path.sink.node_id
+        ]
+
+    trusted_findings = transfer_findings("TransitiveTrustSettler.settleViaRelay(uint256)")
+    assert not trusted_findings, (
+        f"manager reaches settle only via a two-hop relay, but originates from a real immutable — must not fire, got {trusted_findings}"
+    )
+
+    untrusted_findings = transfer_findings("TransitiveUntrustedSettler.settleViaRelay(address,uint256)")
+    assert untrusted_findings, (
+        "manager here is caller-supplied at the top of the SAME two-hop shape — must still fire"
+    )
+    print(
+        "test_destination_trust_propagates_transitively_across_two_hops: PASS — "
+        "TransitiveTrustSettler suppressed, TransitiveUntrustedSettler still",
+        untrusted_findings[0].verdict,
+    )
+
+
 if __name__ == "__main__":
     test_call_site_argument_prunes_dead_branch_without_weakening_reachable_one()
+    test_destination_trust_suppresses_only_when_recipient_is_provably_fixed()
+    test_destination_trust_propagates_transitively_across_two_hops()
     print("\nAll call_site_pruning tests passed.")

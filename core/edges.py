@@ -140,6 +140,36 @@ class CallEdge:
     # the identical address).
     self_bound_params: frozenset = field(default_factory=frozenset)
 
+    # self_passthrough_params: only meaningful for raw_type in
+    # ("internal", "library") — {callee_param_name: caller_param_name}
+    # for arguments that are themselves one of the CALLER's OWN
+    # parameters (not resolved further here). core/paths.py's DFS
+    # resolves this transitively across multiple hops: a passed-
+    # through name is self-bound at THIS hop only if the caller_param
+    # was already proven self-bound at an earlier hop.
+    self_passthrough_params: dict = field(default_factory=dict)
+
+    # dest_param_name: only meaningful for raw_type in ("highlevel",
+    # "delegatecall", "codecall") — set when this edge's destination
+    # resolves to one of ITS OWN function's bare parameters (not a
+    # state variable/immutable, which _resolve_trust already handles
+    # directly). Lets core/paths.py look up, at DFS time, whether the
+    # SPECIFIC call site that reached this function proved that
+    # parameter trustworthy — see trusted_bound_params below.
+    dest_param_name: Optional[str] = None
+
+    # trusted_bound_params: only meaningful for raw_type in
+    # ("internal", "library") — the NAMES of the CALLEE's own
+    # parameters that this specific call site passed an argument
+    # proven (in the CALLER's own context) to be IMMUTABLE or CONSTANT
+    # — see core.edges._trusted_bound_call_args.
+    trusted_bound_params: frozenset = field(default_factory=frozenset)
+
+    # trusted_passthrough_params: only meaningful for raw_type in
+    # ("internal", "library") — same transitive-propagation shape as
+    # self_passthrough_params above, for trust instead of self.
+    trusted_passthrough_params: dict = field(default_factory=dict)
+
 
 # ── Layer 1: IR normalization ─────────────────────────────────────
 
@@ -1488,15 +1518,30 @@ def _dominating_gate_requirements(node, gates: list) -> tuple:
     return reqs
 
 
-def _self_bound_call_args(ir, caller_f) -> frozenset:
+def _self_bound_call_args(ir, caller_f) -> tuple:
     """
     For an InternalCall/LibraryCall ir, resolve each argument in the
-    CALLER's own context (caller_f) and return the NAMES of the
-    callee's own formal parameters (ir.function.parameters, positional)
-    that this specific call site passed the literal expression
-    `address(this)` for. Sound because an internal/library call shares
-    execution context with its caller — `this` means the identical
-    address on both sides.
+    CALLER's own context (caller_f). Returns (standalone, passthrough):
+
+      standalone  -> frozenset of the callee's own parameter NAMES
+                     this call site passed the literal expression
+                     `address(this)` for directly. Sound because an
+                     internal/library call shares execution context
+                     with its caller — `this` means the identical
+                     address on both sides.
+      passthrough -> dict of {callee_param_name: caller_param_name}
+                     for arguments that are themselves one of the
+                     CALLER's OWN parameters, unresolved further here.
+                     Real shape found live this session against
+                     Flaunch's PositionManager (Base): beforeSwap calls
+                     `_internalSwap(poolManager, ...)`, and
+                     _internalSwap's OWN parameter `_poolManager`
+                     (not the immutable itself) is what actually
+                     reaches CurrencySettler.settle two hops later —
+                     core/paths.py's DFS resolves this transitively by
+                     checking, at EACH hop, whether the caller_param
+                     named here was ITSELF already proven at an
+                     earlier hop.
     """
     from core.destination_origin import resolve_variable_origin, DestinationOrigin
 
@@ -1505,19 +1550,168 @@ def _self_bound_call_args(ir, caller_f) -> frozenset:
         params = list(getattr(callee, "parameters", None) or [])
         args = list(getattr(ir, "arguments", None) or [])
     except Exception:
-        return frozenset()
+        return frozenset(), {}
 
-    bound = set()
+    standalone = set()
+    passthrough = {}
     for param, arg in zip(params, args):
         try:
-            origin, _ = resolve_variable_origin(arg, caller_f)
+            origin, resolved = resolve_variable_origin(arg, caller_f)
         except Exception:
             continue
+        name = str(getattr(param, "name", "") or "")
+        if not name:
+            continue
         if origin == DestinationOrigin.SELF:
-            name = str(getattr(param, "name", "") or "")
-            if name:
-                bound.add(name)
-    return frozenset(bound)
+            standalone.add(name)
+        elif origin == DestinationOrigin.PARAMETER:
+            caller_param_name = str(getattr(resolved, "name", "") or "")
+            if caller_param_name:
+                passthrough[name] = caller_param_name
+    return frozenset(standalone), passthrough
+
+
+# ── Call-site-specific destination trust ──────────────────────────
+#
+# _resolve_trust (above) already proves a highlevel call's destination
+# trusted when it resolves DIRECTLY to an immutable/constant/auth-gated
+# state variable of the SAME function's own contract. It has no way to
+# see that a destination resolving to one of THIS function's own bare
+# PARAMETERS might still be trustworthy, because trustworthiness of a
+# parameter depends on what a specific CALLER passed — exactly the
+# same call-site-specific reasoning _self_bound_call_args already does
+# for address(this). Confirmed live against Flaunch's real, currently-
+# deployed PositionManager (Base): the shared V4-core library
+# CurrencySettler.settle(currency, manager, payer, amount, burn) calls
+# `IERC20Minimal(currency).transfer(address(manager), amount)` — from
+# settle's own perspective `manager` is a bare parameter
+# (_is_caller_controlled -> untrusted), but every real call site passes
+# PositionManager's own `poolManager` IMMUTABLE for it — a fixed,
+# non-attacker-redirectable destination. core/paths.py's terminal-edge
+# synthesis (the code path that actually produced this real
+# ASSET_DRAIN finding — CurrencySettler.settle is a library, so it
+# never becomes its own sink node_id via core/sinks.py) never consulted
+# any trust signal at all, so a transfer to a fixed, protocol-owned
+# settlement layer got reported as "direct theft of user funds".
+
+# Recipient argument index for each TOKEN_TRANSFER_SIGNATURES shape —
+# the "to" address, NOT the call's own destination (which for a token
+# transfer is the TOKEN CONTRACT, e.g. `IERC20(token).transfer(to,
+# amount)` calls INTO `token`, but the funds go to `to`, an ordinary
+# argument). Confirmed live: checking ir.destination's origin for
+# CurrencySettler.settle's `IERC20Minimal(currency).transfer(address(
+# manager), amount)` resolved to `currency` (the token, itself resolved
+# from a different parameter) — completely unrelated to whether
+# `manager`, the actual recipient, is trustworthy.
+_TOKEN_TRANSFER_RECIPIENT_ARG_INDEX = {
+    "transfer(address,uint256)": 0,
+    "transferFrom(address,address,uint256)": 1,
+    "safeTransfer(address,uint256)": 0,
+    "safeTransferFrom(address,address,uint256)": 1,
+    "safeTransferFrom(address,address,uint256,bytes)": 1,
+    "safeTransferFrom(address,address,uint256,uint256,bytes)": 1,
+    "safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)": 1,
+}
+
+
+def _destination_param_name(ir, raw_type: str, f) -> Optional[str]:
+    """
+    If this edge's real RECIPIENT — the call's own destination for an
+    ETH/value-carrying call, or the "to" ARGUMENT for a token-transfer-
+    shaped call (see _TOKEN_TRANSFER_RECIPIENT_ARG_INDEX above) —
+    resolves to one of f's OWN parameters, return that parameter's
+    name. This is the call-site identity paths.py looks up to see
+    whether the SPECIFIC invocation that reached f proved it
+    trustworthy. None for every other origin (a destination resolving
+    directly to a state variable/immutable is already handled by
+    _resolve_trust).
+    """
+    if raw_type not in ("highlevel", "delegatecall", "codecall"):
+        return None
+    from core.destination_origin import resolve_variable_origin, DestinationOrigin
+
+    recipient = None
+    if raw_type == "highlevel" and _is_token_transfer_call(ir):
+        try:
+            fname = str(getattr(ir, "function_name", "") or "")
+            args = list(getattr(ir, "arguments", None) or [])
+            from slither.utils.type import convert_type_for_solidity_signature_to_string
+            arg_types = [convert_type_for_solidity_signature_to_string(getattr(a, "type", None)) for a in args]
+            sig = f"{fname}({','.join(arg_types)})"
+            idx = _TOKEN_TRANSFER_RECIPIENT_ARG_INDEX.get(sig)
+            if idx is not None and idx < len(args):
+                recipient = args[idx]
+        except Exception:
+            recipient = None
+
+    if recipient is None:
+        try:
+            recipient = ir.destination
+        except Exception:
+            return None
+
+    try:
+        dest = _follow_reference(recipient)
+        origin, resolved = resolve_variable_origin(dest, f)
+    except Exception:
+        return None
+    if origin != DestinationOrigin.PARAMETER:
+        return None
+    name = str(getattr(resolved, "name", "") or "")
+    return name or None
+
+
+def _trusted_bound_call_args(ir, caller_f) -> tuple:
+    """
+    For an InternalCall/LibraryCall ir, resolve each argument in the
+    CALLER's own context. Returns (standalone, passthrough), same
+    shape and same transitive-propagation rationale as
+    _self_bound_call_args above (real shape found live this session:
+    Flaunch's beforeSwap passes its own `poolManager` immutable into
+    _internalSwap's `_poolManager` PARAMETER, which two hops later is
+    what actually reaches CurrencySettler.settle's `manager` param):
+
+      standalone  -> frozenset of callee parameter NAMES this call site
+                     passed an argument proven directly to be IMMUTABLE
+                     or CONSTANT — the same always-safe-regardless-of-
+                     writer-analysis origins auth_detection.py's
+                     _FIXED_ORIGINS trusts, minus STATE_VARIABLE (a
+                     plain, potentially attacker-writable state
+                     variable needs the real writer-gating analysis
+                     _resolve_trust already does via auth_lookup —
+                     deliberately not re-derived here to avoid a
+                     second, weaker trust standard for the same
+                     question).
+      passthrough -> dict of {callee_param_name: caller_param_name}
+                     for arguments that are themselves one of the
+                     CALLER's OWN parameters.
+    """
+    from core.destination_origin import resolve_variable_origin, DestinationOrigin
+
+    try:
+        callee = ir.function
+        params = list(getattr(callee, "parameters", None) or [])
+        args = list(getattr(ir, "arguments", None) or [])
+    except Exception:
+        return frozenset(), {}
+
+    standalone = set()
+    passthrough = {}
+    for param, arg in zip(params, args):
+        try:
+            origin, resolved = resolve_variable_origin(arg, caller_f)
+        except Exception:
+            continue
+        name = str(getattr(param, "name", "") or "")
+        if not name:
+            continue
+        if origin in (DestinationOrigin.IMMUTABLE, DestinationOrigin.CONSTANT):
+            standalone.add(name)
+        elif origin == DestinationOrigin.PARAMETER:
+            caller_param_name = str(getattr(resolved, "name", "") or "")
+            if caller_param_name:
+                passthrough[name] = caller_param_name
+    return frozenset(standalone), passthrough
 
 
 # ── Public API ────────────────────────────────────────────────────
@@ -1561,11 +1755,13 @@ def extract_edges(src_id: str, f, auth_lookup: Optional[dict] = None, slither=No
                 )
                 props = _semantic_properties(raw_type, ir)
 
-                self_bound = (
-                    _self_bound_call_args(ir, f)
-                    if raw_type in ("internal", "library")
-                    else frozenset()
-                )
+                if raw_type in ("internal", "library"):
+                    self_bound, self_passthrough = _self_bound_call_args(ir, f)
+                    trusted_bound, trusted_passthrough = _trusted_bound_call_args(ir, f)
+                else:
+                    self_bound, self_passthrough = frozenset(), {}
+                    trusted_bound, trusted_passthrough = frozenset(), {}
+                dest_param = _destination_param_name(ir, raw_type, f)
 
                 edges.append(CallEdge(
                     src=src_id,
@@ -1583,6 +1779,10 @@ def extract_edges(src_id: str, f, auth_lookup: Optional[dict] = None, slither=No
                     ),
                     param_gate_requirements=node_gate_reqs,
                     self_bound_params=self_bound,
+                    self_passthrough_params=self_passthrough,
+                    dest_param_name=dest_param,
+                    trusted_bound_params=trusted_bound,
+                    trusted_passthrough_params=trusted_passthrough,
                     **props,
                 ))
 
