@@ -270,6 +270,69 @@ def test_modifier_only_auth_evidence_exempts_unprotected_initializer():
           "grantRole/revokeRole suppressed, grantRoleUnsafe still", dangerous_findings[0].verdict)
 
 
+def test_ternary_guarded_initializer_via_cfg_reachability_suppresses_finding():
+    """
+    Live-verification finding against SPOT Cash's real, currently-
+    deployed Tranche.init() (a real ButtonTranche bond token): OZ
+    v4.5.0's real Initializable.sol guards with a TERNARY inside its
+    require():
+        require(_initializing ? _isConstructor() : !_initialized, "...");
+    Solidity lowers that ternary to actual IF/branch/ENDIF control
+    flow. Confirmed live via direct IR probe against this exact real
+    source: Slither's own flat .nodes list places those lowered nodes
+    AFTER the modifier's PLACEHOLDER in list order, even though they
+    execute BEFORE it (real order, per .sons/.fathers graph edges:
+    ENTRYPOINT -> the ternary's IF/branch/ENDIF -> isTopLevelCall setup
+    -> PLACEHOLDER -> the after-block). is_initializer_guard used to
+    split before/after by flat list index, which put the require()'s
+    _initialized read in the WRONG (after) set, so the one-time latch
+    was never recognized despite being genuine and correctly
+    implemented — Tranche.init() false-positived UNPROTECTED_
+    INITIALIZER even though clone deployment + init() are atomic (no
+    front-running window) AND init() has a real one-time latch.
+
+    UnrelatedTernaryDoesNotSuppressFinding proves this doesn't weaken
+    detection: its ternary condition reads a completely unrelated flag
+    (never the variable actually being latched) — a naive fix that
+    just "trusted any ternary/branch shape near the placeholder" would
+    wrongly suppress this too. Must still fire.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("UnprotectedInit.sol")
+
+    safe = nodes["TrancheStyleTernaryLatch.init(address)"]
+    assert safe.unprotected_initializer_write is None, (
+        f"real OZ v4.5.0 ternary-guarded initializer must not report unprotected-initializer evidence, "
+        f"got {safe.unprotected_initializer_write}"
+    )
+    assert safe.has_initializer_guard is True
+
+    dangerous = nodes["UnrelatedTernaryDoesNotSuppressFinding.init(address)"]
+    assert dangerous.unprotected_initializer_write is not None, (
+        "ternary checks the WRONG flag — must still report unprotected-initializer evidence"
+    )
+    assert dangerous.has_initializer_guard is False
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible
+
+    safe_findings = [
+        r for r in all_results
+        if "UNPROTECTED_INITIALIZER" in r.constraint_type and r.path.entry == "TrancheStyleTernaryLatch.init(address)"
+    ]
+    assert not safe_findings, f"real SPOT Cash shape must not fire UNPROTECTED_INITIALIZER, got {safe_findings}"
+
+    dangerous_findings = [
+        r for r in report.confirmed
+        if "UNPROTECTED_INITIALIZER" in r.constraint_type
+        and r.path.entry == "UnrelatedTernaryDoesNotSuppressFinding.init(address)"
+    ]
+    assert dangerous_findings, "wrong-flag ternary must still fire UNPROTECTED_INITIALIZER CONFIRMED"
+    print("test_ternary_guarded_initializer_via_cfg_reachability_suppresses_finding: PASS —",
+          "TrancheStyleTernaryLatch suppressed, UnrelatedTernaryDoesNotSuppressFinding still", dangerous_findings[0].verdict)
+
+
 def test_unprotected_initializer_constraint_fires_only_on_real_vulnerable_contracts():
     """
     End-to-end: runs the full path-enumeration + constraint-validation
@@ -327,5 +390,6 @@ if __name__ == "__main__":
     test_fake_timelock_does_not_suppress_finding()
     test_vat_style_self_scoped_permission_write_suppresses_finding()
     test_modifier_only_auth_evidence_exempts_unprotected_initializer()
+    test_ternary_guarded_initializer_via_cfg_reachability_suppresses_finding()
     test_unprotected_initializer_constraint_fires_only_on_real_vulnerable_contracts()
     print("\nAll initializer_detection tests passed.")

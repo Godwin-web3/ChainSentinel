@@ -424,3 +424,88 @@ contract FakeArgumentModifierIsNotRealAuth {
         _grantRole(role, account);
     }
 }
+
+// Tests core/initializer_detection.py::_nodes_before_after_placeholder
+// — the fix for the real false positive found live this session
+// against SPOT Cash's real, currently-deployed Tranche.init(): OZ
+// v4.5.0's real Initializable.sol guards with a TERNARY inside its
+// require():
+//   require(_initializing ? _isConstructor() : !_initialized, "...");
+// Solidity lowers that ternary to actual IF/branch/ENDIF control flow
+// — confirmed live via direct IR probe, Slither's own flat .nodes list
+// places those lowered nodes AFTER the modifier's PLACEHOLDER in list
+// order, even though they execute BEFORE it. Splitting before/after by
+// list index (instead of real .sons-edge graph reachability) put the
+// require()'s _initialized read in the WRONG (after) set, so the
+// one-time latch was never recognized despite being genuine and
+// correctly implemented.
+contract InitializableV45 {
+    bool private _initialized;
+    bool private _initializing;
+
+    modifier initializer() {
+        require(_initializing ? _isConstructor() : !_initialized, "Initializable: contract is already initialized");
+        bool isTopLevelCall = !_initializing;
+        if (isTopLevelCall) {
+            _initializing = true;
+            _initialized = true;
+        }
+        _;
+        if (isTopLevelCall) {
+            _initializing = false;
+        }
+    }
+
+    function _isConstructor() private view returns (bool) {
+        return address(this).code.length == 0;
+    }
+}
+
+// Safe: the real SPOT Cash Tranche.init() shape. Must NOT fire.
+contract TrancheStyleTernaryLatch is InitializableV45 {
+    address public bond;
+    address public owner;
+
+    // Makes `owner` structurally "privileged" for classify_sinks.
+    modifier onlyOwner() {
+        require(msg.sender == owner, "not owner");
+        _;
+    }
+
+    function init(address _bond) public initializer {
+        bond = _bond;
+        owner = msg.sender;
+    }
+
+    function withdraw() external onlyOwner {}
+}
+
+// DANGEROUS: the critical adversarial regression case proving the fix
+// doesn't just "notice a ternary/branch shape near the placeholder and
+// assume it's a real check" — it must find a revert-capable read of
+// the SPECIFIC variable being latched. fakeInitializer's ternary
+// condition reads a completely unrelated flag (_unrelatedFlag, always
+// true either way) — `_initialized` itself is set with no guarding
+// check on it at all. Must still fire UNPROTECTED_INITIALIZER.
+contract UnrelatedTernaryDoesNotSuppressFinding {
+    bool private _initialized;
+    bool private _unrelatedFlag;
+    address public owner;
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "not owner");
+        _;
+    }
+
+    modifier fakeInitializer() {
+        require(_unrelatedFlag ? true : true, "always passes, checks the wrong flag");
+        _initialized = true;
+        _;
+    }
+
+    function init(address _owner) public fakeInitializer {
+        owner = _owner;
+    }
+
+    function withdraw() external onlyOwner {}
+}

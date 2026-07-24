@@ -99,31 +99,81 @@ def _has_one_time_latch(before: list, after: list) -> bool:
     return False
 
 
-def is_initializer_guard(modifier_obj) -> bool:
+def _nodes_before_after_placeholder(modifier_obj):
     """
-    True if modifier_obj's real body matches a one-time-latch's
-    structural signature around its PLACEHOLDER (Slither's real marker
-    for a modifier's `_;`) — see _has_one_time_latch. Node lists on
-    both sides are expanded (bounded, one hop) through any InternalCall
-    they make, matching core/auth_detection.py::is_reentrancy_guard's
-    own established convention for the same modern-OZ-delegates-to-
-    private-helpers shape.
+    Split modifier_obj's CFG into (before, after) sets relative to its
+    PLACEHOLDER (Slither's real marker for a modifier's `_;`) using
+    ACTUAL graph reachability (.sons edges) rather than the flat
+    .nodes list's index order.
+
+    Found live this session against SPOT Cash's real, currently-
+    deployed Tranche.init(): the flat .nodes list is NOT always in
+    execution order. OpenZeppelin v4.5.0's real Initializable.sol
+    guards with a ternary inside its require():
+        require(_initializing ? _isConstructor() : !_initialized, "...");
+    Solidity lowers that ternary to actual IF/branch/ENDIF control
+    flow — and confirmed via direct IR probe, Slither appends those
+    lowered nodes to the END of the modifier's flat .nodes list, after
+    the PLACEHOLDER, even though they genuinely execute BEFORE it
+    (their real position in the CFG, per .sons/.fathers, is
+    ENTRYPOINT -> that IF/branch/ENDIF -> the rest of the "before"
+    code -> PLACEHOLDER). Splitting by list index put the require()'s
+    _initialized read in `after` instead of `before`, so
+    _has_one_time_latch's revert-capable-read check never found it and
+    is_initializer_guard returned False for a genuine, correctly-
+    implemented one-time latch.
+
+    Before = every node reachable forward from ENTRYPOINT without
+    passing through PLACEHOLDER; after = every node reachable forward
+    from PLACEHOLDER itself. Correct for any node ordering Slither
+    happens to produce, since it never trusts list position at all.
     """
     try:
         nodes = list(getattr(modifier_obj, "nodes", []) or [])
     except Exception:
+        return None, None
+
+    placeholder = next((n for n in nodes if n.type == NodeType.PLACEHOLDER), None)
+    if placeholder is None:
+        return None, None
+    entry = next((n for n in nodes if n.type == NodeType.ENTRYPOINT), nodes[0] if nodes else None)
+    if entry is None:
+        return None, None
+
+    def _reachable(starts):
+        seen = {id(placeholder)}
+        out = []
+        stack = list(starts)
+        while stack:
+            node = stack.pop()
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            out.append(node)
+            stack.extend(getattr(node, "sons", None) or [])
+        return out
+
+    before = _reachable([entry])
+    after = _reachable(list(getattr(placeholder, "sons", None) or []))
+    return before, after
+
+
+def is_initializer_guard(modifier_obj) -> bool:
+    """
+    True if modifier_obj's real body matches a one-time-latch's
+    structural signature around its PLACEHOLDER — see
+    _has_one_time_latch. Node lists on both sides are expanded
+    (bounded, one hop) through any InternalCall they make, matching
+    core/auth_detection.py::is_reentrancy_guard's own established
+    convention for the same modern-OZ-delegates-to-private-helpers
+    shape.
+    """
+    before, after = _nodes_before_after_placeholder(modifier_obj)
+    if before is None:
         return False
 
-    placeholder_idx = None
-    for i, node in enumerate(nodes):
-        if node.type == NodeType.PLACEHOLDER:
-            placeholder_idx = i
-            break
-    if placeholder_idx is None:
-        return False
-
-    before = _expand_with_internal_calls(nodes[:placeholder_idx])
-    after = _expand_with_internal_calls(nodes[placeholder_idx + 1:])
+    before = _expand_with_internal_calls(before)
+    after = _expand_with_internal_calls(after)
     return _has_one_time_latch(before, after)
 
 
