@@ -21,6 +21,7 @@ from analysis.slither_runner import run_slither
 
 FIXTURE_DIR = os.path.abspath("fixture/legacy_oz_package_name")
 VERSIONED_ALIAS_FIXTURE_DIR = os.path.abspath("fixture/versioned_oz_alias")
+NESTED_SCOPE_ALIAS_FIXTURE_DIR = os.path.abspath("fixture/nested_scope_alias")
 
 
 def _resolved(fixture_dir: str, name: str, solc_version: str = "0.5.17") -> dict:
@@ -84,7 +85,32 @@ def test_versioned_hyphenated_oz_alias_resolves_without_cross_wiring():
           "InitCoreLike.sol compiled with both hyphenated OZ variants correctly resolved to their own version-nested trees")
 
 
+def test_scope_deepened_before_subfolder_join_avoids_sibling_cross_wire():
+    """
+    Reproduces the real "Slither produced no output" failure found live
+    this session against Robinhood Chain's real, currently-deployed
+    Doppler Airlock.sol: it bare-imports both `@openzeppelin/access/
+    Ownable.sol` and `@openzeppelin/utils/math/Math.sol` — the same
+    `@openzeppelin` scope, correctly name-matched to
+    `lib/openzeppelin-contracts` but one level too shallow (real files
+    live under its own `contracts/` subfolder). Tier 0 (the scope+
+    subfolder join for a `@scope/package` bare import) used to run
+    BEFORE the "may not be the real package root" deepening pass
+    corrected the scope directory, so it checked the wrong, too-shallow
+    path, found no `utils` subdirectory there, and silently fell
+    through to the fallback tier — which matched the bare basename
+    "utils" against this fixture's own UNRELATED sibling
+    `lib/solmate/src/utils/` (a real cross-wire trap directory,
+    present in this exact fixture), breaking compilation entirely.
+    """
+    result = run_slither(_resolved(NESTED_SCOPE_ALIAS_FIXTURE_DIR, "NestedScopeAlias", solc_version="0.8.19"))
+    assert result.get("success"), f"expected successful analysis, got: {result}"
+    print("test_scope_deepened_before_subfolder_join_avoids_sibling_cross_wire: PASS —",
+          "NestedScopeAlias.sol compiled with @openzeppelin/utils correctly resolved, not cross-wired to solmate's own utils/")
+
+
 if __name__ == "__main__":
     test_legacy_openzeppelin_solidity_package_name_resolves_via_sibling_alias()
     test_versioned_hyphenated_oz_alias_resolves_without_cross_wiring()
+    test_scope_deepened_before_subfolder_join_avoids_sibling_cross_wire()
     print("\nAll slither_runner tests passed.")

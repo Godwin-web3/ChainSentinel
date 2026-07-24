@@ -265,6 +265,20 @@ CHAINS = {
         explorer_api="https://api.etherscan.io/v2/api", explorer_api_key=ETHERSCAN_KEY,
         native_symbol="ETH"
     ),
+    # Robinhood Chain isn't on Etherscan V2's chainlist at all (confirmed
+    # live: absent from https://api.etherscan.io/v2/chainlist) — its
+    # official explorer is Blockscout, not Etherscan, at a dedicated
+    # per-chain domain. Confirmed live: Blockscout's legacy `/api?module=
+    # contract&action=getsourcecode` endpoint is wire-compatible with our
+    # existing etherscan_request() (same status/result JSON shape, same
+    # query params) and needs no API key at all — an empty
+    # explorer_api_key still returns real verified source.
+    "robinhood": Chain(
+        name="Robinhood Chain Mainnet", chain_id=4663,
+        rpc_url="https://rpc.mainnet.chain.robinhood.com",
+        explorer_api="https://robinhoodchain.blockscout.com/api", explorer_api_key="",
+        native_symbol="ETH"
+    ),
 }
 
 def get_chain(name: str) -> Optional[Chain]:

@@ -102,6 +102,32 @@ def fetch_source(address: str, chain: Chain) -> Optional[dict]:
         except Exception as e:
             log.debug(f"Single JSON parse failed: {e}")
 
+    # Blockscout's getsourcecode response (the explorer for chains like
+    # Robinhood Chain, which isn't on Etherscan V2's chainlist at all)
+    # carries a genuinely different multi-file convention from
+    # Etherscan's `{{...}}`-embedded one: SourceCode holds ONLY the
+    # entry file's own flat text, and the real dependency tree lives in
+    # a SEPARATE top-level "AdditionalSources" array of {"Filename":
+    # ..., "SourceCode": ...} objects. Confirmed live against Robinhood
+    # Chain's real, currently-deployed Doppler Airlock.sol — without
+    # this, every multi-file Blockscout-verified project fell through
+    # to the single-flat-file fallback below with all its real imports
+    # (@openzeppelin/..., src/interfaces/...) left unresolved, and
+    # Slither failed outright.
+    additional_sources = data.get("AdditionalSources")
+    if not file_map and isinstance(additional_sources, list) and additional_sources:
+        entry_path = data.get("FileName") or f"{name or 'Contract'}.sol"
+        file_map = {entry_path: source}
+        for item in additional_sources:
+            if not isinstance(item, dict):
+                continue
+            fname = item.get("Filename")
+            fcontent = item.get("SourceCode")
+            if fname and fcontent is not None:
+                file_map[fname] = fcontent
+        parsed_source = "\n".join(file_map.values())
+        log.debug(f"Blockscout multi-file project: {len(file_map)} files parsed (entry: {entry_path})")
+
     # Flat, non-JSON single-file source (older verified contracts, e.g.
     # pre-2020 compiler tooling) never enters either JSON branch above,
     # so file_map stays empty even though parsed_source has real content.
