@@ -941,6 +941,65 @@ def test_ownable_internal_getter_comparison_auth_detected():
           "| bad variants correctly unscored")
 
 
+def test_ownable_v5_namespaced_storage_auth_detected():
+    """
+    Live-verification finding against Acre's real, currently-deployed
+    acreBTC vault (0x74B5E703bc31FC70B4bA50e7807f9dAd013E338C):
+    OpenZeppelin v5.x's OwnableUpgradeable — the current default for new
+    upgradeable deployments — stores `_owner` via ERC-7201 namespaced
+    storage (`assembly { $.slot := OwnableStorageLocation }`) instead of
+    a plain state variable. Every onlyOwner-gated function in the real
+    contract (updateDispatcher, WithdrawalQueue.initialize, ...) scored
+    UNAUTHENTICATED before this fix: resolve_variable_origin correctly
+    reported origin=RETURN_VALUE with `resolved` pointing at the actual
+    _getOwnableStorage() call result, but _resolve_operand's unwrap step
+    looked up the defining IR keyed on the ORIGINAL variable ($._owner,
+    a Member op — never an InternalCall) instead of `resolved`, so it
+    always found the wrong IR and gave up one hop too early. Fixed by
+    keying that lookup on `resolved`, plus adding DestinationOrigin.
+    CONSTANT to _FIXED_ORIGINS so the compile-time-fixed storage slot
+    literal _getOwnableStorage() resolves to is trusted the same way a
+    plain state variable already is.
+
+    Also proves this doesn't weaken detection or over-generalize:
+    - withdrawUnsafe (Treasury): no guard at all — must stay unscored.
+    - checkOwnerAtArbitrarySlot (ArbitrarySlotIsNotConstant): the
+      storage slot is a CALLER-CHOSEN parameter, not a genuine
+      `constant` — the real "arbitrary storage location" vulnerability
+      shape. Must NOT be treated as auth evidence merely because it
+      shares the same assembly-slot-then-Member-field pattern.
+    - HardcodedConstantAdmin: proves the complementary fix (CONSTANT in
+      _FIXED_ORIGINS) correctly recognizes a plain
+      require(msg.sender == HARDCODED_CONSTANT) check too, while
+      withdrawUnsafe there still correctly stays unscored.
+    """
+    nodes, *_ = _build("OwnableV5NamespacedStorage.sol")
+
+    safe = nodes["Treasury.withdraw(uint256)"]
+    assert safe.auth_score >= 3, f"expected OZ v5.x onlyOwner to score as real auth evidence, got {safe.auth_score}"
+    assert safe.auth_state == "AUTHENTICATED"
+
+    unsafe = nodes["Treasury.withdrawUnsafe(uint256)"]
+    assert unsafe.auth_score == 0, f"unguarded function must not score, got {unsafe.auth_score}"
+    assert unsafe.auth_state == "UNAUTHENTICATED"
+
+    arbitrary_slot = nodes["ArbitrarySlotIsNotConstant.checkOwnerAtArbitrarySlot(bytes32)"]
+    assert arbitrary_slot.auth_score == 0, (
+        f"a caller-controlled assembly slot must NOT be trusted as a fixed origin, got {arbitrary_slot.auth_score}"
+    )
+
+    const_admin = nodes["HardcodedConstantAdmin.withdraw(uint256)"]
+    assert const_admin.auth_score >= 3, f"expected hardcoded-constant comparison to score as real auth evidence, got {const_admin.auth_score}"
+    assert const_admin.auth_state == "AUTHENTICATED"
+
+    const_admin_unsafe = nodes["HardcodedConstantAdmin.withdrawUnsafe(uint256)"]
+    assert const_admin_unsafe.auth_score == 0, f"unguarded function must not score, got {const_admin_unsafe.auth_score}"
+
+    print("test_ownable_v5_namespaced_storage_auth_detected: PASS —",
+          "Treasury.withdraw", safe.auth_score, "| withdrawUnsafe/arbitrary-slot/withdrawUnsafe correctly unscored",
+          "| HardcodedConstantAdmin.withdraw", const_admin.auth_score)
+
+
 if __name__ == "__main__":
     test_custom_named_auth_modifier_detected()
     test_real_access_control_struct_shape_detected()
@@ -966,4 +1025,5 @@ if __name__ == "__main__":
     test_self_delegatecall_multicall_excludes_delegation_sink()
     test_external_view_return_verdict_auth_detected()
     test_ownable_internal_getter_comparison_auth_detected()
+    test_ownable_v5_namespaced_storage_auth_detected()
     print("\nAll auth_detection tests passed.")

@@ -71,8 +71,13 @@ from core.edges import (
 
 # Origins that count as "not caller-controlled" on the non-msg.sender side
 # of a comparison — a real access-control check compares msg.sender
-# against something the caller cannot also freely supply.
-_FIXED_ORIGINS = (DestinationOrigin.STATE_VARIABLE, DestinationOrigin.IMMUTABLE)
+# against something the caller cannot also freely supply. CONSTANT is
+# included on the same basis as STATE_VARIABLE/IMMUTABLE: a Solidity
+# `constant` can never be reassigned or attacker-influenced, whether it's
+# compared directly (require(msg.sender == HARDCODED_ADMIN)) or used as
+# an ERC-7201 namespaced-storage slot locator (see
+# _resolve_operand's docstring on OpenZeppelin v5.x's Ownable shape).
+_FIXED_ORIGINS = (DestinationOrigin.STATE_VARIABLE, DestinationOrigin.IMMUTABLE, DestinationOrigin.CONSTANT)
 
 
 @dataclass
@@ -129,6 +134,33 @@ def _resolve_operand(var, f, known_msg_sender: frozenset = frozenset(), max_dept
        structurally proving its Return value resolves to a state
        variable/immutable is strictly stronger evidence than the
        external case's view/pure heuristic.
+
+       Real gap #2, found live this session against Acre's real,
+       currently-deployed acreBTC vault: OpenZeppelin v5.x's
+       OwnableUpgradeable (the current default for new upgradeable
+       deployments) no longer stores `_owner` as a plain state
+       variable — it uses ERC-7201 namespaced storage:
+           function _getOwnableStorage() private pure returns (OwnableStorage storage $) {
+               assembly { $.slot := OwnableStorageLocation }
+           }
+           function owner() public view returns (address) {
+               OwnableStorage storage $ = _getOwnableStorage();
+               return $._owner;
+           }
+       Resolving owner()'s Return value (`$._owner`, a Member on the
+       storage-pointer local `$`) via resolve_variable_origin correctly
+       walks `$` back to its own defining Assignment (`$ := <call result>`)
+       and reports origin=RETURN_VALUE with `resolved` set to the TEMP
+       holding _getOwnableStorage()'s result — but the lookup below used
+       to search for that call's own IR keyed on the ORIGINAL `var`
+       (`$._owner`, a Member op — never an InternalCall), not on
+       `resolved` (the actual call result), so it always found the wrong
+       IR and gave up. Keying on `resolved` instead correctly reaches
+       _getOwnableStorage(), whose own Return is `$.slot := <a `constant`
+       bytes32 slot literal>` — a compile-time-fixed, non-attacker-
+       influenced storage location exactly as trustworthy as a plain
+       state variable, which is why CONSTANT was added to
+       _FIXED_ORIGINS alongside STATE_VARIABLE/IMMUTABLE.
     """
     if any(var is p for p in known_msg_sender):
         return DestinationOrigin.MSG_SENDER, var
@@ -136,7 +168,7 @@ def _resolve_operand(var, f, known_msg_sender: frozenset = frozenset(), max_dept
     origin, resolved = resolve_variable_origin(var, f)
     if origin != DestinationOrigin.RETURN_VALUE or max_depth <= 0:
         return origin, resolved
-    defining_op = _find_defining_op(var, f)
+    defining_op = _find_defining_op(resolved, f)
     if not isinstance(defining_op, InternalCall):
         return origin, resolved
     callee = getattr(defining_op, "function", None)
