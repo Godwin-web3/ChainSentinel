@@ -562,7 +562,32 @@ def build_graph(
                 unsafe_share_price_divisor = find_unsafe_share_price_divisor(f) if not is_modifier else None
                 unsafe_spot_price_dependency = find_unsafe_spot_price_dependency(f) if not is_modifier else None
                 unstaled_latest_round_data_dependency = find_unstaled_latest_round_data_dependency(f) if not is_modifier else None
-                unprotected_initializer_write = find_unprotected_initializer(f, structural_auth_score) if not is_modifier else None
+                # find_unprotected_initializer's own-auth exemption (a
+                # genuine msg.sender/role check means this isn't an
+                # unguarded "logical constructor") needs f's EFFECTIVE
+                # auth score — own body OR any attached modifier — not
+                # just structural_auth_score (own body only). The
+                # second-pass fold below can't be used here: it runs
+                # after every node in the contract exists, but a
+                # function's modifiers may not have their own
+                # FunctionNode yet at this point (see the Layer 3b
+                # comment). Attached modifiers ARE already real Slither
+                # objects on f regardless of node-build order, so score
+                # them directly instead of waiting on the node lookup.
+                # Found live this session against MatrixDock's real,
+                # currently-deployed STBTv2: grantRole/revokeRole's own
+                # bodies (just `_grantRole(role, account);`) carry zero
+                # auth evidence of their own — the entire real
+                # onlyRole(getRoleAdmin(role)) check lives in the
+                # attached modifier — so structural_auth_score was 0
+                # despite the function being genuinely, correctly
+                # protected, and both false-positived UNPROTECTED_
+                # INITIALIZER.
+                own_or_modifier_auth_score = structural_auth_score
+                if not is_modifier:
+                    for m in f.modifiers:
+                        own_or_modifier_auth_score = max(own_or_modifier_auth_score, compute_own_auth(m).score)
+                unprotected_initializer_write = find_unprotected_initializer(f, own_or_modifier_auth_score) if not is_modifier else None
                 init_guard = has_one_time_latch_protection(f) if not is_modifier else False
                 unsafe_fee_on_transfer_credit = find_unsafe_fee_on_transfer_credit(f) if not is_modifier else None
                 unsafe_live_voting_power_execution = find_unsafe_live_voting_power_execution(f) if not is_modifier else None

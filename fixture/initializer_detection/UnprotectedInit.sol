@@ -344,3 +344,83 @@ contract VatStyleSelfScopedPermission {
         can[victim][usr] = true;
     }
 }
+
+// Negative control (the critical adversarial regression case found live
+// this session verifying against MatrixDock's real, currently-deployed
+// STBTv2 — a real, currently-deployed RWA stablecoin): the real
+// OpenZeppelin AccessControl.grantRole()/revokeRole() shape —
+// `onlyRole(getRoleAdmin(role))`, a modifier invoked with a COMPUTED
+// argument. The function's OWN body (just `_grantRole(role, account);`)
+// carries zero auth evidence of its own — the real check lives entirely
+// inside the attached modifier — so core/graph.py's
+// structural_auth_score (own body only) was 0, and
+// find_unprotected_initializer's own-auth exemption never applied even
+// though the function genuinely is protected. Must NOT fire — grantRole/
+// revokeRole are correctly, structurally auth-gated.
+contract RoleBasedAccessControl {
+    mapping(bytes32 => mapping(address => bool)) private _roles;
+    mapping(bytes32 => bytes32) private _roleAdmin;
+    bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;
+
+    // Makes `_roles` structurally "privileged" for classify_sinks — the
+    // real AccessControl.hasRole shape: a msg.sender-keyed boolean
+    // lookup gating a revert.
+    modifier onlyRole(bytes32 role) {
+        require(_roles[role][msg.sender], "missing role");
+        _;
+    }
+
+    function getRoleAdmin(bytes32 role) public view returns (bytes32) {
+        return _roleAdmin[role];
+    }
+
+    function _grantRole(bytes32 role, address account) internal {
+        _roles[role][account] = true;
+    }
+
+    function _revokeRole(bytes32 role, address account) internal {
+        _roles[role][account] = false;
+    }
+
+    function grantRole(bytes32 role, address account) external onlyRole(getRoleAdmin(role)) {
+        _grantRole(role, account);
+    }
+
+    function revokeRole(bytes32 role, address account) external onlyRole(getRoleAdmin(role)) {
+        _revokeRole(role, account);
+    }
+}
+
+// DANGEROUS: the critical adversarial regression case proving the fix
+// checks the attached modifier's OWN genuine auth evidence, not merely
+// "some modifier that takes an argument is attached" — a naive fix
+// that just exempted any function with an argument-taking modifier
+// would wrongly suppress this too. fakeGate takes an argument
+// (superficially resembling the real onlyRole(getRoleAdmin(role))
+// shape) but its body performs no real check at all. Must still fire
+// UNPROTECTED_INITIALIZER.
+contract FakeArgumentModifierIsNotRealAuth {
+    bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;
+    mapping(bytes32 => mapping(address => bool)) private _roles;
+
+    // Makes `_roles` structurally "privileged" — the same real
+    // AccessControl.hasRole shape used in RoleBasedAccessControl above.
+    modifier onlyRealRole(bytes32 role) {
+        require(_roles[role][msg.sender], "missing role");
+        _;
+    }
+
+    modifier fakeGate(bytes32) {
+        _;
+    }
+
+    function privilegedAction() external onlyRealRole(DEFAULT_ADMIN_ROLE) {}
+
+    function _grantRole(bytes32 role, address account) internal {
+        _roles[role][account] = true;
+    }
+
+    function grantRoleUnsafe(bytes32 role, address account) external fakeGate(role) {
+        _grantRole(role, account);
+    }
+}

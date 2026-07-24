@@ -201,6 +201,75 @@ def test_vat_style_self_scoped_permission_write_suppresses_finding():
           "hope/nope suppressed, corruptGrant still", dangerous_findings[0].verdict)
 
 
+def test_modifier_only_auth_evidence_exempts_unprotected_initializer():
+    """
+    Live-verification finding against MatrixDock's real, currently-
+    deployed STBTv2 (a real RWA stablecoin): the real OpenZeppelin
+    AccessControl.grantRole()/revokeRole() shape —
+    `onlyRole(getRoleAdmin(role))`, a modifier invoked with a COMPUTED
+    argument. Both false-positived UNPROTECTED_INITIALIZER despite
+    being genuinely, correctly access-controlled.
+
+    Root cause: core/graph.py's find_unprotected_initializer call was
+    passed structural_auth_score — compute_own_auth(f) on the
+    function's OWN body only — as the "is this already proven
+    protected" exemption check. grantRole's own body is just
+    `_grantRole(role, account);`, which carries zero auth evidence of
+    its own; the real check lives entirely inside the attached
+    onlyRole modifier. The EFFECTIVE score that folds in attached
+    modifiers is computed in graph.py's later Layer 3b pass, but that
+    runs only after find_unprotected_initializer had already been
+    called with the too-narrow score.
+
+    Fixed by scoring each attached modifier directly (compute_own_auth
+    is safe to call again — modifiers are already real Slither
+    objects on f regardless of node-build order) and taking the max
+    with the function's own score before the exemption check.
+
+    grantRoleUnsafe (FakeArgumentModifierIsNotRealAuth) proves this
+    doesn't weaken detection: fakeGate takes an argument too
+    (superficially resembling the real onlyRole(getRoleAdmin(role))
+    shape) but its body performs no real check at all — a naive fix
+    that exempted any function with an argument-taking modifier would
+    wrongly suppress this. Must still fire CONFIRMED.
+    """
+    nodes, graph_edges, state_writers, state_readers, invariant_index, _ = _build("UnprotectedInit.sol")
+
+    grant_role = nodes["RoleBasedAccessControl.grantRole(bytes32,address)"]
+    revoke_role = nodes["RoleBasedAccessControl.revokeRole(bytes32,address)"]
+    assert grant_role.unprotected_initializer_write is None, (
+        f"grantRole is genuinely onlyRole-gated (via its attached modifier) — must not report unprotected-initializer "
+        f"evidence at all, got {grant_role.unprotected_initializer_write}"
+    )
+    assert revoke_role.unprotected_initializer_write is None
+    assert grant_role.auth_score >= 3
+    assert revoke_role.auth_score >= 3
+
+    fake_gated = nodes["FakeArgumentModifierIsNotRealAuth.grantRoleUnsafe(bytes32,address)"]
+    assert fake_gated.unprotected_initializer_write is not None, (
+        "fakeGate performs no real check — must still report unprotected-initializer evidence"
+    )
+    assert fake_gated.auth_score < 3
+
+    sinks = classify_sinks(nodes, graph_edges)
+    paths = enumerate_paths(nodes, graph_edges, sinks)
+    report = validate_paths(paths, nodes, graph_edges, state_writers, state_readers, invariant_index)
+    all_results = report.confirmed + report.likely + report.possible
+
+    for safe_entry in ("RoleBasedAccessControl.grantRole(bytes32,address)", "RoleBasedAccessControl.revokeRole(bytes32,address)"):
+        safe_findings = [r for r in all_results if r.path.entry == safe_entry]
+        assert not safe_findings, f"{safe_entry} (real MatrixDock shape) must not fire any finding, got {safe_findings}"
+
+    dangerous_findings = [
+        r for r in report.confirmed
+        if "UNPROTECTED_INITIALIZER" in r.constraint_type
+        and r.path.entry == "FakeArgumentModifierIsNotRealAuth.grantRoleUnsafe(bytes32,address)"
+    ]
+    assert dangerous_findings, "grantRoleUnsafe() (fake, no-op modifier) must still fire UNPROTECTED_INITIALIZER CONFIRMED"
+    print("test_modifier_only_auth_evidence_exempts_unprotected_initializer: PASS —",
+          "grantRole/revokeRole suppressed, grantRoleUnsafe still", dangerous_findings[0].verdict)
+
+
 def test_unprotected_initializer_constraint_fires_only_on_real_vulnerable_contracts():
     """
     End-to-end: runs the full path-enumeration + constraint-validation
@@ -257,5 +326,6 @@ if __name__ == "__main__":
     test_metamorpho_style_timelock_gated_accept_does_not_false_positive()
     test_fake_timelock_does_not_suppress_finding()
     test_vat_style_self_scoped_permission_write_suppresses_finding()
+    test_modifier_only_auth_evidence_exempts_unprotected_initializer()
     test_unprotected_initializer_constraint_fires_only_on_real_vulnerable_contracts()
     print("\nAll initializer_detection tests passed.")
