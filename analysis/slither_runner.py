@@ -323,42 +323,100 @@ def run_slither(resolved: dict) -> dict:
     # package moved to the unscoped transmissions11/solmate), so
     # matching on the first segment alone can never succeed; "solmate"
     # (the second segment, the actual package name) does.
-    alias_candidates: dict = {}  # remap LHS prefix -> segment to alias-match against directory names
+    # For a scoped import (`@openzeppelin/contracts/...`), the SECOND
+    # segment alone ("contracts") is a catastrophically ambiguous
+    # alias-match token on its own: "contracts" is the near-universal
+    # top-level subdirectory name of virtually every vendored Solidity
+    # package, so matching on it alone can silently pick a COMPLETELY
+    # WRONG sibling package rather than failing to match at all — worse
+    # than no match. Found live this session against Usual Protocol's
+    # real, currently-deployed Eur0.sol: the project vendors BOTH
+    # `lib/openzeppelin-contracts/` and
+    # `lib/openzeppelin-contracts-upgradeable/`, each with its own
+    # `contracts/` subfolder. Matching `@openzeppelin/contracts` on the
+    # bare token "contracts" tied between both packages' `contracts/`
+    # subfolders (both normalize to the same "contracts", diff 0) and
+    # first-found-wins picked the UPGRADEABLE tree — so
+    # `@openzeppelin/contracts/token/ERC20/IERC20.sol` (a NON-upgradeable
+    # interface, genuinely absent from the upgradeable package) resolved
+    # into the wrong tree and failed to compile, silently killing
+    # structural analysis for the whole contract (Slither exits 1 with
+    # no output, `success: False` with no error surfaced) even though
+    # the real source is fully verified and compiles cleanly on its own.
+    #
+    # Fixed with a two-tier match: try the COMBINED scope+package token
+    # first (`openzeppelin`+`contracts` -> "openzeppelincontracts",
+    # which exact-matches ONLY the `openzeppelin-contracts` package
+    # root, not its generic `contracts/` subfolder or any sibling
+    # `-upgradeable` package). Only if NO directory in the whole tree
+    # matches the combined token do we fall back to the package-name-
+    # alone token — preserving the original real need this alias step
+    # was built for (real GoGoPool/Hypha's TokenggAVAX.sol imports
+    # `@rari-capital/solmate/...`, but no directory anywhere is named
+    # "rari-capital", only "solmate" bare — the combined token
+    # "raricapitalsolmate" matches nothing, so the fallback tier is
+    # exactly what resolves that real case, unchanged from before).
+    alias_simple: dict = {}           # lhs (single segment) -> itself, always full-matched, unchanged from before
+    alias_combined: dict = {}         # lhs (two segments) -> combined scope+package token, tried first, strict-only
+    alias_fallback: dict = {}         # same lhs as alias_combined -> package-name-alone token, tried only if the combined tier finds nothing
     for p in bare_import_paths:
         parts = p.split("/")
-        alias_candidates[parts[0]] = parts[0]
+        alias_simple[parts[0]] = parts[0]
         if parts[0].startswith("@") and len(parts) > 1:
-            alias_candidates[f"{parts[0]}/{parts[1]}"] = parts[1]
+            combined_lhs = f"{parts[0]}/{parts[1]}"
+            alias_combined[combined_lhs] = parts[0][1:] + parts[1]
+            alias_fallback[combined_lhs] = parts[1]
+
+    def _alias_match_pass(candidates_map: dict, strict: bool) -> None:
+        # strict=True (the combined scope+package tier): ONLY the plain,
+        # directional substring check (does the directory name contain
+        # the WHOLE combined token) — skips the filler-stripped
+        # bidirectional core-match fallback below. That fallback's
+        # `core_d in core_seg` direction is exactly what let a short,
+        # generic real subdirectory name (e.g. "token", "security" —
+        # themselves genuine nested paths inside a vendored package,
+        # not a package identity) spuriously substring-match INTO a
+        # long synthetic combined token, causing this tier to claim a
+        # match it shouldn't and pre-empt the (correct) fallback tier.
+        # A real combined token is always long enough (concatenated
+        # scope+package name) that the plain directional check alone is
+        # sufficient — no directory can accidentally contain a ~20-char
+        # combined identity as a substring by coincidence.
+        for root, dirs, files in os.walk(project_root):
+            for d in dirs:
+                full = os.path.join(root, d)
+                norm_d = _normalize(d)
+                if not norm_d:
+                    continue
+                core_d = _core(d)
+                for lhs, seg in candidates_map.items():
+                    norm_seg = _normalize(seg)
+                    if not norm_seg:
+                        continue
+                    candidates = {norm_seg}
+                    if norm_seg in _KNOWN_PACKAGE_SYNONYMS:
+                        candidates.add(_KNOWN_PACKAGE_SYNONYMS[norm_seg])
+                    matched = any(c in norm_d for c in candidates)
+                    diff = abs(len(norm_seg) - len(norm_d))
+                    if not matched and not strict:
+                        core_seg = _core(seg)
+                        if (
+                            len(core_seg) >= _MIN_CORE_LEN and len(core_d) >= _MIN_CORE_LEN
+                            and (core_seg in core_d or core_d in core_seg)
+                        ):
+                            matched = True
+                            diff = abs(len(core_seg) - len(core_d))
+                    if matched and diff < alias_best_diff.get(lhs, float("inf")):
+                        alias_targets[lhs] = full
+                        alias_best_diff[lhs] = diff
 
     alias_targets: dict = {}
     alias_best_diff: dict = {}
-    for root, dirs, files in os.walk(project_root):
-        for d in dirs:
-            full = os.path.join(root, d)
-            norm_d = _normalize(d)
-            if not norm_d:
-                continue
-            core_d = _core(d)
-            for lhs, seg in alias_candidates.items():
-                norm_seg = _normalize(seg)
-                if not norm_seg:
-                    continue
-                candidates = {norm_seg}
-                if norm_seg in _KNOWN_PACKAGE_SYNONYMS:
-                    candidates.add(_KNOWN_PACKAGE_SYNONYMS[norm_seg])
-                matched = any(c in norm_d for c in candidates)
-                diff = abs(len(norm_seg) - len(norm_d))
-                if not matched:
-                    core_seg = _core(seg)
-                    if (
-                        len(core_seg) >= _MIN_CORE_LEN and len(core_d) >= _MIN_CORE_LEN
-                        and (core_seg in core_d or core_d in core_seg)
-                    ):
-                        matched = True
-                        diff = abs(len(core_seg) - len(core_d))
-                if matched and diff < alias_best_diff.get(lhs, float("inf")):
-                    alias_targets[lhs] = full
-                    alias_best_diff[lhs] = diff
+    _alias_match_pass(alias_simple, strict=False)
+    _alias_match_pass(alias_combined, strict=True)
+    unmatched = set(alias_fallback) - set(alias_targets)
+    if unmatched:
+        _alias_match_pass({k: v for k, v in alias_fallback.items() if k in unmatched}, strict=False)
 
     # A name-matched alias target may not be the real package ROOT —
     # some vendoring tools nest the fetched package one level deeper
@@ -399,15 +457,42 @@ def run_slither(resolved: dict) -> dict:
     for seg, full in alias_targets.items():
         remappings.append(f"{seg}/={full}/")
 
+    # Skip any LHS this raw basename sweep would otherwise generate a
+    # remap for if the alias-matching pass above (lines ~333-454)
+    # already resolved and VALIDATED that exact same LHS — that pass
+    # confirms its target against real file paths and self-corrects one
+    # level deeper when the package's own root isn't the real import
+    # root (see the "may not be the real package ROOT" validation
+    # above). This blind walk has no such check: it appends a remap for
+    # ANY directory whose bare basename happens to match a bare-import
+    # prefix, unconditionally pointing at that directory itself. Found
+    # live this session against Usual Protocol's real, currently-
+    # deployed Eur0.sol: it bare-imports
+    # `openzeppelin-contracts-upgradeable/token/ERC20/...` (package name
+    # only, no `contracts/` suffix in the import path itself — the real
+    # file lives one level deeper, under the package's own `contracts/`
+    # subfolder). The alias pass already resolved+validated
+    # `openzeppelin-contracts-upgradeable` correctly to
+    # `.../lib/openzeppelin-contracts-upgradeable/contracts/`. This walk
+    # ALSO matched the same LHS against the package's ROOT directory
+    # (whose bare basename is literally "openzeppelin-contracts-
+    # upgradeable") and appended a SECOND, conflicting, uncorrected
+    # remap for the identical prefix pointing one level too shallow.
+    # solc resolves a duplicate remapping prefix by taking whichever
+    # was declared LAST, and this raw walk always runs after the alias
+    # pass — so the wrong, unvalidated entry silently won, and a fully
+    # verified, compilable-on-its-own contract failed to compile with
+    # zero error output.
+    already_resolved_lhs = set(alias_targets.keys())
     for root, dirs, files in os.walk(project_root):
         for d in dirs:
             full = os.path.join(root, d)
             rel = os.path.relpath(full, project_root)
             short = rel.split("/")[-1] if "/" in rel else None
             # Use relative left side, absolute right side
-            if _needed_by_bare_import(rel):
+            if rel not in already_resolved_lhs and _needed_by_bare_import(rel):
                 remappings.append(f"{rel}/={full}/")
-            if short is not None and _needed_by_bare_import(short):
+            if short is not None and short not in already_resolved_lhs and _needed_by_bare_import(short):
                 remappings.append(f"{short}/={full}/")
 
     remappings = list(dict.fromkeys(remappings))
