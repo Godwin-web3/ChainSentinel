@@ -542,6 +542,44 @@ def run_slither(resolved: dict) -> dict:
     rest = [r for r in remappings if r not in priority]
     remappings = priority + rest
 
+    # Prefer the AUTHORITATIVE remappings Etherscan embeds in
+    # standard-json-verified sources (settings.remappings — the exact
+    # list solc was invoked with at deploy-time compilation) over the
+    # heuristic derivation above, when available. The heuristic exists
+    # only to approximate this for verification formats that don't
+    # carry it (flattened single-file sources, older non-standard-json
+    # bundles) — for a project that DOES carry it, ground truth beats
+    # any approximation. Confirmed live against Flaunch's real, currently-
+    # deployed PositionManager2 (Base, 0xB4512b...): the heuristic maps
+    # `@optimism/interfaces/` and `@optimism/src/` onto the wrong
+    # subdirectories (there is no directory literally named "interfaces"
+    # or "src" inside the vendored optimism package at those depths) and
+    # has no rule that could ever invent `@flaunch/=src/contracts/` for a
+    # bare `@flaunch/PositionManager.sol` DIRECT-FILE import (no
+    # subdirectory segment to key off of at all) — Slither silently
+    # exits 1 with empty stdout/stderr on a fully verified, actively-
+    # used, ~$1.5M-TVL launchpad contract, and run_slither's "no output"
+    # catch-all swallows the real crytic-compile error entirely. The
+    # authoritative RHS values are relative to the project root in
+    # exactly the same way the `sources` dict keys written to disk by
+    # write_source_files are (both come from the same standard-json
+    # `sources` object), so join verbatim onto project_root — no
+    # translation needed.
+    authoritative_remaps = source_data.get("remappings") or []
+    if authoritative_remaps:
+        resolved_remaps = []
+        for entry in authoritative_remaps:
+            lhs, _, rhs = entry.partition("=")
+            lhs = lhs.strip()
+            if not lhs:
+                continue
+            rhs = rhs.strip()
+            full = os.path.join(project_root, rhs) if rhs else project_root
+            resolved_remaps.append(f"{lhs}={full.rstrip('/')}/")
+        if resolved_remaps:
+            remappings = list(dict.fromkeys(resolved_remaps))
+            log.debug(f"Using {len(remappings)} authoritative remappings from verified source metadata")
+
     log.debug(f"Remappings: {remappings[:5]}")
 
     # --via-ir only exists from solc 0.8.13 onward, but --optimize alone

@@ -39,6 +39,7 @@ def fetch_source(address: str, chain: Chain) -> Optional[dict]:
     # Parse multi-file format — Etherscan wraps JSON in {{ }}
     parsed_source = source
     file_map = {}
+    remappings = []
     if source.startswith("{{"):
         try:
             import json
@@ -49,6 +50,31 @@ def fetch_source(address: str, chain: Chain) -> Optional[dict]:
             # Keep full source as concatenated string for pattern matching
             parsed_source = "\n".join(file_map.values())
             log.debug(f"Multi-file project: {len(file_map)} files parsed")
+            # This is standard-json-input format (the shape `forge
+            # verify-contract` submits) — it embeds the EXACT
+            # remappings used at deploy-time compilation under
+            # settings.remappings, e.g.
+            # "@flaunch/=src/contracts/", "@optimism/=lib/optimism/
+            # packages/contracts-bedrock/". Confirmed live against
+            # Flaunch's real, currently-deployed PositionManager2
+            # (Base): re-deriving remappings by walking the fetched
+            # tree (the old/only approach) mapped `@optimism/interfaces/`
+            # and `@optimism/src/` onto the wrong subdirectories and had
+            # no rule at all for a bare `@flaunch/PositionManager.sol`
+            # direct-file import, since no heuristic can invent
+            # `@flaunch/=src/contracts/` — Slither exited 1 with silently
+            # empty stdout/stderr (crytic-compile's real solc error
+            # never surfaced past run_slither's "no output" catch-all),
+            # skipping structural analysis entirely on a fully verified,
+            # actively-used contract. These RHS paths are relative to
+            # the project root exactly like the `sources` dict keys
+            # written to disk by write_source_files, so no translation
+            # is needed — join onto the real tmp project root and use
+            # verbatim, ahead of any heuristic guessing.
+            settings = obj.get("settings", {})
+            raw_remaps = settings.get("remappings", [])
+            if isinstance(raw_remaps, list):
+                remappings = [r for r in raw_remaps if isinstance(r, str) and "=" in r]
         except Exception as e:
             log.debug(f"Multi-file parse failed: {e}")
     elif source.startswith("{"):
@@ -95,7 +121,8 @@ def fetch_source(address: str, chain: Chain) -> Optional[dict]:
         "abi": abi,
         "compiler": compiler,
         "is_proxy": proxy == "1",
-        "implementation": impl if impl else None
+        "implementation": impl if impl else None,
+        "remappings": remappings
     }
 
 def fetch_abi(address: str, chain: Chain) -> Optional[list]:
